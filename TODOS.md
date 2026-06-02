@@ -1,5 +1,58 @@
 # TODOS
 
+## v0.42.5.0 watchdog / pooler-reap / lens-backlog follow-ups (v0.42+)
+
+Deferred from the v0.42.5.0 wave (issue #1678). The shipped fixes are complete
+and tested; these are documented tradeoffs and stronger-but-bigger versions.
+
+- [ ] **P2 — `claim` idempotent recovery.** v0.42.5.0 deliberately does NOT
+  inline-retry `claim` (a retry after the `UPDATE...RETURNING` committed but the
+  socket died could double-claim a job); instead the worker poll loop reconnects
+  and re-claims on the next tick. Codex independently flagged the residual: if
+  claim's UPDATE commits but the connection dies before `RETURNING` reaches the
+  worker, that job is `active` in the DB but absent from `inFlight` (orphaned). It
+  is NOT lost — the stall detector reclaims it once `lock_until` expires (~one
+  lock-duration + stall-interval, ~60s) and requeues it (stalled_counter 0 → first
+  stall requeues, not dead-letters). The stronger fix: after a reconnect, look up
+  an active job already holding this worker's `lock_token` before claiming a new
+  one, so the orphan is recovered immediately instead of after a stall cycle.
+  Needs the claim path to thread the lock_token through recovery.
+- [ ] **P3 — `dream --drain` PGLite lock-path parity.** The drain takes the DB
+  refreshing lock (`cycleLockIdFor`), which is the correct lock the routine cycle
+  uses on Postgres. On PGLite the routine cycle uses the global FILE lock instead,
+  so the drain's DB lock doesn't contend with it. This is currently moot because
+  PGLite's exclusive single-process file lock means a separate `gbrain dream
+  --drain` process can't even open the brain while autopilot's `gbrain dream`
+  holds it (one fails at connect). If PGLite ever gains multi-handle access,
+  the drain must also acquire the cycle file lock. Codex-flagged; low risk today.
+- [ ] **P2 — `synthesize_concepts_backlog` doctor check.** The `extract_atoms`
+  backlog check shipped; `synthesize_concepts` did not, because that phase is a
+  stub with no real eligibility predicate (a NOT-EXISTS analog to atom
+  `source_hash`). Add the check once the phase has a concrete "what's left"
+  definition, else it's a fake signal.
+- [ ] **P3 — `renewLock` AbortSignal-bounded retry.** The renewal tick recovers
+  via a bounded reconnect-once + postgres.js auto-reconnect + multi-tick grace,
+  NOT a `withRetry` around `renewLock` (which would race the tick's own timeout
+  and could refresh a lock after another worker reclaimed it). If production shows
+  the multi-tick grace is insufficient under sustained pooler churn, add an
+  abort-aligned bounded retry under `callTimeoutMs`.
+- [ ] **P3 — Waiter-flag cooperative lock.** The `--drain` mode uses a single
+  bounded lock hold (autopilot defers for the window) rather than a
+  release/reacquire-between-windows protocol with a `wants_lock` signal column.
+  Tighter interleaving (autopilot preempts a long drain mid-window) would need
+  that protocol + a migration; deferred as not worth the surface for the bounded
+  window the drain already provides.
+- [ ] **P3 — `cycle.force_phases` config.** No config to force a pack-gated phase
+  (e.g. `extract_atoms`) to run inside the routine 5-min cycle. The `--drain`
+  escape hatch + doctor warning cover the operator need; a config override would
+  let the routine cycle run an expensive lens phase every tick (the reason it's
+  pack-gated). Add only if a real workflow needs it.
+- [ ] **P3 — Full per-job-kind RSS peak tracking.** The watchdog logs peak RSS +
+  the in-flight job kind on the drain line and the 80% soft-warn, but doesn't
+  persist per-job-kind peaks to an audit file or surface "embed-backfill peaked at
+  9.8GB, cap 8GB" in doctor. Add persisted tracking + a doctor check if operators
+  want trend visibility rather than the point-in-time log line.
+
 ## v0.42.2.0 gbrain connect follow-ups (v0.42+)
 
 - [ ] **T6 (P3): `gbrain connect --env-token` form.** Ship the env-var-indirection
