@@ -25,7 +25,7 @@ import { bumpLastRetrievedAt } from './last-retrieved.ts';
 import { isSearchMode } from './search/mode.ts';
 import { stampEvidence } from './search/evidence.ts';
 import type { SearchResult } from './types.ts';
-import { CJK_SLUG_CHARS } from './cjk.ts';
+import { SLUG_EXTRA_SCRIPT_CHARS } from './cjk.ts'; // LOCAL PATCH (slug i18n): Cyrillic+Turkish, drop CJK
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
 import {
@@ -162,7 +162,7 @@ export function validatePageSlug(slug: string): void {
   }
   // v0.32.7: CJK ranges (Han / Hiragana / Katakana / Hangul Syllables) allowed
   // in segments. ASCII shape rules (lead char, hyphen continuation) preserved.
-  const PAGE_SLUG_SEG = `[a-z0-9${CJK_SLUG_CHARS}][a-z0-9${CJK_SLUG_CHARS}\\-]*`;
+  const PAGE_SLUG_SEG = `[a-z0-9${SLUG_EXTRA_SCRIPT_CHARS}][a-z0-9${SLUG_EXTRA_SCRIPT_CHARS}\\-]*`;
   if (!new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})*$`, 'i').test(slug)) {
     throw new OperationError('invalid_params', `Invalid page_slug: ${slug} (allowed: alphanumeric, CJK, hyphens, forward-slash separated segments)`);
   }
@@ -207,7 +207,7 @@ export function validateFilename(name: string): void {
   }
   // v0.32.7: CJK ranges (Han / Hiragana / Katakana / Hangul) allowed in filenames.
   // Leading-dot / leading-dash rejection preserved.
-  const FILENAME_RE = new RegExp(`^[a-zA-Z0-9${CJK_SLUG_CHARS}][a-zA-Z0-9${CJK_SLUG_CHARS}._\\-]*$`);
+  const FILENAME_RE = new RegExp(`^[a-zA-Z0-9${SLUG_EXTRA_SCRIPT_CHARS}][a-zA-Z0-9${SLUG_EXTRA_SCRIPT_CHARS}._\\-]*$`);
   if (!FILENAME_RE.test(name)) {
     throw new OperationError('invalid_params', `Invalid filename: ${name} (allowed: alphanumeric, CJK, dot, underscore, hyphen — no leading dot/dash, no control chars or backslash)`);
   }

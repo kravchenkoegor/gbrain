@@ -11,7 +11,7 @@
  *   pathToSlug()  →  convert file paths to page slugs
  */
 
-import { CJK_SLUG_CHARS } from './cjk.ts';
+import { SLUG_EXTRA_SCRIPT_CHARS } from './cjk.ts'; // LOCAL PATCH (slug i18n): Cyrillic+Turkish, drop CJK
 // v0.37.7.0 #1169 submodule-detection helpers. Bottom-of-file already
 // aliases existsSync as `_existsSync` for other purposes; the top-of-file
 // import keeps the pruneDir helper's deps near its callsite.
@@ -392,7 +392,7 @@ export function unsyncableReason(path: string, opts: SyncableOptions = {}): Sync
  * Pattern is the inner character class only (no anchors); callers wrap it
  * in `^...$` or compose it with prefixes like `(?:people|companies)/...`.
  */
-export const SLUG_SEGMENT_PATTERN = new RegExp(`[a-z0-9._\\-${CJK_SLUG_CHARS}]+`);
+export const SLUG_SEGMENT_PATTERN = new RegExp(`[a-z0-9._\\-${SLUG_EXTRA_SCRIPT_CHARS}]+`);
 
 /**
  * Slugify a single path segment: lowercase, strip special chars, spaces → hyphens.
@@ -400,15 +400,16 @@ export const SLUG_SEGMENT_PATTERN = new RegExp(`[a-z0-9._\\-${CJK_SLUG_CHARS}]+`
  * NFC re-normalize after the NFD-strip-accents pass so Hangul Jamo recomposes back
  * into precomposed syllables that fall inside the whitelist.
  */
-const SLUGIFY_KEEP_RE = new RegExp(`[^a-z0-9.\\s_\\-${CJK_SLUG_CHARS}]`, 'g');
+const SLUGIFY_KEEP_RE = new RegExp(`[^a-z0-9.\\s_\\-${SLUG_EXTRA_SCRIPT_CHARS}]`, 'g');
 
 export function slugifySegment(segment: string): string {
   return segment
     .normalize('NFD')                     // Decompose accented chars
-    .replace(/[\u0300-\u036f]/g, '')      // Strip accent marks
+    .replace(/([a-zA-Z])[\u0300-\u036f]+/g, '$1') // LOCAL PATCH: strip accents on LATIN only (caf\u00e9\u2192cafe, T\u00fcrk\u00e7e\u2192turkce); preserves Cyrillic \u0439/\u0451
     .normalize('NFC')                     // Recompose Hangul Jamo back to Syllables (v0.32.7)
     .toLowerCase()
-    .replace(SLUGIFY_KEEP_RE, '')         // Keep alnum, dots, spaces, _-, and CJK (v0.32.7)
+    .replace(/ı/g, 'i')                   // LOCAL PATCH: Turkish dotless i has no NFD decomposition
+    .replace(SLUGIFY_KEEP_RE, '')         // Keep ASCII alnum, dots, spaces, _-, and Cyrillic
     .replace(/[\s]+/g, '-')              // Spaces → hyphens
     .replace(/-+/g, '-')                 // Collapse multiple hyphens
     .replace(/^-|-$/g, '');              // Strip leading/trailing hyphens
