@@ -18,6 +18,17 @@
 
 export const CJK_SLUG_CHARS = '一-鿿぀-ゟ゠-ヿ가-힯';
 
+/**
+ * LOCAL PATCH (slug i18n): extra scripts KEPT in slugs, separate from the
+ * CJK chunker constant above (which drives word-count density — must NOT
+ * include Cyrillic or Russian prose would be char-tokenized + over-split).
+ * Cyrillic block U+0400–U+04FF covers Russian (incl. й/ё). Turkish folds to
+ * ASCII via the Latin accent-strip + ı→i in slugifySegment, so no range here.
+ * Used by sync.ts (slugify + segment grammar) and operations.ts (slug/filename
+ * validation). Re-apply after `gbrain upgrade`.
+ */
+export const SLUG_EXTRA_SCRIPT_CHARS = 'Ѐ-ӿ';
+
 export const CJK_RANGES_REGEX = new RegExp(`[${CJK_SLUG_CHARS}]`);
 
 export const CJK_SENTENCE_DELIMITERS = ['。', '！', '？']; // 。！？
