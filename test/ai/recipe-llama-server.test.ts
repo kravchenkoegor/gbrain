@@ -33,9 +33,17 @@ describe('recipe: llama-server', () => {
   test('embedding touchpoint declares user_provided_models', () => {
     const r = getRecipe('llama-server')!;
     expect(r.touchpoints.embedding).toBeDefined();
-    expect(r.touchpoints.embedding!.models).toEqual([]);
+    // LOCAL PATCH (Egor): upstream ships `models: []`, but an empty list trips
+    // 'user_provided_model_unset' in gateway.ts:708. The recipe carries a
+    // non-empty placeholder instead (content is ignored — the include-check is
+    // skipped for user_provided_models). Assert non-empty rather than the
+    // upstream `[]`. Re-apply after gbrain updates.
+    expect(r.touchpoints.embedding!.models.length).toBeGreaterThan(0);
     expect(r.touchpoints.embedding!.user_provided_models).toBe(true);
     expect(r.touchpoints.embedding!.default_dims).toBe(0);
+    // LOCAL PATCH (Egor): no hardcoded dims_options — Tier-0 in
+    // embedding-dim-check.ts accepts any user-declared dim for this recipe.
+    expect(r.touchpoints.embedding!.dims_options).toBeUndefined();
   });
 
   test('declares a probe function', () => {

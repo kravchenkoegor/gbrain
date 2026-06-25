@@ -411,6 +411,19 @@ function isCustomDimValidForProvider(
   requestedDims: number,
   dimsOptions: number[] | undefined,
 ): CustomDimCheck {
+  // Tier 0 — LOCAL PATCH (Egor): bring-your-own-model recipes (llama-server,
+  // litellm-proxy) declare `user_provided_models: true`. The user launches the
+  // server with a specific GGUF and passes its native size via
+  // `--embedding-dimensions N`, so gbrain CANNOT know the dim ahead of time and
+  // has no allow-list to validate against. Accept any N here (the caller already
+  // enforced positive-integer + the pgvector 16000 cap before reaching this fn).
+  // This removes the upstream catch-22 generically — see the llama-server recipe
+  // comment — so swapping the served model (bge-m3 1024 → qwen3-embedding-4b
+  // 2560 → anything) never needs a recipe edit. Re-apply after gbrain updates.
+  if (recipe.touchpoints.embedding?.user_provided_models === true) {
+    return { valid: true, error: '' };
+  }
+
   // Tier 1: recipe-declared dims_options.
   if (dimsOptions && dimsOptions.length > 0) {
     if (dimsOptions.includes(requestedDims)) return { valid: true, error: '' };

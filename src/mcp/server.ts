@@ -15,6 +15,56 @@ import {
 } from '../core/context/resolve-ipc.ts';
 import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/context/retrieval-reflex.ts';
 
+/**
+ * LOCAL PATCH (Egor): federated READ grant for the stdio MCP caller.
+ *
+ * Upstream pins the stdio caller's ctx.sourceId to 'default' (see the dispatch
+ * call below), and `resolveRequestedScope` is fail-closed for remote callers —
+ * an omitted `source_id` OR `__all__` both collapse to the caller's grant. With
+ * no grant, that grant is just the scalar 'default', so an unqualified agent
+ * query only ever searches the `default` source. A multi-source brain's OTHER
+ * federated sources are invisible over MCP unless the agent names them, even
+ * though `gbrain query` on the CLI federates across them automatically.
+ *
+ * This returns every federated source id so the dispatch below can hand the
+ * stdio caller a federated `allowedSources` READ scope (sourceScopeOpts then
+ * emits `{sourceIds}` and the query/search/get_page ops span them all). WRITE
+ * authority stays scalar at ctx.sourceId='default', so `put_page` is unaffected
+ * (allowedSources is read-only federation, independent of write target — see the
+ * AuthInfo doc in operations.ts).
+ *
+ * Cheap id+config query on purpose: `listSources` counts pages per source, which
+ * is wasted work on the per-call hot path. Archived sources are excluded so a
+ * soft-deleted source is never silently re-granted. Fail-closed: any error → []
+ * → sourceScopeOpts falls back to the scalar 'default' scope (upstream behavior).
+ * Resolved per-call so a freshly added/federated source is visible without a
+ * `gbrain serve` restart. Re-apply after gbrain updates; replicate on VPS.
+ */
+async function federatedReadGrant(engine: BrainEngine): Promise<string[]> {
+  try {
+    const rows = await engine.executeRaw<{ id: string; config: unknown }>(
+      `SELECT id, config FROM sources WHERE archived IS NOT TRUE`,
+    );
+    return rows
+      .filter((r) => {
+        const cfg =
+          typeof r.config === 'string'
+            ? (() => {
+                try {
+                  return JSON.parse(r.config as string) as Record<string, unknown>;
+                } catch {
+                  return {};
+                }
+              })()
+            : ((r.config ?? {}) as Record<string, unknown>);
+        return cfg.federated === true;
+      })
+      .map((r) => r.id);
+  } catch {
+    return []; // fail-closed → scalar sourceId='default' scope (upstream behavior)
+  }
+}
+
 export async function startMcpServer(engine: BrainEngine) {
   const server = new Server(
     { name: 'gbrain', version: VERSION },
@@ -40,13 +90,37 @@ export async function startMcpServer(engine: BrainEngine) {
     // see private hunches via takes_list / takes_search / query. Operators
     // who want stdio to see everything should call ops directly via
     // `gbrain call <op>` (sets remote=false in src/cli.ts).
+    // v0.31: source defaults to 'default' for stdio (no per-token scope).
+    // Operators who want a different source on stdio MCP should set
+    // GBRAIN_SOURCE in the env or use --source via `gbrain call`.
+    const sourceId = process.env.GBRAIN_SOURCE || 'default';
+    // LOCAL PATCH (Egor): grant the stdio caller a federated READ scope across
+    // every federated source so an unqualified agent query federates like the
+    // CLI does (see federatedReadGrant). WRITE authority stays scalar at
+    // `sourceId` (put_page still lands in 'default'). An explicit GBRAIN_SOURCE
+    // pin opts out — the operator chose one source on purpose, so no grant.
+    // Synthetic stdio identity. stdio is a local pipe with no OAuth token, but
+    // AuthInfo requires token/clientId/scopes — these satisfy the type. scopes:[]
+    // mirrors pre-patch behavior EXACTLY (ctx.auth was undefined, so every
+    // `ctx.auth?.scopes ?? []` read already saw []), so no op gains or loses a
+    // privilege; the ONLY thing added is `allowedSources` (federated READ scope).
+    // Note: this tightens explicit access — naming a NON-federated source over
+    // MCP now returns permission_denied (the correct isolation posture; federate
+    // a source, or set GBRAIN_SOURCE, to read it over MCP).
+    const auth = process.env.GBRAIN_SOURCE
+      ? undefined
+      : {
+          token: 'stdio-local',
+          clientId: 'stdio-local',
+          clientName: 'stdio-local',
+          scopes: [],
+          allowedSources: await federatedReadGrant(engine),
+        };
     return dispatchToolCall(engine, name, params, {
       remote: true,
       takesHoldersAllowList: ['world'],
-      // v0.31: source defaults to 'default' for stdio (no per-token scope).
-      // Operators who want a different source on stdio MCP should set
-      // GBRAIN_SOURCE in the env or use --source via `gbrain call`.
-      sourceId: process.env.GBRAIN_SOURCE || 'default',
+      sourceId,
+      ...(auth ? { auth } : {}),
       // v0.31 (eD3): _meta.brain_hot_memory injection so Claude Desktop /
       // Code see the brain's relevant hot memory automatically alongside
       // every tool-call response. Best-effort; absorbs errors.
