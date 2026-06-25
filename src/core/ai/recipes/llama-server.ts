@@ -29,7 +29,7 @@ export const llamaServer: Recipe = {
   },
   touchpoints: {
     embedding: {
-      models: ['bge-m3'], // LOCAL PATCH (Egor): upstream ships [] which trips
+      models: ['bge-m3', 'qwen3-embedding-4b'], // LOCAL PATCH (Egor): upstream ships [] which trips
       // 'user_provided_model_unset' in gateway.ts:708 (empty models → treated as
       // unset regardless of config). Declare the served model so embed proceeds.
       user_provided_models: true,
@@ -41,7 +41,7 @@ export const llamaServer: Recipe = {
       // llama-server embedders un-initable. Declaring the served dim here
       // (bge-m3 = 1024) takes the Tier-1 allow path. Re-apply after gbrain
       // updates; replicate on VPS.
-      dims_options: [1024],
+      dims_options: [1024, 2560], // bge-m3=1024 (Mac); qwen3-embedding-4b=2560 (Ubuntu device)
       cost_per_1m_tokens_usd: 0,
       price_last_verified: '2026-05-10',
       // llama-server's batch capacity is set by `--ctx-size` at launch
