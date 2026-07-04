@@ -23,12 +23,13 @@ import {
   categorizeCheck,
   _resetUnknownCheckWarningsForTest,
 } from '../src/core/doctor-categories.ts';
+import { ONBOARD_CHECK_NAMES } from '../src/core/onboard/checks.ts';
 
 const DOCTOR_TS_PATH = join(import.meta.dir, '..', 'src', 'commands', 'doctor.ts');
 
 function enumerateCheckNames(): Set<string> {
   const source = readFileSync(DOCTOR_TS_PATH, 'utf-8');
-  const names = new Set<string>();
+  const names = new Set<string>(ONBOARD_CHECK_NAMES);
   // 1) Inline object-literal form: `{ name: 'foo', ... }`.
   for (const m of source.matchAll(/name:\s*['"]([a-z][a-z0-9_]+)['"]/g)) {
     names.add(m[1]);
@@ -122,6 +123,16 @@ describe('categorizeCheck', () => {
     expect(categorizeCheck('embedding_provider')).toBe('brain');
     expect(categorizeCheck('graph_coverage')).toBe('brain');
     expect(categorizeCheck('sync_freshness')).toBe('brain');
+  });
+
+  test('returns the right category for dynamically imported onboard checks', () => {
+    expect(categorizeCheck('embed_staleness')).toBe('brain');
+    expect(categorizeCheck('entity_link_coverage')).toBe('brain');
+    expect(categorizeCheck('timeline_coverage')).toBe('brain');
+    expect(categorizeCheck('takes_count')).toBe('brain');
+    expect(categorizeCheck('dangling_aliases')).toBe('brain');
+    expect(categorizeCheck('pack_upgrade_available')).toBe('meta');
+    expect(categorizeCheck('type_proliferation')).toBe('meta');
   });
 
   test('returns the right category for a known skill name', () => {

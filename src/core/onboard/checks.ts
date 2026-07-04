@@ -29,6 +29,16 @@ export interface OnboardCheckResult {
   remediations: RemediationStep[];
 }
 
+export const ONBOARD_CHECK_NAMES = [
+  'embed_staleness',
+  'entity_link_coverage',
+  'timeline_coverage',
+  'takes_count',
+  'pack_upgrade_available',
+  'type_proliferation',
+  'dangling_aliases',
+] as const;
+
 /** Internal sql helper. Returns first row or empty object on throw. */
 async function safeCount(engine: BrainEngine, sql: string, params: unknown[] = []): Promise<number> {
   try {
