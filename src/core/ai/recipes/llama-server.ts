@@ -34,14 +34,7 @@ export const llamaServer: Recipe = {
       // unset regardless of config). Declare the served model so embed proceeds.
       user_provided_models: true,
       default_dims: 0, // forces explicit --embedding-dimensions
-      // LOCAL PATCH (Egor): upstream v0.42.44.0 has no dims_options here, so
-      // resolveSchemaEmbeddingDim rejects ANY explicit --embedding-dimensions
-      // (requestedDims !== default_dims=0 → Tier-3 reject) while init still
-      // REQUIRES the flag for user_provided_models — a catch-22 that makes
-      // llama-server embedders un-initable. Declaring the served dim here
-      // (bge-m3 = 1024) takes the Tier-1 allow path. Re-apply after gbrain
-      // updates; replicate on VPS.
-      dims_options: [1024, 2560], // bge-m3=1024 (Mac); qwen3-embedding-4b=2560 (Ubuntu device)
+      trust_custom_dims: true, // #2271: user knows the launched model's native dim
       cost_per_1m_tokens_usd: 0,
       price_last_verified: '2026-05-10',
       // llama-server's batch capacity is set by `--ctx-size` at launch
