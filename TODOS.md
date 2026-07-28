@@ -1,5 +1,61 @@
 # TODOS
 
+## community fix-wave follow-ups (filed v0.42.60.0)
+
+- [x] **P2 — cherry-pick #2112's uncovered doctor.ts hunk.** Fix-wave A (#2820) superseded
+  most of #2112 but not its `checkSubagentCapability` fix (check explicit `models.subagent`
+  before `models.tier.subagent`). Implemented: `checkSubagentCapability` now resolves
+  `models.subagent` before tier/default fallbacks and has regression coverage.
+
+## v0.42.59.0 follow-ups (five-fix rollup #2735–#2739)
+
+Filed as follow-ups from v0.42.59.0 (bootstrap probe for
+`timeline_entries.event_page_id`, migrate-engine source catalog + target-aware
+resume, entity-resolution quarantine, escape-aware fence cells, think gather
+source scope).
+
+- [ ] **P2 — schema-bootstrap-coverage strip block never exercises `timeline_entries.event_page_id`.**
+  The guard's pre-migration-brain simulation (the strip DDL in
+  `test/schema-bootstrap-coverage.test.ts`) has no
+  `ALTER TABLE timeline_entries DROP COLUMN IF EXISTS event_page_id` (or FK drop), so the
+  coverage entry added for the v121 forward reference is vacuous — the probe never fires
+  under that harness. The real regression guard lives in `test/bootstrap.test.ts` (which
+  does drop → re-bootstrap → assert). Add the DROP statements to the strip block so the
+  coverage test genuinely exercises its own entry.
+- [ ] **P2 — extract-facts reconcile still wipes-then-reinserts when the parse emitted MALFORMED warnings.**
+  `runExtractFacts` (`src/core/cycle/extract-facts.ts`) deletes a page's facts and
+  reinserts from the parsed fence even when `parseFactsFence` surfaced
+  `FACTS_TABLE_MALFORMED` warnings — any future parse defect becomes a deletion vector
+  (rows the parser failed to read get wiped with nothing to reinsert). Consider
+  skip-wipe-on-warnings: treat a warning-bearing parse as non-authoritative for that page
+  (skip the wipe, surface a warn), mirroring the empty-fence legacy-row guard's posture.
+- [ ] **P3 — bare-name resolution quarantines even on an exact unique match when prefix siblings exist.**
+  With pages `companies/acme` + `companies/acme-labs`, a bare `"Acme"` yields two
+  `findPrefixCandidates` rows, so `tryUnambiguousPrefixExpansion` declines — even though
+  `companies/acme` is an exact `dir/token` slug match (and may be a unique exact title
+  match). That's an unambiguity signal being wasted. Consider promoting an exact
+  `dir/token` (or exact-title) hit above the sibling-count check in
+  `src/core/entities/resolve.ts`.
+- [ ] **P2 — `scripts/run-verify-parallel.sh` no-gtimeout fallback reports the watchdog's exit code, not the check's.**
+  In the fallback branch, `rc=$?` is captured after `wait "$cap_pid"` (the killed
+  sleep-watchdog, rc=143) rather than after `wait "$pid"` (the actual check) — on a Mac
+  without coreutils every check false-fails with rc=143. Capture `rc` from `wait "$pid"`
+  first, then reap the watchdog.
+- [ ] **P3 — same-target migrate resume with `--force` still skips checkpointed pages after the wipe.**
+  `gbrain migrate --to <engine> --force` wipes the target's pages, but the resume
+  manifest's `completed_slugs` filter still applies, so previously-checkpointed pages are
+  skipped against the now-empty target (pre-existing behavior; the v0.42.59.0 verification
+  warns about it). `--force` should clear the manifest when it matches the same target.
+  Where: `src/commands/migrate-engine.ts`.
+- [ ] **P2 — think residual scope gaps.** Two spots in `src/core/think/index.ts` don't yet
+  inherit the caller's source scope the way the gather stage now does:
+  `persistCitations` resolves citation slugs with an unscoped
+  `SELECT id FROM pages WHERE slug = $1 LIMIT 1` (cross-source slug ambiguity can attach
+  saved evidence to the wrong same-slug page), and the trajectory entity-resolution scalar
+  is `opts.sourceId ?? 'default'` (a federated caller with `allowedSources` but no scalar
+  resolves entities against `default` instead of its grant). Mirror the gather-stage
+  precedence (federated array > scalar > default) at both sites.
+
 ## provider-agnostic follow-ups (filed v0.42.58.0)
 
 Deferred from the provider-agnostic plumbing wave (#1249/#1250/#1292/#2271/#2209).
@@ -2224,10 +2280,25 @@ at plan time and got carved out:
   via `buildPerSourceBindings`. Document workaround: register
   source-scoped OAuth clients.
 
-- [ ] **v0.41+: T20 — extends-chain merging in registry.ts.**
-  `registry.ts:167` documents the gap. Implementing full child-wins
-  merge cascades through every consumer of `manifest.page_types`. ~1
-  day CC.
+- [x] **v0.41+: T20 — extends-chain merging in registry.ts.** DONE (#1749).
+  `resolvePack` now merges parent → child (child-wins) for the six
+  ingest/query-shaping fields (`page_types`, `link_types`,
+  `frontmatter_links`, `enrichable_types`, `filing_rules`, `takes_kinds`)
+  plus `borrow_from` materialization, in `src/core/schema-pack/merge.ts`.
+  The cascade was transparent (consumers already read `resolved.manifest`),
+  not per-consumer. `phases`/`calibration_domains` deliberately excluded —
+  see the P3 follow-up below.
+
+- [ ] **P3: explicit opt-in to inherit `phases` / `calibration_domains`.**
+  T20 excludes these two from the child-wins merge because they gate real
+  cycle execution (`cycle.ts` `packDeclaresPhase`) and the manifest
+  contract says each pack declares its own participation explicitly —
+  auto-inheriting would silently make a child run cycle phases it never
+  requested. Multi-level lens packs (`gbrain-everything`) therefore still
+  re-declare them by hand. If that redeclaration becomes painful, add an
+  explicit manifest flag (e.g. `inherit_phases: true`) so a pack author
+  opts in consciously. Depends on: T20 (landed). Start in
+  `src/core/schema-pack/merge.ts` (`mergeInheritedManifest`).
 
 - [ ] **v0.41+: T21 — comment-preserving YAML emitter.**
   v0.40.7.0 emitter does NOT preserve comments. Authors who care
