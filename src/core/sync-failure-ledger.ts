@@ -161,6 +161,15 @@ export function classifyErrorCode(errorMsg: string): string {
   if (/Anthropic has no embedding model|EMBEDDING_NO_TOUCHPOINT/i.test(errorMsg)) {
     return 'EMBEDDING_NO_TOUCHPOINT';
   }
+  // #3875: embed-scoped timeouts (AbortSignal.timeout firing inside the
+  // gateway's per-sub-batch AI_EMBED_TIMEOUT_MS produces
+  // `[embed(provider:model)] The operation timed out.`). Classified BEFORE the
+  // rate-limit/quota checks and distinct from STATEMENT_TIMEOUT (a DB error) —
+  // this is provider-infra unhealth, not file poison, so the auto-skip valve
+  // must never eat it.
+  if (/\[embed(?:Multimodal)?\([^)]*\)\][^\n]*\b(?:timed? ?out|timeout)\b|EMBEDDING_TIMEOUT/i.test(errorMsg)) {
+    return 'EMBEDDING_TIMEOUT';
+  }
   if (/\brate.?limit|\b429\b|too many requests|rate_limited|RateLimit/i.test(errorMsg)) {
     return 'EMBEDDING_RATE_LIMIT';
   }
@@ -206,8 +215,24 @@ export function formatCodeBreakdown(
   return summary.map(s => `  ${s.code}: ${s.count}`).join('\n');
 }
 
+/**
+ * Where `sync-failures.jsonl` lives. Defaults to the gbrain home.
+ *
+ * `GBRAIN_SYNC_FAILURES_DIR` exists for the same reason `GBRAIN_AUDIT_DIR` does
+ * (#2823): the test suite exercises import/sync failure paths with deliberately
+ * broken fixtures, and without an override those fixture rows append into the
+ * operator's REAL ledger — the one `gbrain doctor` reads and warns on until it
+ * is cleaned up. A stray `srcE / notes/bad.md SLUG_MISMATCH` row in a live
+ * brain came from exactly this.
+ *
+ * A dedicated var rather than leaning on `GBRAIN_HOME`: pointing GBRAIN_HOME at
+ * a scratch dir for the whole suite also makes `loadConfig()` return null for
+ * every test that reads the real config, which is a far wider blast radius than
+ * this problem needs (and `test/gbrain-home-isolation.test.ts` asserts the
+ * unset-fallback behavior directly).
+ */
 function _failuresDir(): string {
-  return _gbrainPath();
+  return process.env.GBRAIN_SYNC_FAILURES_DIR || _gbrainPath();
 }
 
 export function syncFailuresPath(): string {
@@ -499,9 +524,9 @@ export function clearFailures(sourceId: string, paths: string[]): void {
 }
 
 /**
- * Acknowledge OPEN file failures (human `--skip-failed`). Scoped to one
- * source when `sourceId` is given (never acks another source — #1939 Codex
- * #2). Sentinels (`<head>`) are NEVER acknowledged this way.
+ * Acknowledge OPEN or AUTO_SKIPPED file failures (human `--skip-failed`).
+ * Scoped to one source when `sourceId` is given (never acks another source
+ * — #1939 Codex #2). Sentinels (`<head>`) are NEVER acknowledged this way.
  */
 export function acknowledgeFailures(sourceId?: string): AcknowledgeResult {
   return withLedgerLock(() => {
@@ -510,7 +535,7 @@ export function acknowledgeFailures(sourceId?: string): AcknowledgeResult {
     let changed = 0;
     const acked: SyncFailure[] = [];
     for (const e of entries) {
-      if (e.state !== 'open') continue;
+      if (e.state !== 'open' && e.state !== 'auto_skipped') continue;
       if (sourceId !== undefined && e.source_id !== sourceId) continue;
       if (!isSkippablePath(e.path)) continue;
       e.state = 'acknowledged';
@@ -527,7 +552,7 @@ export function acknowledgeFailures(sourceId?: string): AcknowledgeResult {
 /**
  * Mark the given chronic file paths `auto_skipped` (valve fired). Only OPEN,
  * non-sentinel rows transition. Auto-skipped rows stay UNRESOLVED so doctor
- * keeps warning until the file imports cleanly.
+ * keeps warning until the file imports cleanly or a human acknowledges them.
  */
 export function autoSkipFailures(sourceId: string, paths: string[]): AcknowledgeResult {
   if (paths.length === 0) return { count: 0, summary: [] };
@@ -576,6 +601,26 @@ export interface GateDecision {
 }
 
 /**
+ * #3875: error codes that indicate the EMBEDDING PROVIDER is unhealthy, not
+ * that the file is poison. The bounded auto-skip valve exists to route around
+ * a single bad file; letting it fire on provider-infra failures silently
+ * unindexes an unbounded slice of the brain (every file "fails" while the
+ * provider is down/timing out/rate-limited). These codes always BLOCK the
+ * bookmark instead of auto-skipping — the fix is provider health, not
+ * `--skip-failed`.
+ */
+export const EMBEDDING_INFRA_CODES: ReadonlySet<string> = new Set([
+  'EMBEDDING_TIMEOUT',
+  'EMBEDDING_RATE_LIMIT',
+  'EMBEDDING_QUOTA',
+]);
+
+/** True when `code` names a provider-infra embedding failure (see above). */
+export function isEmbeddingInfraCode(code: string | undefined): boolean {
+  return code !== undefined && EMBEDDING_INFRA_CODES.has(code);
+}
+
+/**
  * Decide what the sync gate should do, given this run's failures and the
  * current attempt counts. Pure — the caller executes effects in the safe
  * order (advance THEN ack, so a crash can't mark a file skipped while the
@@ -586,10 +631,13 @@ export interface GateDecision {
  *   --skip-failed                     → advance (ack handled post-advance)
  *   valve disabled (threshold<=0)     → block (pure fail-closed) if failures
  *   any fresh (attempts<threshold)    → block
+ *   any embedding-infra code (#3875)  → block (provider unhealthy ≠ file poison;
+ *                                       never auto-skip, regardless of attempts)
  *   all chronic (attempts>=threshold) → advance_then_autoskip
  */
 export function decideGateAction(args: {
-  fileFailures: Array<{ path: string }>;
+  /** `code` (when provided) is a classifyErrorCode() result — #3875. */
+  fileFailures: Array<{ path: string; code?: string }>;
   sentinels: Array<{ path: string }>;
   attemptsByPath: Map<string, number>;
   threshold: number;
@@ -603,6 +651,14 @@ export function decideGateAction(args: {
   const chronic: string[] = [];
   let fresh = 0;
   for (const f of args.fileFailures) {
+    // #3875: provider-infra failures (embed timeout / rate limit / quota) are
+    // never chronic-eligible — auto-skipping them would silently unindex every
+    // file that happened to sync while the provider was unhealthy. Treat them
+    // as fresh so the gate BLOCKS and the operator fixes the provider.
+    if (isEmbeddingInfraCode(f.code)) {
+      fresh++;
+      continue;
+    }
     const a = args.attemptsByPath.get(f.path) ?? 1;
     if (a >= args.threshold) chronic.push(f.path);
     else fresh++;
@@ -716,7 +772,9 @@ export async function applySyncFailureGate(input: SyncGateInput): Promise<SyncGa
   );
 
   const decision = decideGateAction({
-    fileFailures,
+    // #3875: thread the classified error code so provider-infra failures
+    // (embed timeout / rate limit / quota) can never ride the auto-skip valve.
+    fileFailures: fileFailures.map(f => ({ path: f.path, code: classifyErrorCode(f.error) })),
     sentinels,
     attemptsByPath,
     threshold,

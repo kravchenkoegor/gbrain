@@ -135,7 +135,15 @@ describe('BudgetTracker.reserve', () => {
     expect(caught).toBeInstanceOf(BudgetExhausted);
     expect((caught as BudgetExhausted).reason).toBe('no_pricing');
     expect((caught as BudgetExhausted).modelId).toBe('mystery:some-unreleased-model');
-    expect((caught as Error).message).toMatch(/anthropic-pricing\.ts/);
+    expect((caught as Error).message).toMatch(/model-pricing\.ts/);
+    const audit = readAudit();
+    expect(audit).toContainEqual(expect.objectContaining({
+      event: 'reserve_no_pricing',
+      kind: 'chat',
+      model: 'mystery:some-unreleased-model',
+      reason: 'no_pricing',
+      schema_version: 1,
+    }));
   });
 
   test('v0.41.20.0: slash-prefix anthropic/claude-* under --max-cost does NOT no_pricing throw (THE FIX)', () => {
@@ -168,6 +176,33 @@ describe('BudgetTracker.reserve', () => {
         kind: 'chat',
       }),
     ).not.toThrow();
+  });
+
+  test('#2504: canonical-priced non-Anthropic chat models reserve under a cap', () => {
+    // These models live only in CANONICAL_PRICING, not in the bare-keyed
+    // ANTHROPIC_PRICING view. A capped BudgetTracker must still price them
+    // instead of TX2 hard-failing no_pricing.
+    for (const modelId of [
+      'deepseek:deepseek-chat',
+      'openai:gpt-5.2',
+      'google:gemini-2.0-flash',
+    ]) {
+      const t = new BudgetTracker({ maxCostUsd: 1.0, label: 'test', auditPath });
+      expect(() =>
+        t.reserve({
+          modelId,
+          estimatedInputTokens: 1_000,
+          maxOutputTokens: 1_000,
+          kind: 'chat',
+        }),
+      ).not.toThrow();
+    }
+    const audit = readAudit();
+    expect(audit.filter((e) => e.event === 'reserve').map((e) => e.model)).toEqual([
+      'deepseek:deepseek-chat',
+      'openai:gpt-5.2',
+      'google:gemini-2.0-flash',
+    ]);
   });
 
   test('no cap + unknown pricing: warns once per process, no throw', () => {
@@ -248,6 +283,37 @@ describe('BudgetTracker.reserve', () => {
     expect((caught as BudgetExhausted).reason).toBe('no_pricing');
   });
 
+  test('#3223: rerank kind for zeroentropyai:zerank-2 prices from the embedding table (no TX2 throw under --max-cost)', () => {
+    // Pre-fix: `search_mode: tokenmax` defaults the zerank-2 reranker ON
+    // (docs/ai-providers/zeroentropy.md), but lookupPricing's rerank branch
+    // never consulted the embedding pricing table (where ZeroEntropy's
+    // provider:model-keyed prices live) — so any --max-cost run that
+    // reranked TX2 hard-failed with "no pricing entry" even after adding
+    // the entry to EMBEDDING_PRICING alone. Fixed by wiring the rerank
+    // branch to fall back to lookupEmbeddingPrice.
+    const t = new BudgetTracker({ maxCostUsd: 0.0001, label: 'test', auditPath });
+    expect(() =>
+      t.reserve({
+        modelId: 'zeroentropyai:zerank-2',
+        estimatedInputTokens: 3000,
+        maxOutputTokens: 0,
+        kind: 'rerank',
+      }),
+    ).not.toThrow();
+    expect(t.totalSpent).toBe(0); // reserve() only projects; record() below banks it.
+    expect(() =>
+      t.record({
+        modelId: 'zeroentropyai:zerank-2',
+        inputTokens: 3000,
+        outputTokens: 0,
+        kind: 'rerank',
+      }),
+    ).not.toThrow();
+    // $0.025/1M * 3000 tokens = $0.000075, under the $0.0001 cap — proves the
+    // real ZeroEntropy price was used, not a $0 fallback.
+    expect(t.totalSpent).toBeCloseTo(0.000075, 9);
+  });
+
   test('v0.40.x: local embed providers price at $0 (no TX2 throw under --max-cost)', () => {
     // FREE_LOCAL_EMBED_PROVIDERS — ollama / llama-server run on local inference
     // (electricity, not tokens). Pre-fix a --max-cost embed/reindex job
@@ -272,6 +338,25 @@ describe('BudgetTracker.reserve', () => {
     }
     expect(caught).toBeInstanceOf(BudgetExhausted);
     expect((caught as BudgetExhausted).reason).toBe('no_pricing');
+  });
+
+  test('#3628: unknown hosted rerank provider points no-pricing guidance at embedding-pricing', () => {
+    const t = new BudgetTracker({ maxCostUsd: 1.0, label: 'test', auditPath });
+    let caught: unknown = null;
+    try {
+      t.reserve({
+        modelId: 'acmecorp:unpriced-reranker-v9',
+        estimatedInputTokens: 100,
+        maxOutputTokens: 0,
+        kind: 'rerank',
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(BudgetExhausted);
+    expect((caught as BudgetExhausted).reason).toBe('no_pricing');
+    expect((caught as Error).message).toContain('embedding-pricing.ts');
+    expect((caught as Error).message).not.toContain('anthropic-pricing.ts');
   });
 
   test('v0.40.x REGRESSION: known hosted embed (openai) still real-priced (trips a tiny cap)', () => {

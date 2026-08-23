@@ -13,6 +13,9 @@
 // merge, dedup, dry-run, fail-soft on executeRaw errors.
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   runPhaseExtractAtoms,
@@ -50,7 +53,7 @@ function stubChat(text: string): (o: ChatOpts) => Promise<ChatResult> {
 
 /**
  * Stub that returns a unique-title atom on each call so atoms write to
- * distinct slugs (`atoms/${date}/${slugify(title)}`) instead of upserting
+ * distinct slugs (`atoms/<source-date>/<stem>-<title-hash>`) instead of upserting
  * into one row. Needed for tests that count atoms after multiple work items.
  */
 function stubChatUnique(): (o: ChatOpts) => Promise<ChatResult> {
@@ -108,12 +111,15 @@ async function seedPage(opts: {
 }
 
 describe('v0.41.2.1: discoverExtractablePages SQL contract', () => {
-  test('filters by all 6 extractable types', async () => {
-    for (const type of ['meeting', 'source', 'article', 'video', 'book', 'original']) {
+  test('discovers legacy + pack-extractable types, excludes synthesis outputs', async () => {
+    // Legacy floor + `note` (declared extractable:true in gbrain-base, now
+    // honored via the pack manifest — the D2 fix).
+    for (const type of ['meeting', 'source', 'article', 'video', 'book', 'original', 'note']) {
       await seedPage({ slug: `${type}/x`, type });
     }
-    // Add a non-extractable page that should NOT appear
-    await seedPage({ slug: 'notes/skip-me', type: 'note' });
+    // `concept` is also extractable:true in gbrain-base, but extracting atoms
+    // FROM concepts would loop — synthesis outputs are always excluded.
+    await seedPage({ slug: 'wiki/concepts/skip-me', type: 'concept' });
 
     const discovered = await discoverExtractablePages(engine, 'default');
     const slugs = discovered.map((d) => d.slug).sort();
@@ -121,6 +127,7 @@ describe('v0.41.2.1: discoverExtractablePages SQL contract', () => {
       'article/x',
       'book/x',
       'meeting/x',
+      'note/x',
       'original/x',
       'source/x',
       'video/x',
@@ -172,6 +179,18 @@ describe('v0.41.2.1: discoverExtractablePages SQL contract', () => {
 
     const discovered = await discoverExtractablePages(engine, 'default');
     expect(discovered.map((d) => d.slug)).toEqual(['original/normal']);
+  });
+
+  test('raw source-holder pages excluded (#5 — no permanent no-progress backlog)', async () => {
+    await seedPage({ slug: 'source/normal', type: 'source' });
+    await seedPage({
+      slug: 'wiki/raw-email-source',
+      type: 'source',
+      frontmatter: { raw: 'raw/email/example.md' },
+    });
+
+    const discovered = await discoverExtractablePages(engine, 'default');
+    expect(discovered.map((d) => d.slug)).toEqual(['source/normal']);
   });
 
   test('pages with NULL content_hash excluded (D9 #3 — no .slice crash)', async () => {
@@ -291,6 +310,97 @@ describe('v0.41.2.1: runPhaseExtractAtoms — dual-source merge + idempotency', 
     expect(rows[0].source_id).toBe('dept-x');
   });
 
+  test('production transcript discovery is default-only while non-default DB pages still extract', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('dept-x', 'dept-x') ON CONFLICT DO NOTHING`,
+    );
+    await seedPage({
+      slug: 'meeting/dept-x-page',
+      type: 'meeting',
+      source_id: 'dept-x',
+      content_hash: 'dept-page-hash-1234567890',
+    });
+
+    const corpusDir = mkdtempSync(join(tmpdir(), 'gbrain-extract-atoms-corpus-'));
+    writeFileSync(join(corpusDir, '2026-07-28-global.txt'), 'global transcript '.repeat(180));
+    let chatCalls = 0;
+    const chat = async (opts: ChatOpts): Promise<ChatResult> => {
+      chatCalls++;
+      return stubChat(
+        `[{"title":"item-${chatCalls}","atom_type":"insight","body":"b"}]`,
+      )(opts);
+    };
+
+    try {
+      const result = await runPhaseExtractAtoms(engine, {
+        sourceId: 'dept-x',
+        brainDir: '/tmp/dept-x-brain',
+        _loadConfig: () => ({
+          dream: { synthesize: { session_corpus_dir: corpusDir } },
+        } as never),
+        _chat: chat,
+      });
+
+      expect(result.details?.transcripts_total).toBe(0);
+      expect(result.details?.pages_total).toBe(1);
+      expect(chatCalls).toBe(1);
+      const rows = await engine.executeRaw<{
+        source_id: string;
+        source_slug: string | null;
+        source_path: string | null;
+      }>(
+        `SELECT source_id,
+                frontmatter->>'source_slug' AS source_slug,
+                frontmatter->>'source_path' AS source_path
+           FROM pages
+          WHERE type = 'atom'`,
+      );
+      expect(rows).toEqual([{
+        source_id: 'dept-x',
+        source_slug: 'meeting/dept-x-page',
+        source_path: null,
+      }]);
+    } finally {
+      rmSync(corpusDir, { recursive: true, force: true });
+    }
+  });
+
+  test('production transcript discovery remains enabled for the default source', async () => {
+    const corpusDir = mkdtempSync(join(tmpdir(), 'gbrain-extract-atoms-default-corpus-'));
+    const transcriptPath = join(corpusDir, '2026-07-28-global.txt');
+    writeFileSync(transcriptPath, 'global transcript '.repeat(180));
+
+    try {
+      const result = await runPhaseExtractAtoms(engine, {
+        sourceId: 'default',
+        brainDir: '/tmp/default-brain',
+        _pages: [],
+        _loadConfig: () => ({
+          dream: { synthesize: { session_corpus_dir: corpusDir } },
+        } as never),
+        _chat: stubChat('[{"title":"default-item","atom_type":"insight","body":"b"}]'),
+      });
+
+      expect(result.details?.transcripts_total).toBe(1);
+      expect(result.details?.pages_total).toBe(0);
+      const rows = await engine.executeRaw<{
+        source_id: string;
+        source_path: string | null;
+      }>(
+        `SELECT source_id,
+                frontmatter->>'source_path' AS source_path
+           FROM pages
+          WHERE type = 'atom'`,
+      );
+      expect(rows).toEqual([{
+        source_id: 'default',
+        source_path: transcriptPath,
+      }]);
+    } finally {
+      rmSync(corpusDir, { recursive: true, force: true });
+    }
+  });
+
   test('transcript-side idempotency: re-discovered same-hash transcript skipped (closes pre-existing bug)', async () => {
     const chat = stubChatUnique();
     // First run writes the atom
@@ -337,6 +447,41 @@ describe('v0.41.2.1: runPhaseExtractAtoms — dual-source merge + idempotency', 
       `SELECT COUNT(*)::int AS count FROM pages WHERE type = 'atom'`,
     );
     expect(after[0].count).toBe(before[0].count);
+  });
+
+  test('deterministic slug: source-dated + title-hashed, trailing dash stripped, re-extract upserts (no cross-day twin)', async () => {
+    // 16 three-letter words → slugifySegment output truncates ON a hyphen at the
+    // 60-char cut, exercising the trailing-dash re-strip (Bug A).
+    const title = 'aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp';
+    const chat = stubChat(`[{"title":"${title}","atom_type":"insight","body":"b"}]`);
+    // Transcript filename carries a date DIFFERENT from the run date, so a
+    // source-dated slug is observably distinct from the old run-date one.
+    const filePath = '/srv/transcripts/2026-06-12-telegram.md';
+    await runPhaseExtractAtoms(engine, {
+      _transcripts: [{ filePath, content: 'first', contentHash: 'aaaa1111bbbb2222' }],
+      _pages: [],
+      _chat: chat,
+    });
+    // Same file, GROWN content (append-only) → different contentHash, so the
+    // source-hash fast-path does NOT skip and the atom is re-extracted. Pre-fix
+    // this minted a second atom under a new run-date prefix (Bug B); the
+    // source-dated, title-hashed slug must upsert into the same row instead.
+    await runPhaseExtractAtoms(engine, {
+      _transcripts: [{ filePath, content: 'first plus appended', contentHash: 'cccc3333dddd4444' }],
+      _pages: [],
+      _chat: chat,
+    });
+    const rows = await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE type = 'atom'`,
+    );
+    expect(rows.length).toBe(1); // upsert, not a cross-day duplicate
+    const slug = rows[0].slug;
+    expect(slug.startsWith('atoms/2026-06-12/')).toBe(true); // SOURCE date, not run date
+    expect(slug).toMatch(/-[0-9a-f]{6}$/); // 6-char title-hash suffix
+    expect(slug).not.toContain('--'); // trailing dash stripped before -<hash>
+    const stem = slug.slice('atoms/2026-06-12/'.length).replace(/-[0-9a-f]{6}$/, '');
+    expect(stem.endsWith('-')).toBe(false);
+    expect(stem.length).toBeLessThanOrEqual(60);
   });
 
   test('PhaseResult.details has additive page fields populated', async () => {
@@ -391,5 +536,52 @@ describe('v0.41.2.1: runPhaseExtractAtoms — dual-source merge + idempotency', 
     });
     expect(discovered.details?.pages_total).toBe(1);
     expect(discovered.details?.atoms_extracted).toBe(1);
+  });
+});
+
+describe('#2144: zero-yield tombstone', () => {
+  test('zero-yield page is stamped and excluded from rediscovery', async () => {
+    await seedPage({ slug: 'article/zero-yield', type: 'article' });
+    // Successful LLM call that yields no atoms.
+    const result = await runPhaseExtractAtoms(engine, { _transcripts: [], _chat: stubChat('[]') });
+    expect(result.details?.pages_processed).toBe(1);
+    expect(result.details?.atoms_extracted).toBe(0);
+
+    // Stamp landed: atoms_scan_hash = first 16 chars of the page's content_hash.
+    const rows = await engine.executeRaw<{ scan: string; ch: string }>(
+      `SELECT frontmatter->>'atoms_scan_hash' AS scan, content_hash AS ch
+         FROM pages WHERE slug = 'article/zero-yield'`,
+    );
+    expect(rows[0].scan).toBe(rows[0].ch.slice(0, 16));
+
+    // No longer rediscovered.
+    const discovered = await discoverExtractablePages(engine, 'default');
+    expect(discovered.find((d) => d.slug === 'article/zero-yield')).toBeUndefined();
+  });
+
+  test('content change re-eligibilizes a tombstoned page', async () => {
+    await seedPage({ slug: 'article/evolves', type: 'article' });
+    await runPhaseExtractAtoms(engine, { _transcripts: [], _chat: stubChat('[]') });
+    expect((await discoverExtractablePages(engine, 'default')).length).toBe(0);
+
+    // Simulate an edit: content_hash moves while the stale stamp stays.
+    await engine.executeRaw(
+      `UPDATE pages SET content_hash = 'fresh-hash-after-edit' WHERE slug = $1 AND source_id = 'default'`,
+      ['article/evolves'],
+    );
+    const rediscovered = await discoverExtractablePages(engine, 'default');
+    expect(rediscovered.map((d) => d.slug)).toContain('article/evolves');
+  });
+
+  test('failed chat does NOT stamp — page stays retryable', async () => {
+    await seedPage({ slug: 'article/transient-failure', type: 'article' });
+    const failingChat = async (_o: ChatOpts): Promise<ChatResult> => { throw new Error('rate limit'); };
+    await runPhaseExtractAtoms(engine, { _transcripts: [], _chat: failingChat as never });
+    const rows = await engine.executeRaw<{ scan: string | null }>(
+      `SELECT frontmatter->>'atoms_scan_hash' AS scan FROM pages WHERE slug = 'article/transient-failure'`,
+    );
+    expect(rows[0].scan).toBeNull();
+    const discovered = await discoverExtractablePages(engine, 'default');
+    expect(discovered.map((d) => d.slug)).toContain('article/transient-failure');
   });
 });

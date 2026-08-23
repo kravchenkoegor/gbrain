@@ -107,6 +107,63 @@ describe('toModelMessages — v6 ModelMessage shape', () => {
     ]);
   });
 
+  test('Date in tool-result json output serializes to ISO string (Postgres timestamptz)', () => {
+    // node-postgres returns timestamptz columns as JS Date; AI SDK v6's
+    // JSONValue schema rejects a raw Date, dead-lettering the tool loop.
+    const msgs: ChatMessage[] = [
+      {
+        role: 'user',
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'c1',
+          toolName: 'brain_get_page',
+          output: { rows: [{ updated_at: new Date('2026-06-26T06:56:59.000Z'), nested: { created_at: new Date('2026-01-02T03:04:05.000Z') } }] },
+        }],
+      },
+    ];
+    const out = toModelMessages(msgs) as any[];
+    const value = out[0].content[0].output.value;
+    expect(out[0].content[0].output.type).toBe('json');
+    expect(value.rows[0].updated_at).toBe('2026-06-26T06:56:59.000Z');
+    expect(value.rows[0].nested.created_at).toBe('2026-01-02T03:04:05.000Z');
+    // No Date instance survives (would throw in AI SDK v6).
+    expect(value.rows[0].updated_at instanceof Date).toBe(false);
+  });
+
+  test('non-string text block is dropped (reasoning-model null-text guard)', () => {
+    // DeepSeek v4 / reasoning models can emit text:null/undefined thinking
+    // parts; AI SDK v6 rejects them. Dropped here; tool-call sibling kept.
+    const msgs: ChatMessage[] = [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: null as unknown as string },
+          { type: 'text', text: undefined as unknown as string },
+          { type: 'text', text: 'kept' },
+          { type: 'text', text: '' }, // empty string is valid — kept
+          { type: 'tool-call', toolCallId: 'c1', toolName: 'search', input: {} },
+        ],
+      },
+    ];
+    const out = toModelMessages(msgs) as any[];
+    expect(out[0].content).toEqual([
+      { type: 'text', text: 'kept' },
+      { type: 'text', text: '' },
+      { type: 'tool-call', toolCallId: 'c1', toolName: 'search', input: {} },
+    ]);
+  });
+
+  test('errored tool-result never throws on circular/bigint output (safeStringify)', () => {
+    const circular: any = {};
+    circular.self = circular;
+    const msgs: ChatMessage[] = [
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'c1', toolName: 'x', output: circular, isError: true }] },
+    ];
+    const out = toModelMessages(msgs) as any[];
+    expect(out[0].content[0].output.type).toBe('error-text');
+    expect(typeof out[0].content[0].output.value).toBe('string');
+  });
+
   test('full multi-turn conversation: user → assistant(tool-call) → tool(result)', () => {
     const msgs: ChatMessage[] = [
       { role: 'user', content: 'find widget' },
@@ -119,5 +176,56 @@ describe('toModelMessages — v6 ModelMessage shape', () => {
     expect((out[1] as any).role).toBe('assistant');
     expect((out[2] as any).role).toBe('tool');
     expect((out[2] as any).content[0].output).toEqual({ type: 'json', value: { hits: 0 } });
+  });
+
+  // #4201 — per-part provider state (Gemini 3.x thoughtSignature) rides
+  // ChatBlock.providerMetadata inbound and MUST re-attach as providerOptions
+  // outbound, and ONLY when present (absent → parts stay byte-identical).
+  describe('per-part providerMetadata echo (#4201)', () => {
+    const sig = { google: { thoughtSignature: 'opaque-sig-abc' } };
+
+    test('tool-call block with providerMetadata emits providerOptions', () => {
+      const msgs: ChatMessage[] = [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', toolCallId: 'c1', toolName: 'search', input: { q: 'x' }, providerMetadata: sig }],
+        },
+      ];
+      const out = toModelMessages(msgs) as any[];
+      expect(out[0].content[0].providerOptions).toEqual(sig);
+      expect(out[0].content[0].providerMetadata).toBeUndefined();
+    });
+
+    test('text block with providerMetadata emits providerOptions', () => {
+      const msgs: ChatMessage[] = [
+        { role: 'assistant', content: [{ type: 'text', text: 'thinking done', providerMetadata: sig }] },
+      ];
+      const out = toModelMessages(msgs) as any[];
+      expect(out[0].content[0].providerOptions).toEqual(sig);
+    });
+
+    test('tool-result block with providerMetadata emits providerOptions on the tool part', () => {
+      const msgs: ChatMessage[] = [
+        { role: 'user', content: [{ type: 'tool-result', toolCallId: 'c1', toolName: 'search', output: 'ok', providerMetadata: sig }] },
+      ];
+      const out = toModelMessages(msgs) as any[];
+      expect(out[0].role).toBe('tool');
+      expect(out[0].content[0].providerOptions).toEqual(sig);
+    });
+
+    test('blocks WITHOUT providerMetadata gain no providerOptions key (byte-identical)', () => {
+      const msgs: ChatMessage[] = [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'hi' },
+            { type: 'tool-call', toolCallId: 'c1', toolName: 'search', input: {} },
+          ],
+        },
+      ];
+      const out = toModelMessages(msgs) as any[];
+      expect('providerOptions' in out[0].content[0]).toBe(false);
+      expect('providerOptions' in out[0].content[1]).toBe(false);
+    });
   });
 });

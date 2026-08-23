@@ -26,11 +26,13 @@
 import type { BrainEngine } from '../core/engine.ts';
 import {
   runCycle,
+  resolveSourceForDir,
   ALL_PHASES,
   type CyclePhase,
   type CycleReport,
 } from '../core/cycle.ts';
 import { resolveSourceId } from '../core/source-resolver.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { fetchSource } from '../core/sources-load.ts';
 import { existsSync } from 'fs';
 import { resolve } from 'node:path';
@@ -76,6 +78,18 @@ interface DreamArgs {
   drain: boolean;
   /** Drain wallclock budget in seconds. Default 300 (5 min). */
   windowSeconds: number;
+  /**
+   * issue #2860 — `--once`. One-shot bypass of the named `--phase`'s own
+   * `dream.<phase>.enabled` / `cycle.<phase>.enabled` config gate, for this
+   * invocation only. Never reads or writes config — unlike the old
+   * "toggle enabled true, run, toggle back to false" workaround, a crash
+   * mid-run can't leave any global state stuck. Requires an explicit
+   * `--phase <name>`; bare `--once` is a usage error (there'd be no single
+   * phase to target). Applies only to phases with a config `.enabled` gate
+   * (patterns, synthesize, conversation_facts_backfill, enrich_thin,
+   * skillopt, drift) — a no-op for phases that always run when named directly.
+   */
+  once: boolean;
 }
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -105,6 +119,14 @@ function collectFlagValues(args: string[], flag: string): string[] | null {
 
 function parseArgs(args: string[]): DreamArgs {
   const phaseIdx = args.indexOf('--phase');
+  // issue #2860 (Codex P3): captured BEFORE --input/--drain get a chance to
+  // implicitly default `phase` below, so --once's validation can require
+  // the user actually TYPED --phase, not merely that some phase ended up
+  // resolved. Without this, `--input <f> --once` and `--drain --once`
+  // slip past the "explicit --phase required" contract (the derived
+  // `phase` value is already non-null by the time that check runs) and
+  // --once becomes silently ineffective for both.
+  const phaseWasExplicit = phaseIdx !== -1;
   const rawPhase = phaseIdx !== -1 ? args[phaseIdx + 1] : null;
   let phase = rawPhase && (ALL_PHASES as string[]).includes(rawPhase)
     ? (rawPhase as CyclePhase)
@@ -214,6 +236,35 @@ function parseArgs(args: string[]): DreamArgs {
     }
   }
 
+  // issue #2860: --once requires an EXPLICIT single --phase target (typed
+  // by the user, not merely implied by --input/--drain — see
+  // `phaseWasExplicit` above). Bare `--once` (full/default cycle) has no
+  // single phase to bypass the gate for, and force-enabling EVERY
+  // currently-disabled phase at once would be exactly the kind of
+  // surprise-spend risk the flag exists to prevent. An implicit phase
+  // (from --input or --drain) is rejected too: --drain returns before
+  // onceForPhase is ever read, and --input already bypasses the
+  // synthesize gate on its own, so --once would silently do nothing in
+  // either case — reject loudly instead of pretending it worked (Codex
+  // review finding).
+  //
+  // Codex review finding: `--help` must short-circuit BEFORE this exits(2),
+  // matching the "IRON RULE" pinned by test/dream.test.ts's
+  // "--help --source whatever prints help and exits 0" case — `gbrain
+  // dream --help --once` (no --phase) must show help, not a usage error.
+  const once = args.includes('--once');
+  const wantsHelp = args.includes('--help') || args.includes('-h');
+  if (once && !phaseWasExplicit && !wantsHelp) {
+    console.error(
+      '--once requires an explicit --phase <name> (bypasses that one ' +
+      'phase\'s dream.<phase>.enabled / cycle.<phase>.enabled gate for ' +
+      'this run only; never touches config). A phase implied by --input ' +
+      'or --drain does not count — --once would silently do nothing for ' +
+      'those. Usage: gbrain dream --phase <name> --once',
+    );
+    process.exit(2);
+  }
+
   return {
     json: args.includes('--json'),
     dryRun: args.includes('--dry-run'),
@@ -229,6 +280,7 @@ function parseArgs(args: string[]): DreamArgs {
     source,
     drain,
     windowSeconds,
+    once,
   };
 }
 
@@ -295,6 +347,7 @@ async function resolveBrainDir(
 
 function printHelp() {
   console.log(`Usage: gbrain dream [options]
+       gbrain dream retriage [flags]   (see: gbrain dream retriage --help)
 
 Run one brain maintenance cycle. Eight phases:
   lint -> backlinks -> sync -> synthesize -> extract -> patterns -> embed -> orphans
@@ -303,13 +356,31 @@ The synthesize + patterns phases (v0.21) consolidate yesterday's
 conversation transcripts into reflections, originals, and cross-session
 pattern pages. Designed for cron (exits when done).
 
+The synthesize phase (#4152) runs a two-stage cascade: a cheap scored triage
+(model: models.dream.triage, gate: dream.triage.threshold, default 0.5) gates
+the expensive per-transcript synthesis subagents (turn budget:
+dream.synthesize.max_turns, default 16). Retune the threshold any time —
+scores are cached, so re-gating costs zero new LLM calls. \`dream retriage\`
+re-scores the corpus and reconciles the queued synthesis backlog.
+
 Options:
   --dry-run           Preview all fixes without writing. Note: synthesize
-                      runs the cheap Haiku significance filter (caches
-                      verdicts), but skips the Sonnet synthesis pass.
+                      runs the cheap scored triage pass (caches verdicts),
+                      but skips the synthesis subagents.
                       "--dry-run" does NOT mean "zero LLM calls."
   --json              Emit the CycleReport as JSON (agent-readable)
   --phase <name>      Run a single phase: ${ALL_PHASES.join(' | ')}
+  --once              With --phase <name>: run that phase once even if its
+                      own dream.<phase>.enabled / cycle.<phase>.enabled
+                      config gate is false. Never reads or writes config —
+                      unlike toggling the flag on/off around the run, a
+                      crash mid-invocation can't leave it stuck. Applies to
+                      patterns, synthesize, conversation_facts_backfill,
+                      enrich_thin, skillopt, drift; no-op on phases with no such
+                      gate. Requires an EXPLICIT --phase <name> — a phase
+                      implied by --input or --drain does not count (bare
+                      --once, or --once with --input/--drain and no
+                      explicit --phase, is a usage error).
   --pull              git pull the brain repo before syncing (default: no pull)
   --dir <path>        Brain directory (default: configured brain). On a
                       postgres/remote brain with no local checkout, the
@@ -319,9 +390,13 @@ Options:
 
   --source <id>       Scope the cycle to one source so doctor's
                       cycle_freshness check sees a fresh stamp on
-                      completion. Without this, gbrain dream's
-                      timestamp never lands and federated brains
-                      see "stale cycle" forever.
+                      completion. When omitted, gbrain derives the
+                      source from --dir / the configured checkout
+                      when it matches a source's local_path (#1869).
+                      A named non-default source runs the deterministic
+                      freshness phases unless --phase is given
+                      (explicit phases are honored verbatim);
+                      --source default still runs the full cycle.
   --source-id <id>    Alias for --source. Matches the v0.37.7.0+
                       naming used by import/extract/graph-query.
 
@@ -353,6 +428,7 @@ Examples:
   gbrain dream
   gbrain dream --dry-run --json
   gbrain dream --phase lint
+  gbrain dream --phase patterns --once   # run once, ignore dream.patterns.enabled=false
   gbrain dream --phase synthesize --input ~/transcripts/2026-04-25.txt
   gbrain dream --phase synthesize --from 2026-04-01 --to 2026-04-25
   0 2 * * * gbrain dream --json         # nightly via cron
@@ -382,9 +458,29 @@ function printHuman(report: CycleReport) {
   }
 
   if (report.status === 'clean') {
+    // A 'clean' cycle can still carry a skip reason worth surfacing — e.g.
+    // synthesize's D8 legacy-key / D5 oversize-chunk skips leave
+    // transcripts_processed/synth_pages_written at 0 (so deriveStatus sees
+    // no activity) while `details.skips` names exactly why each transcript
+    // was passed over. Without this, `--input <already-handled-file>`
+    // prints only "Brain is healthy" with no indication anything was
+    // examined and skipped.
+    const skipLines: string[] = [];
+    for (const p of report.phases) {
+      const skips = (p.details as { skips?: Array<{ filePath: string; reason: string }> } | undefined)?.skips;
+      if (Array.isArray(skips)) {
+        for (const s of skips) {
+          skipLines.push(`  - ${p.phase}: ${s.filePath} (${s.reason})`);
+        }
+      }
+    }
     console.log(
       `Brain is healthy. ${report.phases.length} phase(s) checked in ${(report.duration_ms / 1000).toFixed(1)}s.`,
     );
+    if (skipLines.length > 0) {
+      console.log('Skipped:');
+      for (const line of skipLines) console.log(line);
+    }
     return;
   }
 
@@ -396,6 +492,17 @@ function printHuman(report: CycleReport) {
       p.status === 'skipped' ? '-' : '✗';
     const line = `  ${icon} ${p.phase.padEnd(10)}  ${p.summary}`;
     console.log(line);
+    const details = p.details as Record<string, unknown> | undefined;
+    const failures = Array.isArray(details?.failures) ? details.failures : [];
+    if (failures.length > 0) {
+      for (const f of failures) {
+        // sync failures carry `source`; synthesize_concepts failures carry
+        // `concept` — name whichever is present so a concept-synthesis
+        // failure isn't printed as an anonymous '?'.
+        const { source, concept, error } = f as { source?: string; concept?: string; error?: string };
+        console.log(`      ✗ ${source ?? concept ?? '?'}: ${error ?? 'unknown error'}`);
+      }
+    }
     if (p.error) {
       const hint = p.error.hint ? ` (${p.error.hint})` : '';
       console.log(`      [${p.error.class}/${p.error.code}] ${p.error.message}${hint}`);
@@ -416,6 +523,14 @@ function printHuman(report: CycleReport) {
     );
   }
 }
+
+// ── Test-only export ───────────────────────────────────────
+// `__testing` re-exports otherwise-private helpers so unit tests can pin
+// CLI output behavior without spawning a subprocess. Not part of the
+// runtime contract.
+export const __testing = {
+  printHuman,
+};
 
 // ─── CLI entry ─────────────────────────────────────────────────────
 
@@ -506,6 +621,33 @@ async function runDrain(
 }
 
 export async function runDream(engine: BrainEngine | null, args: string[]): Promise<CycleReport | void> {
+  // ─── `dream retriage` subverb (#4152) — dispatched BEFORE parseArgs so its
+  // flag set never collides with the cycle flags. `dream --help` never reaches
+  // here (args[0] is '--help'); `dream retriage --help` prints subcommand help
+  // inside runDreamRetriage without touching the engine (same IRON RULE).
+  if (args[0] === 'retriage') {
+    const { runDreamRetriage } = await import('./dream-retriage.ts');
+    await runDreamRetriage(engine, args.slice(1));
+    return;
+  }
+  // Fail-loud guard (structured-review r3 P1): the CLI flag registry unions
+  // retriage's flags into `dream`, so the pre-dispatch validator accepts
+  // `gbrain dream --reconcile-queue` — but without the `retriage` positional,
+  // parseArgs would ignore the flag and silently run the full (paid, writing)
+  // maintenance cycle instead of the reconciliation the user asked for.
+  {
+    const RETRIAGE_ONLY_FLAGS = ['--reconcile-queue', '--cancel-unmatched', '--audit-rejects'];
+    const stray = args.find(a => RETRIAGE_ONLY_FLAGS.includes(a));
+    if (stray) {
+      console.error(
+        `gbrain dream: ${stray} belongs to the 'retriage' subcommand — ` +
+        `did you mean: gbrain dream retriage ${args.join(' ')}`,
+      );
+      setCliExitVerdict(2);
+      return;
+    }
+  }
+
   const opts = parseArgs(args);
 
   // ─── IRON RULE: --help short-circuits BEFORE any engine-bearing work ─
@@ -572,6 +714,25 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
     );
     process.exit(1);
   }
+
+  // #1869: a path-scoped run (--dir, or the configured sync.repo_path) whose
+  // directory matches a registered source's local_path IS that source's cycle
+  // — derive the source id so runCycle writes last_source_cycle_at /
+  // last_full_cycle_at on success and doctor's cycle_freshness check stops
+  // reading perpetually stale. Explicit --source still wins (resolved above).
+  // Fixed here at the command level, NOT in runCycle's stamp gate, so legacy
+  // global callers (autopilot-global-maintenance runs GLOBAL_PHASES with a
+  // brainDir and no sourceId) can't falsely stamp per-source freshness.
+  // A derived match on an archived source is skipped silently (falls back to
+  // legacy unscoped behavior) — stamping it would mask staleness on restore,
+  // mirroring the explicit --source archived guard above.
+  if (resolvedSourceId === undefined && engine !== null && brainDir !== null) {
+    const derived = await resolveSourceForDir(engine, brainDir);
+    if (derived !== undefined) {
+      const src = await fetchSource(engine, derived);
+      if (src?.archived !== true) resolvedSourceId = derived;
+    }
+  }
   // ─── issue #1678: bounded single-hold extract_atoms drain ──────────
   if (opts.drain) {
     if (engine === null) {
@@ -594,6 +755,9 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
     synthFrom: opts.from ?? undefined,
     synthTo: opts.to ?? undefined,
     synthBypassDreamGuard: opts.bypassDreamGuard,
+    // issue #2860: opts.phase is guaranteed non-null here when opts.once is
+    // set (parseArgs enforces --once requires --phase).
+    onceForPhase: opts.once ? opts.phase! : undefined,
   });
 
   if (opts.json) {

@@ -25,6 +25,7 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { LATEST_VERSION } from '../../src/core/migrate.ts';
+import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const skip = !DATABASE_URL;
@@ -34,6 +35,7 @@ describe.skipIf(skip)('PostgresEngine forward-reference bootstrap (E2E)', () => 
 
   beforeAll(async () => {
     engine = new PostgresEngine();
+    assertSafeE2eDatabaseUrl(DATABASE_URL!);
     await engine.connect({ database_url: DATABASE_URL! });
   }, 30_000);
 
@@ -90,6 +92,131 @@ describe.skipIf(skip)('PostgresEngine forward-reference bootstrap (E2E)', () => 
     await engine.initSchema();
     expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
   });
+
+  test('pre-v121 timeline shape converges to full final shape on REAL Postgres (#2626 wedge class)', async () => {
+    // The v121 wedge was Postgres-visible in production (blob CREATE INDEX
+    // on a column migration v121 hadn't added yet); the PGLite twins live in
+    // test/bootstrap.test.ts. Rewind schema AND the version counter to the
+    // wedged cohort's true state, then assert full initSchema convergence:
+    // column + FK + BOTH partial indexes, ledger at LATEST.
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    await conn.unsafe(`
+      DROP INDEX IF EXISTS idx_timeline_event_dedup;
+      DROP INDEX IF EXISTS idx_timeline_event_page;
+      ALTER TABLE timeline_entries DROP CONSTRAINT IF EXISTS timeline_entries_event_page_id_fkey;
+      ALTER TABLE timeline_entries DROP COLUMN IF EXISTS event_page_id;
+    `);
+    await engine.setConfig('version', '120');
+
+    await engine.initSchema();
+
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+    const col = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'timeline_entries' AND column_name = 'event_page_id'
+    `;
+    expect(col).toHaveLength(1);
+    const fk = await conn`
+      SELECT conname FROM pg_constraint WHERE conname = 'timeline_entries_event_page_id_fkey'
+    `;
+    expect(fk).toHaveLength(1);
+    const idx = await conn`
+      SELECT indexname FROM pg_indexes
+      WHERE tablename = 'timeline_entries'
+        AND indexname IN ('idx_timeline_event_page', 'idx_timeline_event_dedup')
+    `;
+    expect(idx).toHaveLength(2);
+  }, 60_000);
+
+  test('pre-v7 minion_jobs shape (scanner-sweep wedge class) converges on REAL Postgres', async () => {
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    await conn.unsafe(`
+      DROP INDEX IF EXISTS idx_minion_jobs_timeout;
+      DROP INDEX IF EXISTS uniq_minion_jobs_idempotency;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS timeout_at;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS idempotency_key;
+    `);
+
+    await engine.initSchema();
+
+    const cols = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'minion_jobs'
+        AND column_name IN ('timeout_at', 'idempotency_key')
+    `;
+    expect(cols).toHaveLength(2);
+    const idx = await conn`
+      SELECT indexname FROM pg_indexes
+      WHERE tablename = 'minion_jobs'
+        AND indexname IN ('idx_minion_jobs_timeout', 'uniq_minion_jobs_idempotency')
+    `;
+    expect(idx).toHaveLength(2);
+  }, 60_000);
+
+  test('pre-v136 minion_jobs private-queue shape (dream-inline lifecycle) converges on REAL Postgres', async () => {
+    // v0.46.25 (#4332): the private-queue owner/lease columns are migration-
+    // added AND referenced by the blob partial indexes — the same wedge class
+    // as v121 and pre-v7 above. Strip all three columns + both indexes, then
+    // assert the bootstrap → SCHEMA_SQL replay re-adds every piece.
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    await conn.unsafe(`
+      DROP INDEX IF EXISTS idx_minion_jobs_private_queue_recovery;
+      DROP INDEX IF EXISTS idx_minion_jobs_private_queue_owner;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_owner_job_id;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_owner_token;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_lease_until;
+    `);
+
+    await engine.initSchema();
+
+    const cols = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'minion_jobs'
+        AND column_name IN ('private_queue_owner_job_id', 'private_queue_owner_token', 'private_queue_lease_until')
+    `;
+    expect(cols).toHaveLength(3);
+    const idx = await conn`
+      SELECT indexname, indexdef FROM pg_indexes
+      WHERE tablename = 'minion_jobs'
+        AND indexname IN ('idx_minion_jobs_private_queue_recovery', 'idx_minion_jobs_private_queue_owner')
+    `;
+    expect(idx).toHaveLength(2);
+    // The recovery index must come back PARTIAL — the dream-inline predicate
+    // is what keeps the startup recovery scan off the general job table.
+    const recovery = idx.find(
+      (r: { indexname: string; indexdef: string }) => r.indexname === 'idx_minion_jobs_private_queue_recovery',
+    );
+    expect(recovery?.indexdef).toContain('dream-inline-');
+  }, 60_000);
+
+  test('token-only-missing minion_jobs is repaired by the pq_token probe on REAL Postgres (749a7dcb)', async () => {
+    // Partial-upgrade shape: ONLY private_queue_owner_token is missing.
+    // Neither blob index references the token, so SCHEMA_SQL replay cannot
+    // crash on it, and the ledger is already at LATEST so runMigrations won't
+    // re-run v136 — the ONLY repair path is the minion_jobs_pq_token_exists
+    // probe (749a7dcb) triggering the bootstrap's three-column ALTER block.
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    await conn.unsafe(`
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_owner_token;
+    `);
+
+    await engine.initSchema();
+
+    const cols = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'minion_jobs'
+        AND column_name = 'private_queue_owner_token'
+    `;
+    expect(cols).toHaveLength(1);
+  }, 60_000);
 
   // Migration v120 — schema-lint hardening (#1647 / #171). Postgres-only
   // assertions (security_invoker has no surface on embedded PGLite).
