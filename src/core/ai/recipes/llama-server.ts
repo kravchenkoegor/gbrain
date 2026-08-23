@@ -32,9 +32,7 @@ export const llamaServer: Recipe = {
   },
   touchpoints: {
     embedding: {
-      models: ['bge-m3', 'qwen3-embedding-4b'], // LOCAL PATCH (Egor): upstream ships [] which trips
-      // 'user_provided_model_unset' in gateway.ts:708 (empty models → treated as
-      // unset regardless of config). Declare the served model so embed proceeds.
+      models: [], // user-driven; whatever model the server was launched with
       user_provided_models: true,
       default_dims: 0, // forces explicit --embedding-dimensions
       trust_custom_dims: true, // #2271: user knows the launched model's native dim
