@@ -312,6 +312,33 @@ function whichSafe(bin: string): string | null {
   }
 }
 
+/** Optional overrides for the three harness-detection probes.
+ *
+ * Production leaves every field unset, so `resolveDeps` keeps its `Bun.which`
+ * defaults. E2E tests MUST pin them: `Bun.which` resolves against the live
+ * PATH and reads the real password-database HOME, so it ignores a test's
+ * remapped HOME/PATH entirely. Without a pin, an otherwise hermetic test
+ * silently asserts something different depending on which agent CLIs the host
+ * happens to have installed — `claude` is on a developer laptop's PATH but
+ * absent from a GitHub runner, so the claude lane never ran in CI, no
+ * `claude mcp add` was exec'd, and no user-scope settings file was written.
+ */
+export interface HarnessDetectOverrides {
+  claude?: () => boolean;
+  codex?: () => boolean;
+  opencode?: () => boolean;
+}
+
+/** Narrow the overrides to the HarnessDeps keys, omitting absent probes so
+ * resolveDeps' production defaults stay in charge of anything not pinned. */
+export function harnessDetectDeps(o?: HarnessDetectOverrides): Partial<HarnessDeps> {
+  return {
+    ...(o?.claude ? { detectClaude: o.claude } : {}),
+    ...(o?.codex ? { detectCodex: o.codex } : {}),
+    ...(o?.opencode ? { detectOpencode: o.opencode } : {}),
+  };
+}
+
 /** Production mint: open the configured engine just long enough to insert. */
 async function defaultMint(opts: { name: string; scopes: string[]; sourceGrant?: string[] }): Promise<MintedLegacyToken> {
   const cfg = loadConfig();
@@ -1604,7 +1631,11 @@ export function parseClaudeMcpGetBearer(out: string): string | null {
 /** Parse the bearer token out of OUR managed codex block. When
  * `expectedUrl` is given, the block's `url` must match it ([C8] parity with
  * the claude-lane recovery): a hand-edited block pointing at another brain's
- * serve carries a credential that must never be transmitted to receipt.url. */
+ * serve carries a credential that must never be transmitted to receipt.url.
+ * Reads the current `http_headers = { Authorization = "Bearer <t>" }` shape
+ * (#4574 — codex-cli >=0.149 rejects inline `bearer_token`), with a legacy
+ * `bearer_token = "<t>"` fallback so machines wired by older gbrain still
+ * have their token recovered for status/rotation. */
 export function parseCodexBlockBearer(configText: string, expectedUrl?: string): string | null {
   const norm = configText.replace(/\r\n/g, '\n');
   // The shared writer constants — inline copies here would silently stop
@@ -1616,6 +1647,12 @@ export function parseCodexBlockBearer(configText: string, expectedUrl?: string):
   if (expectedUrl !== undefined) {
     const u = block.match(/^url\s*=\s*"((?:[^"\\]|\\.)*)"\s*$/m);
     if (!u || u[1].replace(/\\(.)/g, '$1') !== expectedUrl) return null;
+  }
+  const h = block.match(/^http_headers\s*=\s*\{\s*Authorization\s*=\s*"((?:[^"\\]|\\.)*)"\s*\}\s*$/m);
+  if (h) {
+    const value = h[1].replace(/\\(.)/g, '$1');
+    // A non-Bearer Authorization header is a hand-edit — not ours to recover.
+    return value.startsWith('Bearer ') ? value.slice('Bearer '.length) : null;
   }
   const m = block.match(/^bearer_token\s*=\s*"((?:[^"\\]|\\.)*)"\s*$/m);
   if (!m) return null;

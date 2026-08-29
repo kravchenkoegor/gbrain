@@ -16,6 +16,7 @@
 import { readFileSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { buildReflexAddition, warmReflex, type ResolveEntitiesFn as ReflexResolveEntitiesFn } from './context/reflex.ts';
+import { backupNagReadOnlyConsult, backupNoticeText, loadBackupStatus } from './backup/status-file.ts';
 // Types inlined from openclaw/plugin-sdk to avoid hard dependency during development.
 // At runtime inside OpenClaw, the real SDK is available; these types ensure build compat.
 
@@ -813,6 +814,13 @@ export function createGBrainContextEngine(ctx: {
     checkpointMemo.set(sessionId, memo);
   }
   let _envelope: string | null = null;
+  // Monthly backup-coverage line: in-process 24h latch. assemble() composes
+  // server-side and cannot know delivery, so this channel NEVER writes nag
+  // state (read-only consult of the shared dampener + global monthly cap).
+  // The latch advances on every CONSULT (not just shows) so a long-lived
+  // serve pays at most one file read per 24h — an ok verdict must not cost
+  // I/O on every turn, and a repeat line stays impossible.
+  let _backupCheckedAt = 0;
   async function envelope(): Promise<string> {
     if (_envelope !== null) return _envelope;
     try {
@@ -1091,7 +1099,7 @@ export function createGBrainContextEngine(ctx: {
       return { ingested: true };
     },
 
-    async assemble({ sessionId, sessionKey, messages, tokenBudget, availableTools, citationsMode }) {
+    async assemble({ sessionId, sessionKey, messages, tokenBudget, availableTools, citationsMode, prompt }) {
       // Lazy SDK load on first method call (was top-level await pre-L0-B).
       await ensureSdkLoaded();
 
@@ -1099,6 +1107,16 @@ export function createGBrainContextEngine(ctx: {
       // turn; a host that sends messages:undefined (or a non-array) must not
       // take down the whole context pipeline.
       const msgs = Array.isArray(messages) ? messages : [];
+
+      // Some OpenClaw runtimes (e.g. the codex-app-server in 2026.7.x) deliver
+      // the current user turn via `prompt` with an empty `messages` array.
+      // Synthesize a single user turn so the Retrieval Reflex still sees the
+      // text (the deterministic live-context/pass-through path is unaffected).
+      const effectiveMessages = msgs.length > 0
+        ? msgs
+        : (typeof prompt === 'string' && prompt.trim()
+            ? ([{ role: 'user', content: prompt }] as typeof msgs)
+            : msgs);
 
       // 1. Generate deterministic context (<5ms, zero LLM calls)
       const liveCtx = generateLiveContext(workspaceDir);
@@ -1131,11 +1149,11 @@ export function createGBrainContextEngine(ctx: {
       // nothing salient resolves. Detect + point, never auto-dump bodies.
       const reflexAddition = await buildReflexAddition({
         workspaceDir,
-        currentUserText: getLastUserText(msgs),
-        priorContextText: getPriorContextText(msgs),
+        currentUserText: getLastUserText(effectiveMessages),
+        priorContextText: getPriorContextText(effectiveMessages),
         // v0.43 (#2095): rolling window — assistant-introduced entities and
         // named-antecedent follow-ups from recent turns now resolve too.
-        windowTurns: getWindowTurns(msgs),
+        windowTurns: getWindowTurns(effectiveMessages),
         resolveEntities: ctx.resolveEntities,
       });
 
@@ -1148,6 +1166,22 @@ export function createGBrainContextEngine(ctx: {
       if (checkpointBlock) parts.push(checkpointBlock);
       if (memoryAddition) parts.push(memoryAddition);
       if (reflexAddition) parts.push(reflexAddition);
+
+      // Monthly backup-coverage warning (⚠ idiom, model-visible). Bounded by
+      // the recording channels' budget without ever spending it; fail-open.
+      try {
+        const now = Date.now();
+        if (now - _backupCheckedAt > 24 * 60 * 60 * 1000) {
+          _backupCheckedAt = now;
+          const backupStatus = loadBackupStatus();
+          if (backupStatus && backupNagReadOnlyConsult(backupStatus, now)) {
+            const note = backupNoticeText(backupStatus, 'human');
+            if (note) parts.push(`- ⚠️ ${note}`);
+          }
+        }
+      } catch {
+        /* a notice must never break context assembly */
+      }
 
       // 4. Pass through messages unchanged (legacy assembly)
       return {

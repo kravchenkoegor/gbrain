@@ -1271,15 +1271,24 @@ async function runPhaseSync(
     // doesn't report a clean run over a wedged source. Timeout-class partials
     // keep the pre-existing 'ok' mapping (they converge on retry by design).
     const pullFailedPartial = result.status === 'partial' && result.reason === 'pull_failed';
+    // Untracked-gap fix: uncommitted working-tree drift (files invisible to
+    // commit-driven sync) surfaces as 'warn', not a clean 'ok +0' — a nightly
+    // cycle over a dirty vault otherwise reports convergence it never achieved.
+    const uncommittedTotal = result.uncommitted
+      ? result.uncommitted.added + result.uncommitted.modified + result.uncommitted.deleted
+      : 0;
+    const uncommittedNote = uncommittedTotal > 0
+      ? `; ${uncommittedTotal} uncommitted file(s) invisible to commit-driven sync — commit them or set sync.include_working_tree=true`
+      : '';
     return {
       phase: 'sync',
-      status: result.status === 'blocked_by_failures' || pullFailedPartial ? 'warn' : 'ok',
+      status: result.status === 'blocked_by_failures' || pullFailedPartial || uncommittedTotal > 0 ? 'warn' : 'ok',
       duration_ms: 0,
       summary: dryRun
         ? `${syncedCount} page(s) would sync, ${result.deleted} would delete`
         : pullFailedPartial
           ? `git pull failed, nothing imported — source may be behind its remote (sync anchor unchanged)`
-          : `+${result.added} added, ~${result.modified} modified, -${result.deleted} deleted`,
+          : `+${result.added} added, ~${result.modified} modified, -${result.deleted} deleted${uncommittedNote}`,
       details: {
         added: result.added,
         modified: result.modified,
@@ -1289,6 +1298,7 @@ async function runPhaseSync(
         failedFiles: result.failedFiles ?? 0,
         syncStatus: result.status,
         ...(result.reason ? { syncReason: result.reason } : {}),
+        ...(result.uncommitted ? { uncommitted: result.uncommitted } : {}),
         dryRun,
       },
       pagesAffected: result.pagesAffected,
@@ -2087,9 +2097,10 @@ export async function runCycle(
       };
   let lockStolenAbort = false;
   // Raced variant for the 5 long phases (synthesize / extract_atoms / patterns
-  // / synthesize_concepts / consolidate): their opts can't carry a signal yet
-  // (W6), so a steal must be able to stop the WAIT even though the phase's
-  // in-flight work runs to its own bounded timeout. Steal-free cycles behave
+  // / synthesize_concepts / consolidate): even where their opts now carry the
+  // signal (#4077 synthesize/patterns, consolidate), a steal must be able to
+  // stop the WAIT while the phase unwinds cooperatively; extract_atoms and
+  // synthesize_concepts still can't carry one (W6). Steal-free cycles behave
   // byte-identically to timePhase.
   const racedTimePhase = <T,>(fn: () => Promise<T>) => raceStolen(timePhase(fn));
 
@@ -2235,6 +2246,10 @@ export async function runCycle(
           // (explicit --source wins, else derived from the checkout dir).
           sourceId: cycleSourceId,
           once: opts.onceForPhase === 'synthesize',
+          // #4077: combined external-abort + lock-steal signal, so a
+          // cancelled cycle stops judge calls, inline children, and
+          // derived-state writes instead of running out the grace period.
+          signal: cycleSignal,
           // #4168 sibling: clamp child-subagent timeouts to the remaining
           // job budget (same collision shape as propose_takes, cross-process
           // timeout domain — clamped via the patterns.ts childBudget template).
@@ -2456,6 +2471,8 @@ export async function runCycle(
           // source owns the page, which is what doctor reports as
           // multi_source_drift.
           sourceId: cycleSourceId,
+          // #4077: same cooperative-cancellation threading as synthesize.
+          signal: cycleSignal,
         }));
         result.duration_ms = duration_ms;
         phaseResults.push(result);
@@ -2495,6 +2512,11 @@ export async function runCycle(
         const { runPhaseSynthesizeConcepts } = await import('./cycle/synthesize-concepts.ts');
         const { result, duration_ms } = await racedTimePhase(() => runPhaseSynthesizeConcepts(engine, {
           brainDir: brainDir ?? undefined,
+          // #4416: thread the cycle's resolved source into the phase's page/
+          // receipt/rollup writes; the engine's `?? 'default'` fallback
+          // misfiles (or kills the cycle on the createVersion update path) on
+          // any brain without a source literally named 'default'.
+          sourceId: cycleSourceId,
           dryRun,
           // v0.41.19.0 (T3): closure refreshes cycle lock + fires outer hook.
           yieldDuringPhase: buildYieldDuringPhase(lock, opts.yieldDuringPhase, onStolen),

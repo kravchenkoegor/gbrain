@@ -5,7 +5,8 @@
 //      via a single raw SQL query (NOT EXISTS subquery filters out
 //      pages already extracted by content hash — see "Idempotency" below).
 //   2. Dedup by content_hash; transcripts win on collision.
-//   3. Per work-item, ask Haiku for 1-3 atoms.
+//   3. Per work-item, ask the configured extract_atoms model (key-aware
+//      utility-tier default, see resolveExtractAtomsModel below) for 1-3 atoms.
 //   4. Write each atom via importFromContent(slug, markdown, {sourceId})
 //      with sourceId threaded so federated brains route correctly. The
 //      canonical import path (not engine.putPage) is what chunks and embeds
@@ -50,6 +51,7 @@
 // which made the NOT EXISTS guard ineffective on federated brains.
 
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
+import { stripReasoningBlocks } from '../llm-json.ts';
 import type { PhaseResult } from '../cycle.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { ProgressReporter } from '../progress.ts';
@@ -57,14 +59,21 @@ import { chat as gatewayChat, withBudgetTracker, isAvailable } from '../ai/gatew
 import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { importFromContent } from '../import-file.ts';
 import { serializeMarkdown } from '../markdown.ts';
+import { truncateUtf8 } from '../text-safe.ts';
 import { BudgetExhausted, BudgetTracker, isModelPriceable } from '../budget/budget-tracker.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { createHash } from 'crypto';
 import { slugifySegment } from '../sync.ts';
+import { resolveTierDefault } from '../model-config.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
-const DEFAULT_EXTRACT_ATOMS_MODEL = 'anthropic:claude-haiku-4-5';
+// #4529 + #4540: per-item extractor caps, overridable via
+// cycle.extract_atoms.* config keys (max_input_chars — with the #4529
+// legacy alias max_source_chars — plus max_output_tokens / pacing_ms).
+// Exported so tests pin the defaults instead of re-hardcoding the literals.
+export const DEFAULT_EXTRACT_MAX_INPUT_CHARS = 50_000;
+export const DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 4096;
 
 /**
  * gbrain#4148: consecutive same-content failures of a content-deterministic
@@ -261,6 +270,7 @@ export async function discoverExtractablePages(
   engine: BrainEngine,
   sourceId: string,
   affectedSlugs?: string[],
+  limit: number = PAGE_DISCOVERY_BUDGET,
 ): Promise<DiscoveredPage[]> {
   const hasFilter = Array.isArray(affectedSlugs) && affectedSlugs.length > 0;
   const sql = `
@@ -293,7 +303,7 @@ export async function discoverExtractablePages(
     sourceId,
     await resolveExtractableTypes(),
     MIN_PAGE_CHARS_FOR_EXTRACTION,
-    PAGE_DISCOVERY_BUDGET,
+    limit,
   ];
   if (hasFilter) params.push(affectedSlugs);
 
@@ -385,6 +395,19 @@ export async function countExtractAtomsBacklog(
   }
 }
 
+async function resolvePageDiscoveryLimit(engine: BrainEngine): Promise<number> {
+  try {
+    const configured = await engine.getConfig('cycle.extract_atoms.page_discovery_budget');
+    if (configured) {
+      const n = Number(configured);
+      // Ceiling: discovery selects full compiled_truth bodies per row, so an
+      // oversized budget materializes that many pages in one result set.
+      if (Number.isFinite(n) && n > 0) return Math.min(Math.floor(n), 10_000);
+    }
+  } catch { /* keep default */ }
+  return PAGE_DISCOVERY_BUDGET;
+}
+
 /**
  * Batch source-hash idempotency check. Returns the set of contentHash16
  * values that already have an atom row for this source. One SQL
@@ -423,6 +446,40 @@ export async function atomsExistingForHashes(
     console.error(`[extract_atoms] batch idempotency check failed (assuming none extracted): ${msg}`);
     return new Set();
   }
+}
+
+/**
+ * The exact two-step model resolution `runPhaseExtractAtoms` uses:
+ * `models.dream.extract_atoms` DB config wins if set (same plain-`||`
+ * truthiness as always — a whitespace-only value IS "configured"), else the
+ * key-aware `resolveTierDefault('utility')`. Deliberately NOT
+ * `resolveModel()`'s fuller chain (which also honors `models.tier.utility`,
+ * `models.default`, and an env var) — extract_atoms has never read those, and
+ * unifying the two behaviors is a separate, larger change. Exported so
+ * `gbrain models` can report the actual routing instead of a generic chain
+ * that can diverge from it in partially-configured installs; `source` comes
+ * from the SAME call as `model` so the report's attribution can never
+ * disagree with the resolved value. Fail-soft: a throwing config read routes
+ * to the tier default (the same end state runPhaseExtractAtoms's config-read
+ * try/catch has always produced).
+ */
+export async function resolveExtractAtomsModelWithSource(
+  engine: BrainEngine,
+): Promise<{ model: string; source: 'config' | 'tier_default' }> {
+  let configuredModel: string | null = null;
+  try {
+    configuredModel = await engine.getConfig('models.dream.extract_atoms');
+  } catch {
+    // Fail-soft — fall through to the tier default.
+  }
+  return configuredModel
+    ? { model: configuredModel, source: 'config' }
+    : { model: resolveTierDefault('utility'), source: 'tier_default' };
+}
+
+/** String-returning wrapper for runtime callers (`runPhaseExtractAtoms`). */
+export async function resolveExtractAtomsModel(engine: BrainEngine): Promise<string> {
+  return (await resolveExtractAtomsModelWithSource(engine)).model;
 }
 
 /**
@@ -486,7 +543,12 @@ export async function runPhaseExtractAtoms(
   if (opts._pages !== undefined) {
     pages = opts._pages;
   } else {
-    pages = await discoverExtractablePages(engine, sourceId, opts.affectedSlugs);
+    pages = await discoverExtractablePages(
+      engine,
+      sourceId,
+      opts.affectedSlugs,
+      await resolvePageDiscoveryLimit(engine),
+    );
   }
 
   // 2. Apply transcript-side source-hash idempotency in ONE batch query
@@ -581,7 +643,7 @@ export async function runPhaseExtractAtoms(
     };
   }
 
-  // 4. Per work-item: extract atoms via Haiku
+  // 4. Per work-item: extract atoms via the configured extract_atoms model
   let totalAtomsExtracted = 0;
   let transcriptsProcessed = 0;
   let pagesProcessed = 0;
@@ -590,18 +652,58 @@ export async function runPhaseExtractAtoms(
   const failures: Array<{ source: string; error: string }> = [];
   let estimatedSpendUsd = 0;
   let budgetExhausted = false;
-  let extractModel = DEFAULT_EXTRACT_ATOMS_MODEL;
+  // #3813: key-aware tier default, not a hardcoded Anthropic model — an
+  // OPENAI_API_KEY-only install must not route to an unservable provider.
+  // Pre-computed so a config-read failure inside the try below (caught, see
+  // "Keep safe defaults" comment) still leaves extractModel on this default,
+  // matching the pre-refactor fail-soft behavior exactly.
+  let extractModel = resolveTierDefault('utility');
   let budgetCap = DEFAULT_BUDGET_USD;
+  // #4529/#4540: the per-item input/output caps were hardcoded (slice(0, 50_000) +
+  // maxTokens: 4096). Operators on small-context or thinking models need to
+  // shrink/grow both without a code change; defaults are unchanged.
+  let maxInputChars = DEFAULT_EXTRACT_MAX_INPUT_CHARS;
+  let maxOutputTokens = DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS;
+  let pacingMs = 0;
   try {
-    const configuredModel = await engine.getConfig('models.dream.extract_atoms');
-    if (configuredModel) extractModel = configuredModel;
+    extractModel = await resolveExtractAtomsModel(engine);
     const configuredBudget = await engine.getConfig('cycle.extract_atoms.budget_usd');
     if (configuredBudget) {
       const n = Number(configuredBudget);
       if (Number.isFinite(n) && n > 0) budgetCap = n;
     }
+    // #4529: legacy input-cap key (its own floor of 500 chars, as landed).
+    // Read FIRST so the newer #4540 max_input_chars key below wins when
+    // both are set — they name the same knob.
+    const configuredMaxSourceChars = await engine.getConfig('cycle.extract_atoms.max_source_chars');
+    if (configuredMaxSourceChars) {
+      const n = Number(configuredMaxSourceChars);
+      if (Number.isFinite(n) && n >= 500) maxInputChars = Math.floor(n);
+    }
+    const configuredMaxInput = await engine.getConfig('cycle.extract_atoms.max_input_chars');
+    if (configuredMaxInput) {
+      const n = Number(configuredMaxInput);
+      // Floor of 1000 chars: below that the extractor sees a fragment too
+      // small to yield atoms and every page burns budget for nothing.
+      if (Number.isFinite(n) && n >= 1_000) maxInputChars = Math.floor(n);
+    }
+    const configuredMaxOutput = await engine.getConfig('cycle.extract_atoms.max_output_tokens');
+    if (configuredMaxOutput) {
+      const n = Number(configuredMaxOutput);
+      // Floor of 256 tokens mirrors dream.triage.max_tokens: a smaller cap
+      // truncates every response into the malformed-output failure path.
+      if (Number.isFinite(n) && n >= 256) maxOutputTokens = Math.floor(n);
+    }
+    // Optional per-item pacing sleep (ms) so a large backlog doesn't hammer
+    // a local/self-hosted provider back-to-back. 0 (default) = no pacing.
+    const configuredPacing = await engine.getConfig('cycle.extract_atoms.pacing_ms');
+    if (configuredPacing) {
+      const n = Number(configuredPacing);
+      if (Number.isFinite(n) && n > 0) pacingMs = Math.min(60_000, Math.floor(n));
+    }
   } catch {
-    // Keep safe defaults: Haiku + $0.30.
+    // Keep safe defaults on any config-read failure: key-aware utility-tier
+    // model, $0.30 cap, default input cap (max_input_chars).
   }
   // A cost cap is only meaningful for a model the tracker can price.
   // BudgetTracker.reserve() hard-fails with BudgetExhausted(reason:'no_pricing')
@@ -714,16 +816,21 @@ export async function runPhaseExtractAtoms(
         messages: [
           {
             role: 'user',
-            content: `Source: ${originLabel}\n\n---\n\n${item.content.slice(0, 50_000)}`,
+            // #4529/#4540: configurable input cap, cut UTF-8-safely (a bare
+            // .slice() can split a surrogate pair at the boundary).
+            content: `Source: ${originLabel}\n\n---\n\n${truncateUtf8(item.content, maxInputChars)}`,
           },
         ],
-        maxTokens: 4096,
+        maxTokens: maxOutputTokens,
       });
       // Post-await yield: closes the "long LLM call past TTL" hazard
       // codex flagged. The 30s throttle inside maybeYield bounds the
       // actual refresh rate so this is cheap when calls are fast.
       await maybeYield();
       llmHalt.reset();
+      // #4540: optional per-item pacing between successful LLM calls.
+      // setTimeout (not setImmediate) so the lock-refresh interval fires.
+      if (pacingMs > 0) await new Promise<void>((r) => setTimeout(r, pacingMs));
 
       estimatedSpendUsd = budgetTracker.totalSpent;
 
@@ -1013,6 +1120,23 @@ export type AtomsParseOutcome =
   | { ok: false; reason: string };
 
 export function parseAtomsOutcome(raw: string): AtomsParseOutcome {
+  const direct = parseAtomsOutcomeInner(raw);
+  if (direct.ok) return direct;
+  // Same reasoning-block hazard as the facts extractor: `indexOf('[')` below
+  // finds a bracket inside <think> when the model drafts its array while
+  // reasoning, so the parse fails and the page is halted. Ladder, not a
+  // pre-filter: raw first, stripped only on failure — and the ORIGINAL
+  // outcome is returned when the retry also fails, so error reasons are
+  // unchanged for non-reasoning models.
+  const stripped = stripReasoningBlocks(raw);
+  if (stripped && stripped !== raw.trim()) {
+    const retry = parseAtomsOutcomeInner(stripped);
+    if (retry.ok) return retry;
+  }
+  return direct;
+}
+
+function parseAtomsOutcomeInner(raw: string): AtomsParseOutcome {
   // Strip markdown code fences if the LLM wrapped JSON in them.
   let cleaned = raw.trim();
   const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);

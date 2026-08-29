@@ -12,7 +12,7 @@ import { clampSearchLimit } from '../engine.ts';
 import type { Page, PageType } from '../types.ts';
 import { importFromContent } from '../import-file.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
-import { writePageThrough, type WriteThroughResult } from '../write-through.ts';
+import { writePageThrough, deletePageThrough, resolvePageWriteTarget, type WriteThroughResult } from '../write-through.ts';
 import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from '../link-extraction.ts';
 // #3190: pack-aware link typing on the put_page auto-link path.
 import { loadActivePackForLocalEngine } from '../schema-pack/best-effort.ts';
@@ -22,7 +22,6 @@ import type { WriterLintPayload } from '../output/post-write.ts';
 import { stripFactsFence } from '../facts-fence.ts';
 import { getContentFlag } from '../quarantine.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
-import { isValidSourceId, ALL_SOURCES } from '../source-id.ts';
 import { resolveExcludePrivatePages, isPrivatePage, findPrivateOnlySlugs } from '../search/private-visibility.ts';
 import { LIST_PAGES_DESCRIPTION, CAPTURE_DESCRIPTION } from '../operations-descriptions.ts';
 import { OperationError } from './contract.ts';
@@ -33,44 +32,11 @@ import {
   enforceClientSlugFence,
   federatedSearchScope,
   normalizeSlugPrefix,
+  parseSourceIdParam,
   validatePageSlug,
 } from './context.ts';
 
 // --- Page CRUD ---
-
-/**
- * #4329: parse a per-call `source_id` param. Pre-fix, get_page / delete_page /
- * restore_page had NO source_id in their contracts, so an agent-passed
- * source_id was SILENTLY dropped and the op acted on ctx.sourceId —
- * soft-deleting the WRONG row on a multi-source brain while returning a
- * success that named the requested slug. A caller-supplied value is either
- * honored or rejected loudly — never ignored. `allowAll` admits the
- * `__all__` sentinel for read ops (resolveRequestedScope collapses it per
- * trust); destructive ops target exactly one source and reject it.
- */
-function parseSourceIdParam(
-  raw: unknown,
-  opName: string,
-  opts?: { allowAll?: boolean },
-): string | undefined {
-  if (raw === undefined || raw === null) return undefined;
-  if (typeof raw === 'string') {
-    if (raw === ALL_SOURCES) {
-      if (opts?.allowAll === true) return raw;
-      throw new OperationError(
-        'invalid_params',
-        `${opName}: source_id '${ALL_SOURCES}' is not a valid target — this op acts on exactly one source.`,
-        'Pass the single source_id of the row to target, or omit source_id to use the ambient source scope.',
-      );
-    }
-    if (isValidSourceId(raw)) return raw;
-  }
-  throw new OperationError(
-    'invalid_params',
-    `${opName}: invalid source_id ${JSON.stringify(raw)} — must be 1-32 lowercase alnum chars with optional interior hyphens.`,
-    'Pass a registered source id (see list_sources), or omit source_id to use the ambient source scope.',
-  );
-}
 
 /**
  * #4329 (S1-tightened): write-authority gate for a per-call source_id on the
@@ -117,6 +83,30 @@ async function dropPrivateSlugs(
 ): Promise<string[]> {
   const hidden = await findPrivateOnlySlugs(engine, candidates, scope, { includeDeleted });
   return candidates.filter(c => !hidden.has(c));
+}
+
+/**
+ * #3625: strip the takes/private-facts fences from BOTH compiled_truth and
+ * timeline before a page reaches an untrusted reader. Pre-#3625 this only
+ * covered compiled_truth — a `## Facts` fence written below the
+ * `<!-- timeline -->` sentinel lands in the `timeline` column (splitBody's
+ * split boundary), which get_page/fetch_page returned verbatim, unstripped.
+ * A private fact fence misplaced there was fully readable by any remote MCP
+ * caller. Same stripping rule as compiled_truth: takes fence dropped
+ * entirely, facts fence keeps only `world`-visibility rows.
+ */
+function stripPrivacyFencesForRemoteReader(page: Page): Page {
+  return {
+    ...page,
+    compiled_truth: stripFactsFence(
+      stripTakesFence(page.compiled_truth),
+      { keepVisibility: ['world'] },
+    ),
+    timeline: stripFactsFence(
+      stripTakesFence(page.timeline ?? ''),
+      { keepVisibility: ['world'] },
+    ),
+  };
 }
 
 const get_page: Operation = {
@@ -181,7 +171,25 @@ const get_page: Operation = {
     }
 
     if (!page) {
-      throw new OperationError('page_not_found', `Page not found: ${slug}`, includeDeleted ? 'Check the slug or use fuzzy: true' : 'Page may be soft-deleted; pass include_deleted: true to verify');
+      let hint = includeDeleted ? 'Check the slug or use fuzzy: true' : 'Page may be soft-deleted; pass include_deleted: true to verify';
+      // #4516: source scoping is by-design isolation, but the miss diagnostic
+      // should say WHERE the slug actually lives. Trusted local callers only
+      // (`ctx.remote === false`) — for a remote caller the probe would be a
+      // cross-source existence oracle outside its grant. Only when the lookup
+      // was actually scoped (an unscoped read already spanned every source).
+      if (ctx.remote === false && (sourceOpts.sourceId !== undefined || sourceOpts.sourceIds !== undefined)) {
+        try {
+          // gbrain-allow-unscoped-getpage: read-only diagnostic existence probe —
+          // deliberately spans all sources to name where the slug lives.
+          const elsewhere = await ctx.engine.getPage(slug, { includeDeleted });
+          if (elsewhere && !(excludePrivate && isPrivatePage(elsewhere.frontmatter))) {
+            hint = `Page exists in source '${elsewhere.source_id}' — pass --source ${elsewhere.source_id} (source_id: '${elsewhere.source_id}' over MCP). ${hint}`;
+          }
+        } catch {
+          // Diagnostic only — a probe failure must never mask the real error.
+        }
+      }
+      throw new OperationError('page_not_found', `Page not found: ${slug}`, hint);
     }
 
     // v0.37.0 (D11): op-layer write-back for the `last_retrieved_at` stale
@@ -222,13 +230,7 @@ const get_page: Operation = {
     //    untrusted readers see them. Private facts never cross the boundary.
     const isUntrustedReader = ctx.remote === true;
     const visibleBody = isUntrustedReader
-      ? {
-          ...page,
-          compiled_truth: stripFactsFence(
-            stripTakesFence(page.compiled_truth),
-            { keepVisibility: ['world'] },
-          ),
-        }
+      ? stripPrivacyFencesForRemoteReader(page)
       : page;
     // v0.42 (#1699) agent-warning channel: surface the page's content_flag
     // marker as a top-level field (parallel to SearchResult.content_flag) so
@@ -300,13 +302,7 @@ const fetch_page: Operation = {
     // true — every MCP transport) never see takes or private facts fences.
     const visibleBody = ctx.remote === false
       ? page
-      : {
-          ...page,
-          compiled_truth: stripFactsFence(
-            stripTakesFence(page.compiled_truth),
-            { keepVisibility: ['world'] },
-          ),
-        };
+      : stripPrivacyFencesForRemoteReader(page);
     return {
       id: page.slug,
       title: page.title,
@@ -328,10 +324,10 @@ const fetch_page: Operation = {
 
 const put_page: Operation = {
   name: 'put_page',
-  description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).',
+  description: 'Write or replace a page (markdown with frontmatter). REPLACES the entire page; this is not a partial edit. Before modifying an existing page, read its canonical content with `get_page include_content:true`, then submit the complete page. Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. Remote (MCP) callers: body wikilinks are NOT reconciled into the graph — auto_link/auto_timeline are skipped for untrusted writers (response reports auto_links: {skipped: "remote"}); use local capture/put_page for link extraction. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).',
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
-    content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
+    content: { type: 'string', required: true, description: 'Complete markdown content with YAML frontmatter. REPLACES the entire page; this is not a partial edit. Read the canonical page first with `get_page include_content:true` before modifying it.' },
     allow_empty: { type: 'boolean', required: false, description: 'Allow overwriting an existing non-empty page with empty/whitespace-only content (default: false). Without it, put_page rejects the empty overwrite — the empty-stdin failure class.' },
     // v0.39.3.0 provenance write-through (WARN-8 + A1 + CV6). Optional fields
     // for trusted local callers (capture CLI, autopilot, dream cycle). Remote
@@ -347,6 +343,7 @@ const put_page: Operation = {
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
+    validatePageSlug(slug);
 
     // v0.39.3.0 CV6 trust gate for provenance write-through (WARN-8).
     // Only trusted LOCAL callers (ctx.remote === false — capture CLI,
@@ -524,8 +521,8 @@ const put_page: Operation = {
     // v0.38 put_page write-through (ingestion cathedral):
     // After importFromContent succeeds, if `sync.repo_path` resolves to a
     // real directory, persist the markdown file to disk alongside the DB
-    // row. Failures non-fatal — DB write is durable; subsequent sync
-    // reconciles drift.
+    // row. A failure here is fatal to the call (see the check right below)
+    // except for the deliberate DB-only configurations.
     //
     // Trust gating:
     //   - Subagent sandbox (viaSubagent without allowedSlugPrefixes) → DB-only.
@@ -557,6 +554,42 @@ const put_page: Operation = {
       writeThrough = { written: false, skipped: 'dry_run' };
     }
 
+    // The markdown file is the system of record (docs/architecture/
+    // system-of-record.md); the DB row is a derived cache. The deliberate,
+    // by-design DB-only outcomes are `no_repo_configured` (no `sync.repo_path`
+    // set at all), `disabled_by_config` (operator opted out via
+    // `sync.write_through=false`), `subagent_sandbox`, and `dry_run` (no real
+    // write was supposed to happen). Every other non-written outcome — a
+    // thrown write error, or a guard that REFUSED to write into an existing
+    // repo (missing dir, sibling-source collision, escaped path, case-fold
+    // clash, unreadable row) — means a file was supposed to exist and
+    // doesn't, so put_page must not report success.
+    if (writeThrough && !writeThrough.written
+      && writeThrough.skipped !== 'no_repo_configured'
+      && writeThrough.skipped !== 'disabled_by_config'
+      && writeThrough.skipped !== 'subagent_sandbox'
+      && writeThrough.skipped !== 'dry_run') {
+      // Roll back rather than leave an index-only orphan, but only when this
+      // call is what created the row: created_at === updated_at is set by
+      // the SAME insert statement (the ON CONFLICT UPDATE branch never
+      // touches created_at), so equality here means "brand new, this call."
+      // An update (or a dedup hit resolved to a pre-existing page) is left
+      // alone — the prior file on disk still matches the prior DB content.
+      try {
+        const row = await ctx.engine.getPage(result.slug, { sourceId: ctx.sourceId ?? 'default' });
+        if (row && row.created_at.getTime() === row.updated_at.getTime()) {
+          await ctx.engine.deletePage(result.slug, { sourceId: ctx.sourceId ?? 'default' });
+        }
+      } catch {
+        // best-effort; the error thrown below still surfaces the failure
+      }
+      throw new OperationError(
+        'storage_error',
+        `put_page: the page content could not be written to disk (${writeThrough.skipped ?? writeThrough.error}).`,
+        'Check that the configured repo path exists and is writable, then retry.',
+      );
+    }
+
     // Auto-link post-hook: runs AFTER importFromContent (which is its own
     // transaction). Runs even on status='skipped' so reconciliation catches drift
     // between the page text and the links table. Failures are non-blocking.
@@ -571,9 +604,9 @@ const put_page: Operation = {
     let autoLinks:
       | { created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[] }
       | { error: string }
-      | { skipped: 'remote' }
+      | { skipped: 'remote'; hint?: string }
       | undefined;
-    let autoTimeline: { created: number } | { error: string } | { skipped: 'remote' } | undefined;
+    let autoTimeline: { created: number } | { error: string } | { skipped: 'remote'; hint?: string } | undefined;
     // Trusted-workspace path (v0.23 dream cycle) re-enables auto-link/timeline
     // even though ctx.remote=true, because the allow-list bounds the slug and
     // the synthesis prompt is itself the trusted dispatcher. Without this,
@@ -584,8 +617,14 @@ const put_page: Operation = {
       && Array.isArray(ctx.allowedSlugPrefixes)
       && ctx.allowedSlugPrefixes.length > 0;
     if (ctx.remote !== false && !trustedWorkspace) {
-      autoLinks = { skipped: 'remote' };
-      autoTimeline = { skipped: 'remote' };
+      // #4525: say WHY and what to do about it — pre-fix the bare
+      // {skipped: 'remote'} left agents believing their body wikilinks had
+      // been reconciled into the graph.
+      const hint = 'auto_link/auto_timeline run for trusted local writers only; '
+        + 'body wikilinks were saved as text but NOT reconciled into the graph. '
+        + 'Use local `gbrain capture`/`gbrain call put_page` for link extraction.';
+      autoLinks = { skipped: 'remote', hint };
+      autoTimeline = { skipped: 'remote', hint };
     } else if (result.parsedPage) {
       try {
         const enabled = await isAutoLinkEnabled(ctx.engine);
@@ -1074,6 +1113,18 @@ const delete_page: Operation = {
     const sourceOpts = requestedSource
       ? { sourceId: requestedSource }
       : ctx.sourceId ? { sourceId: ctx.sourceId } : {};
+    // #4022 trust gating: sandbox subagents (viaSubagent without
+    // allowedSlugPrefixes) stay DB-only, matching put_page's write-through gate.
+    const isSandboxSubagent = ctx.viaSubagent === true
+      && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
+    // #4022: resolve the artifact target BEFORE softDeletePage stamps
+    // deleted_at — resolvePageWriteTarget reads the recorded source_path from
+    // active rows only, so a post-stamp resolution would fall back to the
+    // slug-derived twin and miss the real artifact.
+    const wtSourceId = sourceOpts.sourceId ?? 'default';
+    const target = isSandboxSubagent
+      ? undefined
+      : await resolvePageWriteTarget(ctx.engine, slug, wtSourceId);
     // v0.26.5: rewired from hard-delete to soft-delete. The hard-delete primitive
     // (engine.deletePage) is now reserved for purgeDeletedPages and explicit
     // tests. softDeletePage returns null when the slug is unknown OR already
@@ -1088,9 +1139,18 @@ const delete_page: Operation = {
       }
       return { status: 'already_soft_deleted', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), deleted_at: existing.deleted_at };
     }
+    // #4022: remove the on-disk artifact too. Pre-fix this was DB-only, so the
+    // deleted page's `.md` survived, any timer-based commit (snapshot cron,
+    // hardened post-commit push) pushed it back into git, and the next
+    // `gbrain sync` resurrected the page. Best-effort like put_page's
+    // write-through: a skip/error never fails the delete (the DB row is the
+    // durable sink and the stale file reconciles on the next sync).
+    const writeThrough = isSandboxSubagent
+      ? { removed: false, skipped: 'subagent_sandbox' as const }
+      : await deletePageThrough(ctx.engine, slug, { sourceId: wtSourceId, logger: ctx.logger, target });
     // Echo the targeted source so a multi-source caller can verify WHICH row
     // the delete landed on (#4329's false-confidence failure mode).
-    return { status: 'soft_deleted', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), recoverable_until: 'now + 72h via restore_page' };
+    return { status: 'soft_deleted', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), recoverable_until: 'now + 72h via restore_page', write_through: writeThrough };
   },
   cliHints: { name: 'delete', positional: ['slug'] },
 };
@@ -1124,7 +1184,18 @@ const restore_page: Operation = {
       }
       return { status: 'already_active', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}) };
     }
-    return { status: 'restored', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}) };
+    // #4022: re-render the artifact — delete_page now removes it, so without
+    // this a restored page has a DB row and no file, and `sync --full`'s
+    // delete-reconcile treats the missing artifact as a user deletion,
+    // silently re-deleting the page that was just restored. Keeps the two
+    // sinks symmetric across the delete/restore pair; sandbox subagents stay
+    // DB-only, matching put_page's trust gate.
+    const isSandboxSubagent = ctx.viaSubagent === true
+      && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
+    const writeThrough = isSandboxSubagent
+      ? { written: false, skipped: 'subagent_sandbox' as const }
+      : await writePageThrough(ctx.engine, slug, { sourceId: sourceOpts.sourceId, logger: ctx.logger });
+    return { status: 'restored', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), write_through: writeThrough };
   },
   cliHints: { name: 'restore', positional: ['slug'] },
 };

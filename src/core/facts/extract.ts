@@ -22,6 +22,7 @@
  */
 
 import { chat, embedOne, isAvailable } from '../ai/gateway.ts';
+import { stripReasoningBlocks } from '../llm-json.ts';
 import type { ChatResult } from '../ai/gateway.ts';
 import { INJECTION_PATTERNS } from '../think/sanitize.ts';
 import { resolveModel } from '../model-config.ts';
@@ -88,6 +89,8 @@ export const ALL_EXTRACT_KINDS: readonly FactKind[] = [
   'event', 'preference', 'commitment', 'belief', 'fact',
 ] as const;
 
+export type FactNotability = 'high' | 'medium' | 'low';
+
 /**
  * #4209 — max entity hints forwarded to the extractor prompt. Anything past
  * this is silently dropped by the prompt builder, so the cap is NAMED here
@@ -119,6 +122,11 @@ export interface ExtractInput {
   abortSignal?: AbortSignal;
   /** Cap on number of facts returned per turn. Defaults to 10. */
   maxFactsPerTurn?: number;
+  /** Optional pre-embedding admission selector for extracted fact tiers. */
+  notabilityAdmission?: {
+    allowed: readonly FactNotability[];
+    invalid: 'drop';
+  };
 }
 
 /** A pre-INSERT fact ready for the engine.insertFact path. */
@@ -429,8 +437,13 @@ export async function extractFactsFromTurnWithOutcome(
       ? (candidate.kind as FactKind)
       : 'fact';
     const confidence = clampConfidence(candidate.confidence);
-    const notability = ['high', 'medium', 'low'].includes(candidate.notability || '')
-      ? (candidate.notability as 'high' | 'medium' | 'low')
+    const validTier = ['high', 'medium', 'low'].includes(candidate.notability ?? '');
+    if (input.notabilityAdmission) {
+      const tier = validTier ? candidate.notability as FactNotability : null;
+      if (!tier || !input.notabilityAdmission.allowed.includes(tier)) continue;
+    }
+    const notability: FactNotability = validTier
+      ? candidate.notability as FactNotability
       : 'medium';
 
     let embedding: Float32Array | null = null;
@@ -531,6 +544,21 @@ interface ParsedExtractorShape {
 }
 
 function parseExtractorJsonDetailed(raw: string): ParsedExtractorShape | null {
+  const direct = parseExtractorJsonDetailedInner(raw);
+  if (direct) return direct;
+  // Reasoning models emit a <think> block before the answer, and draft their
+  // JSON inside it. The substring scan below starts at the first `{`, so it
+  // spans from a draft brace inside the reasoning to the real closing brace
+  // and fails — recorded as malformed output, which then burns a retry LLM
+  // call that usually fails the same way. Ladder, not a pre-filter: raw is
+  // tried first, so a fact legitimately containing "<think>" still parses
+  // byte-identically.
+  const stripped = stripReasoningBlocks(raw);
+  if (stripped && stripped !== raw.trim()) return parseExtractorJsonDetailedInner(stripped);
+  return null;
+}
+
+function parseExtractorJsonDetailedInner(raw: string): ParsedExtractorShape | null {
   const cleaned = raw.trim().replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '');
   // Strict.
   const direct = tryArrayShapeDetailed(cleaned);

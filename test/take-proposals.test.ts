@@ -154,6 +154,37 @@ describe('acceptProposal', () => {
     expect(row.acted_at).not.toBeNull();
   });
 
+  test('#4480 TOCTOU: concurrent accepts — exactly one wins, one fence write, loser gets not_pending', async () => {
+    const id = await insertProposal({
+      slug: 'companies/acme-example', claim: 'Acme signs exactly one concurrent deal', kind: 'take',
+    });
+    // Pre-fix (fence write first, status flip after, rowcount ignored) BOTH
+    // callers passed the pending check, BOTH appended the take to the .md,
+    // and BOTH reported success. Post-fix the claim CAS runs first, so only
+    // the winner touches the fence.
+    const results = await Promise.allSettled([
+      acceptProposal({ engine, brainDir: repo, sourceId: 'default', actedBy: 'racer-a' }, id),
+      acceptProposal({ engine, brainDir: repo, sourceId: 'default', actedBy: 'racer-b' }, id),
+    ]);
+    const wins = results.filter((r) => r.status === 'fulfilled');
+    const losses = results.filter((r) => r.status === 'rejected');
+    expect(wins.length).toBe(1);
+    expect(losses.length).toBe(1);
+    const lossReason = (losses[0] as PromiseRejectedResult).reason;
+    expect(lossReason).toBeInstanceOf(TakeProposalError);
+    expect((lossReason as TakeProposalError).code).toBe('not_pending');
+
+    // Exactly ONE copy of the claim in the markdown fence.
+    const fence = parseTakesFence(readFileSync(join(repo, 'companies/acme-example.md'), 'utf-8'));
+    const copies = fence.takes.filter((t) => t.claim === 'Acme signs exactly one concurrent deal');
+    expect(copies.length).toBe(1);
+
+    // Row is stamped once, with the winner's identity + promoted_row_num.
+    const row = await proposalRow(id);
+    expect(row.status).toBe('accepted');
+    expect(row.promoted_row_num).not.toBeNull();
+  });
+
   test('double-accept refuses with not_pending', async () => {
     const id = await insertProposal({ slug: 'companies/widget-co', claim: 'Widget-co raises fund-a next year' });
     await acceptProposal({ engine, brainDir: repo, sourceId: 'default' }, id);
@@ -162,6 +193,23 @@ describe('acceptProposal', () => {
       throw new Error('should have thrown');
     } catch (err) {
       expect((err as TakeProposalError).code).toBe('not_pending');
+    }
+  });
+
+  test('wave-g: stranded claim (accepted, no promoted take) surfaces the repair SQL on retry', async () => {
+    // The crash-between-CAS-and-fence-write shape (#4480 residual): the row
+    // is status='accepted' with promoted_row_num NULL — invisible in the
+    // pending list, so the retry path must name it and print the repair.
+    const id = await insertProposal({ slug: 'people/strand-example', claim: 'stranded claim', status: 'accepted' });
+    try {
+      await acceptProposal({ engine, brainDir: repo }, id);
+      throw new Error('expected acceptProposal to throw for the stranded row');
+    } catch (e) {
+      expect(e).toBeInstanceOf(TakeProposalError);
+      expect((e as TakeProposalError).code).toBe('not_pending');
+      expect((e as Error).message).toContain('stranded');
+      expect((e as Error).message).toContain(`SET status='pending'`);
+      expect((e as Error).message).toContain(String(id));
     }
   });
 
@@ -216,6 +264,20 @@ describe('rejectProposal', () => {
       expect((err as TakeProposalError).code).toBe('not_pending');
     }
   });
+
+  test('#4480 TOCTOU: concurrent rejects — exactly one wins the CAS', async () => {
+    const id = await insertProposal({ slug: 'companies/widget-co', claim: 'reject: raced claim' });
+    const results = await Promise.allSettled([
+      rejectProposal({ engine, sourceId: 'default', actedBy: 'racer-a' }, id),
+      rejectProposal({ engine, sourceId: 'default', actedBy: 'racer-b' }, id),
+    ]);
+    // Pre-fix both resolved (the loser's no-op UPDATE went unchecked).
+    expect(results.filter((r) => r.status === 'fulfilled').length).toBe(1);
+    const loss = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+    expect((loss.reason as TakeProposalError).code).toBe('not_pending');
+    const row = await proposalRow(id);
+    expect(row.status).toBe('rejected');
+  });
 });
 
 describe('coerceProposalKind', () => {
@@ -243,6 +305,94 @@ describe('CLI dispatcher (#2411 no-fallthrough)', () => {
     const parsed = JSON.parse(out);
     expect(Array.isArray(parsed)).toBe(true);
     expect(parsed.some((r: { claim_text: string }) => r.claim_text === 'cli: pending list claim')).toBe(true);
+  });
+
+  test('`takes propose --json` normalizes Postgres BigInt proposal rows (#4634)', async () => {
+    const id = await insertProposal({
+      slug: 'companies/acme-example',
+      claim: 'cli: bigint proposal row',
+    });
+    const originalExecuteRaw = engine.executeRaw;
+    engine.executeRaw = (async <T>(query: string, params?: unknown[]): Promise<T[]> => {
+      const rows = await originalExecuteRaw.call(engine, query, params) as T[];
+      if (!query.includes('FROM take_proposals') || !query.includes("status = 'pending'")) {
+        return rows;
+      }
+      return rows.map((row) => {
+        const record = row as Record<string, unknown>;
+        return {
+          ...record,
+          id: BigInt(Number(record.id)),
+          weight: String(record.weight),
+          promoted_row_num: record.promoted_row_num == null
+            ? null
+            : BigInt(Number(record.promoted_row_num)),
+        } as T;
+      });
+    }) as typeof engine.executeRaw;
+
+    try {
+      const out = await captureStdout(() =>
+        runTakes(engine, ['propose', '--json', '--limit', '100'])
+      );
+      const parsed = JSON.parse(out) as Array<{ id: number; claim_text: string }>;
+      const row = parsed.find((candidate) => candidate.claim_text === 'cli: bigint proposal row');
+      expect(row?.id).toBe(id);
+      expect(typeof row?.id).toBe('number');
+    } finally {
+      engine.executeRaw = originalExecuteRaw;
+    }
+  });
+
+  test('accept path normalizes a munged old-shape loadProposal row (BigInt/string id, string weight)', async () => {
+    // loadProposal's SELECT (`FROM take_proposals WHERE id = $1`) is a
+    // DIFFERENT query from listPendingProposals' — a Postgres driver
+    // returning BigInt ids / NUMERIC-as-string weights on THAT read must be
+    // normalized before the row reaches the fence write and the caller.
+    const id = await insertProposal({
+      slug: 'companies/acme-example',
+      claim: 'accept: munged driver row',
+      weight: 0.65,
+    });
+    const originalExecuteRaw = engine.executeRaw;
+    engine.executeRaw = (async <T>(query: string, params?: unknown[]): Promise<T[]> => {
+      const rows = await originalExecuteRaw.call(engine, query, params) as T[];
+      // Match ONLY the loadProposal SELECT — the id-keyed single-row read.
+      if (!query.includes('FROM take_proposals') || !query.includes('WHERE id = $1')) {
+        return rows;
+      }
+      return rows.map((row) => {
+        const record = row as Record<string, unknown>;
+        return {
+          ...record,
+          id: BigInt(Number(record.id)),
+          weight: String(record.weight),
+          promoted_row_num: record.promoted_row_num == null
+            ? null
+            : BigInt(Number(record.promoted_row_num)),
+        } as T;
+      });
+    }) as typeof engine.executeRaw;
+
+    try {
+      const { proposal, rowNum } = await acceptProposal(
+        { engine, brainDir: repo, sourceId: 'default', actedBy: 'people/tester' },
+        id,
+      );
+      // The public numeric row contract: normalized id AND weight.
+      expect(proposal.id).toBe(id);
+      expect(typeof proposal.id).toBe('number');
+      expect(typeof proposal.weight).toBe('number');
+      expect(proposal.weight).toBeCloseTo(0.65, 6);
+      expect(rowNum).toBeGreaterThan(0);
+      // The promoted take carries the numeric weight through to the DB mirror.
+      const takes = await engine.listTakes({ page_slug: 'companies/acme-example', active: true });
+      const promoted = takes.find((t) => t.claim === 'accept: munged driver row');
+      expect(promoted).toBeDefined();
+      expect(Number(promoted!.weight)).toBeCloseTo(0.65, 6);
+    } finally {
+      engine.executeRaw = originalExecuteRaw;
+    }
   });
 
   test('`takes propose --accept <id>` promotes and reports the fence row', async () => {

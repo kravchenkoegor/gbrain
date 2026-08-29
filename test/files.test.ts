@@ -1,35 +1,16 @@
 import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
-import { writeFileSync, mkdirSync, rmSync, symlinkSync, mkdtempSync } from 'fs';
+import { writeFileSync, readFileSync, mkdirSync, rmSync, symlinkSync, mkdtempSync } from 'fs';
 import { join, basename } from 'path';
 import { createHash } from 'crypto';
-import { extname } from 'path';
 import { tmpdir } from 'os';
-import { collectFiles, formatFileSizeKb } from '../src/commands/files.ts';
+import { collectFiles, formatFileSizeKb, getMimeType, noStorageBackendMessage } from '../src/commands/files.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import * as db from '../src/core/db.ts';
 
 const TMP = join(import.meta.dir, '.tmp-files-test');
 
-// These functions are not exported from files.ts, so we reimplement and test
-// the logic patterns to ensure correctness. If they ever get exported, switch
-// to direct imports.
-
-const MIME_TYPES: Record<string, string> = {
-  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
-  '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
-  '.pdf': 'application/pdf', '.mp4': 'video/mp4', '.m4a': 'audio/mp4',
-  '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.heic': 'image/heic',
-  '.tiff': 'image/tiff', '.tif': 'image/tiff', '.dng': 'image/x-adobe-dng',
-  '.doc': 'application/msword',
-  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  '.xls': 'application/vnd.ms-excel',
-  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-};
-
-function getMimeType(filePath: string): string | null {
-  const ext = extname(filePath).toLowerCase();
-  return MIME_TYPES[ext] || null;
-}
+// fileHash is not exported from files.ts (it takes a path there, not a
+// buffer), so it stays reimplemented below. getMimeType is imported.
 
 function fileHash(content: Buffer): string {
   return createHash('sha256').update(content).digest('hex');
@@ -121,6 +102,26 @@ describe('getMimeType', () => {
 
   test('handles .dng (raw photos)', () => {
     expect(getMimeType('RAW_001.dng')).toBe('image/x-adobe-dng');
+  });
+
+  test('handles the audio containers transcription accepts', () => {
+    expect(getMimeType('memo.ogg')).toBe('audio/ogg');
+    expect(getMimeType('memo.flac')).toBe('audio/flac');
+    expect(getMimeType('memo.mpga')).toBe('audio/mpeg');
+    expect(getMimeType('clip.webm')).toBe('video/webm');
+    expect(getMimeType('clip.mpeg')).toBe('video/mpeg');
+  });
+
+  // upload-raw routes on `mimeType?.startsWith('audio/'|'video/'|'image/')`.
+  // A null MIME is falsy, so any transcribable format missing from MIME_TYPES
+  // is silently classified as small text and copied into the brain git repo.
+  test('every extension transcription.ts accepts routes as media', () => {
+    const transcribable = ['.mp3', '.mp4', '.mpeg', '.mpga', '.m4a', '.wav', '.webm', '.ogg', '.flac'];
+    const notMedia = transcribable.filter(ext => {
+      const mime = getMimeType(`voice-memo${ext}`);
+      return !mime || !/^(audio|video)\//.test(mime);
+    });
+    expect(notMedia).toEqual([]);
   });
 });
 
@@ -446,5 +447,51 @@ describe('files verify git lane (per-source root resolution)', () => {
       exitSpy.mockRestore();
       rmSync(srcDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('storage precondition — the silent-no-op class (#4022)', () => {
+  test('refusal message names the subcommand and why it refuses', () => {
+    const msg = noStorageBackendMessage('upload');
+    expect(msg).toContain('gbrain files upload');
+    // The two facts a user needs: nothing was stored, and metadata-only is why.
+    expect(msg).toContain('refusing to continue');
+    expect(msg).toMatch(/metadata only|no blob column/);
+    expect(noStorageBackendMessage('redirect')).toContain('gbrain files redirect');
+  });
+
+  /**
+   * The guard rung: a bug is a sample, not the population. `upload`, `sync`,
+   * and `redirect` each tested storage permissively (`if (config?.storage)`)
+   * and continued when the answer was "no" — inserting rows, printing
+   * "uploaded", and in `redirect` unlinking local originals whose bytes had
+   * never left the machine. This scan fails if anyone reintroduces the
+   * permissive form, so the whole class stays dead rather than just the three
+   * instances.
+   */
+  test('[GUARD] no storage-dependent path uses the permissive `if (config?.storage)` form', () => {
+    const src = readFileSync(join(import.meta.dir, '..', 'src', 'commands', 'files.ts'), 'utf8');
+    // Strip comments so prose describing the old bug doesn't trip the scan.
+    const code = src
+      .split('\n')
+      .filter((l) => {
+        const t = l.trim();
+        return !t.startsWith('*') && !t.startsWith('//') && !t.startsWith('/*');
+      })
+      .join('\n');
+
+    expect(code).not.toMatch(/if\s*\(\s*config\?\.storage\s*\)/);
+    // And the storage-dependent commands must route through the shared guard.
+    for (const op of ['upload', 'sync', 'mirror', 'redirect']) {
+      expect(code).toContain(`requireStorageBackend('${op}')`);
+    }
+  });
+
+  test('[GUARD] verify never hardcodes its mismatch/missing counts', () => {
+    const src = readFileSync(join(import.meta.dir, '..', 'src', 'commands', 'files.ts'), 'utf8');
+    // The original printed `${verified} files verified, 0 mismatches, 0 missing`
+    // with both counts literal, so phantom rows reported as verified.
+    expect(src).not.toMatch(/files verified, 0 mismatches, 0 missing/);
+    expect(src).toContain('${verified} files verified, ${mismatches} mismatches, ${missing} missing');
   });
 });

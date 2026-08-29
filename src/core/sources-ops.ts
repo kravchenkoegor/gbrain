@@ -174,6 +174,26 @@ export interface AddSourceOpts {
     /** Installation id; optional, first installation is used when absent. */
     appInstallId?: number;
   };
+  /**
+   * v0.47: register a google-kind source (Gmail/Calendar/Contacts sync).
+   * API-backed like github; credentials come from the vault
+   * (`gbrain google connect`), and `account` is only a pointer into it —
+   * no secret ever lands in sources.config. See src/core/google/google-source.ts.
+   */
+  google?: {
+    /** Account email — vault credential pointer (vault mode) or identity only. */
+    account: string;
+    /** Subset of gmail,calendar,contacts (comma-joined into config). */
+    services: string[];
+    /** Backfill/reconcile window in days. */
+    historyDays: number;
+    /** Managed dir where pages are materialized. */
+    dir: string;
+    /** Token acquisition: gbrain vault (default), a token-printing command, or an env var. */
+    access?: 'vault' | 'command' | 'env';
+    tokenCommand?: string;
+    tokenEnv?: string;
+  };
 }
 
 export interface RemoveSourceOpts {
@@ -385,6 +405,30 @@ export async function addSource(
     // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- localPath only flows here from the trusted local CLI: the sources_add op hard-rejects `path` unless ctx.remote === false (remote callers get null), so this is the operator registering their own directory; absolutizing it is the #3696 fix
     opts = { ...opts, localPath: resolvePath(msysToNativePath(opts.localPath)) };
   }
+  if (opts.cloneDir) {
+    // #3696 residual: same phantom-path class as localPath above — a relative
+    // `--clone-dir clones/x` was stored verbatim as local_path, so every
+    // consumer running from a different cwd (launchd daemon at cwd=/,
+    // autopilot dispatch, sync anchors) join-resolved a path that does not
+    // exist and silently missed the clone.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- cloneDir only flows here from the trusted local CLI (sources_add hard-rejects it unless ctx.remote === false); absolutizing the operator's own directory is the #3696 fix
+    opts = { ...opts, cloneDir: resolvePath(msysToNativePath(opts.cloneDir)) };
+  }
+  if (opts.github) {
+    // #3696 residual (sibling of the cloneDir case above): `--kind github
+    // --dir clones/x` stores opts.github.dir verbatim as local_path (Path C
+    // below never resolves it), so the same phantom-path class survives
+    // through the github-kind registration path — a launchd daemon at
+    // cwd=/, autopilot dispatch, or a sync anchor running from a different
+    // cwd than the CLI join-resolves a path that does not exist.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- opts.github.dir only flows here from the trusted local CLI (sources_add hard-rejects opts.github unless ctx.remote === false); absolutizing the operator's own directory is the #3696 fix
+    opts = { ...opts, github: { ...opts.github, dir: resolvePath(msysToNativePath(opts.github.dir)) } };
+  }
+  if (opts.google) {
+    // Same #3696 phantom-path class as the github dir above.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- opts.google.dir only flows here from the trusted local CLI (sources_add hard-rejects opts.google unless ctx.remote === false); absolutizing the operator's own directory is the #3696 fix
+    opts = { ...opts, google: { ...opts.google, dir: resolvePath(msysToNativePath(opts.google.dir)) } };
+  }
 
   // Q4: pre-flight collision check before any clone work.
   const existing = await engine.executeRaw<{ id: string; local_path: string | null }>(
@@ -402,7 +446,8 @@ export async function addSource(
     existing[0]!.local_path === null &&
     !!opts.localPath &&
     !opts.remoteUrl &&
-    !opts.github;
+    !opts.github &&
+    !opts.google;
   if (existing.length > 0 && !attachPath) {
     const pathNote = existing[0]!.local_path
       ? ` with local_path ${existing[0]!.local_path}`
@@ -554,6 +599,39 @@ export async function addSource(
         config.gh_app_install_id = opts.github.appInstallId;
       }
     }
+    const displayName = opts.name ?? opts.id;
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+           VALUES ($1, $2, $3, $4::text::jsonb)`,
+      [opts.id, displayName, finalPath, JSON.stringify(config)],
+    );
+  } else if (opts.google) {
+    // ── Path D: --kind google (v0.47) ─────────────────────────────────────
+    // API-backed source: no git repo, no clone. Credentials live in the
+    // vault; config carries only the account POINTER (mirrors gh_token_env
+    // storing an env NAME — check:source-config-leak stays trivially green).
+    const finalPath = opts.google.dir;
+    mkdirSync(finalPath, { recursive: true });
+    const config: Record<string, unknown> = {
+      kind: 'google',
+      g_account: opts.google.account,
+      g_services: opts.google.services.join(','),
+      g_history_days: opts.google.historyDays,
+      // Non-vault access (v0.47): 'command' runs g_token_command locally at
+      // sync time (same trust class as recipe health_check argv — the google
+      // kind is hard-rejected on remote sources_add and these keys are not
+      // reachable over MCP); 'env' reads the env var NAMED here (never a
+      // secret value — the gh_token_env pattern).
+      ...(opts.google.access && opts.google.access !== 'vault'
+        ? { g_access: opts.google.access }
+        : {}),
+      ...(opts.google.tokenCommand ? { g_token_command: opts.google.tokenCommand } : {}),
+      ...(opts.google.tokenEnv ? { g_token_env: opts.google.tokenEnv } : {}),
+      g_managed: finalPath === defaultCloneDir(`${opts.id}-google`),
+      // Same default as github mirrors: a fresh google source participates
+      // in unqualified reads unless --no-federated opts out.
+      federated: opts.federated ?? true,
+    };
     const displayName = opts.name ?? opts.id;
     await engine.executeRaw(
       `INSERT INTO sources (id, name, local_path, config)
@@ -729,16 +807,29 @@ export async function resolveScopedSourceOrThrow(
 
 export async function listSources(
   engine: BrainEngine,
-  opts: { includeArchived?: boolean } = {},
+  opts: { includeArchived?: boolean; allowedSourceIds?: readonly string[] } = {},
 ): Promise<SourceListEntry[]> {
   // v0.28.1 codex finding (MEDIUM): the prior version ignored the
   // includeArchived flag and returned every row. That leaked archived
   // sources' ids, local_paths, and remote_urls to read-scoped MCP callers
   // who shouldn't see soft-deleted state. Filter at the SQL level so the
   // archived rows never reach the wire by default.
-  const archivedFilter = opts.includeArchived
-    ? ''
-    : 'WHERE archived IS NOT TRUE';
+  //
+  // #4433: `allowedSourceIds` row-filters to the caller's source scope —
+  // a scoped remote MCP caller must not enumerate other sources' ids,
+  // local_paths, or remote_urls. Row-filter (not field redaction) so
+  // out-of-scope rows never reach the wire; an explicit empty array matches
+  // nothing (fail-closed); undefined = unscoped (trusted local CLI and
+  // internal callers — since wave-L, remote scalar/no-grant callers pass
+  // their resolved scope here too instead of arriving unscoped).
+  const conds: string[] = [];
+  const params: unknown[] = [];
+  if (!opts.includeArchived) conds.push('archived IS NOT TRUE');
+  if (opts.allowedSourceIds !== undefined) {
+    params.push([...opts.allowedSourceIds]);
+    conds.push(`id = ANY($${params.length})`);
+  }
+  const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
   const rows = await engine.executeRaw<{
     id: string;
     name: string;
@@ -747,7 +838,8 @@ export async function listSources(
     config: unknown;
   }>(
     `SELECT id, name, local_path, last_sync_at, config
-       FROM sources ${archivedFilter} ORDER BY (id = 'default') DESC, id`,
+       FROM sources ${where} ORDER BY (id = 'default') DESC, id`,
+    params,
   );
   const out: SourceListEntry[] = [];
   for (const r of rows) {
@@ -831,12 +923,14 @@ export async function removeSource(
   // v0.46: github-kind mirrors at the default clone location are owned by
   // gbrain (gh_managed marker) and get the same cleanup as --url clones.
   const ghManaged = ghCfg.kind === 'github' && ghCfg.gh_managed === true;
+  // v0.47: google-kind mirrors mark g_managed the same way.
+  const gManaged = ghCfg.kind === 'google' && ghCfg.g_managed === true;
   const cloneRoot = gbrainPath('clones');
   let cloneRemoved = false;
   if (
     !opts.keepStorage &&
     src.local_path &&
-    (remoteUrl || ghManaged) && // only auto-clean when gbrain managed the dir
+    (remoteUrl || ghManaged || gManaged) && // only auto-clean when gbrain managed the dir
     isPathContained(src.local_path, cloneRoot)
   ) {
     try {

@@ -75,10 +75,12 @@ import {
   codexBlockOwnsName,
   codexPluginProvidesName,
   ensureHarnessHome,
+  harnessDetectDeps,
   parseHarnessArgs,
   removeHarness,
   statusHarness,
   type HarnessDeps,
+  type HarnessDetectOverrides,
 } from '../core/bootstrap/harness.ts';
 import { claudeUserSettingsPath, codexConfigPath, opencodeConfigDir, opencodeGlobalConfigPath, opencodeProjectConfigPath } from '../core/bootstrap/host-specs.ts';
 import {
@@ -99,6 +101,7 @@ import {
   type StatusReport,
 } from '../core/bootstrap/status.ts';
 import { verifyWorkspace, resolveVerifySourceId, deriveWorkspaceSourceId } from '../core/bootstrap/verify.ts';
+import { auditWritebackContract, repairWritebackContract } from '../core/bootstrap/contract.ts';
 
 export const BOOTSTRAP_HELP = `gbrain bootstrap — paste-in agent install (Claude Code / Codex / opencode)
 
@@ -116,6 +119,8 @@ Subcommands (run \`gbrain bootstrap status\` first — it is the resume entrypoi
   render [--force] [--only F] [--minimal]
                                   Render identity files from the confirmed answers.
                                   Never clobbers; --force backs up first.
+  contract [--repair]             Audit the same-turn GBrain write-back contract.
+                                  --repair appends it additively and backs up AGENTS.md.
   hooks [--harness claude-code|codex|opencode] [--repair] [--no-hooks] [--gbrain-bin <path>]
                                   Register MCP (+ per-turn hooks on Claude Code,
                                   ON by default; --no-hooks opts out, GBRAIN_HOOKS=0
@@ -172,6 +177,9 @@ const SUBCOMMAND_HELP: Record<string, string> = {
   render:
     'gbrain bootstrap render [--force] [--only F] [--minimal]\n' +
     '  Render identity files from the confirmed interview answers. Never clobbers; --force backs up first.',
+  contract:
+    'gbrain bootstrap contract [--repair]\n' +
+    '  Audit AGENTS.md for the same-turn GBrain write-back contract. --repair appends a marker-owned block and backs up the original.',
   repo:
     'gbrain bootstrap repo\n' +
     '  Create the dedicated PRIVATE GitHub repo (or adopt an EMPTY private repo you created\n' +
@@ -685,6 +693,20 @@ async function runStatus(ws: string, rest: string[], home: string): Promise<numb
     );
   }
   return 0;
+}
+
+async function runContract(ws: string, rest: string[]): Promise<number> {
+  const repair = rest.includes('--repair');
+  if (!repair) {
+    const audit = auditWritebackContract(ws);
+    console.log(JSON.stringify(audit, null, 2));
+    return audit.ok ? 0 : 1;
+  }
+  return withLock(ws, async () => {
+    const result = repairWritebackContract(ws);
+    console.log(JSON.stringify(result, null, 2));
+    return result.ok ? 0 : 1;
+  });
 }
 
 /** One copy of the A8 invalidation warning — shared by --set and --skip so
@@ -1625,7 +1647,7 @@ export function workspaceBrainStats(ws: string): { sources: string[]; pages: num
 
 /** `gbrain bootstrap harness` (#4043) — machine-level, no workspace, no
  * agent.json. Locks on the gbrain HOME (there is no workspace to lock). */
-async function runHarness(rest: string[], home: string, runner: ExecRunner): Promise<number> {
+async function runHarness(rest: string[], home: string, runner: ExecRunner, detect?: HarnessDetectOverrides): Promise<number> {
   const flags = parseHarnessArgs(rest);
   if (flags.error) {
     console.error(flags.error);
@@ -1639,6 +1661,7 @@ async function runHarness(rest: string[], home: string, runner: ExecRunner): Pro
     gbrainBin: resolveGbrainBin(),
     isTTY: process.stdout.isTTY === true,
     prompt: promptLine,
+    ...harnessDetectDeps(detect),
   };
   // [X12] --status is READ-ONLY: no home mkdir, no lock — it must work (and
   // stay side-effect-free) even while an apply/remove holds the mutex.
@@ -1866,6 +1889,8 @@ export interface RunBootstrapOpts {
   /** Spawn seam for the opencode `mcp list` probe (tests capture argv, cwd,
    * and env; the default holds a real Bun.spawn handle so timeouts kill). */
   probeSpawn?: OpencodeProbeSpawn;
+  /** Harness-detection seam; see HarnessDetectOverrides in core/bootstrap/harness.ts. */
+  harnessDetect?: HarnessDetectOverrides;
 }
 
 /** Dispatch. Returns the process exit code (cli.ts passes it to setCliExitVerdict). */
@@ -1877,7 +1902,7 @@ export async function runBootstrap(args: string[], opts: RunBootstrapOpts = {}):
   }
   const rest = args.slice(1);
 
-  const KNOWN = new Set(['status', 'interview', 'render', 'repo', 'hooks', 'verify', 'attach', 'uninstall', 'harness', 'cloud-setup-script']);
+  const KNOWN = new Set(['status', 'interview', 'render', 'contract', 'repo', 'hooks', 'verify', 'attach', 'uninstall', 'harness', 'cloud-setup-script']);
   if (!KNOWN.has(sub)) {
     console.error(`unknown subcommand: ${sub}`);
     console.error(BOOTSTRAP_HELP);
@@ -1958,6 +1983,9 @@ export async function runBootstrap(args: string[], opts: RunBootstrapOpts = {}):
       case 'render':
         code = await runRender(ws, rest, home);
         break;
+      case 'contract':
+        code = await runContract(ws, rest);
+        break;
       case 'repo':
         code = await runRepo(ws, rest, home, runner);
         break;
@@ -1974,7 +2002,7 @@ export async function runBootstrap(args: string[], opts: RunBootstrapOpts = {}):
         code = await runUninstall(ws, rest, home, runner);
         break;
       case 'harness':
-        code = await runHarness(rest, home, runner);
+        code = await runHarness(rest, home, runner, opts.harnessDetect);
         break;
       default:
         return 2; // unreachable
