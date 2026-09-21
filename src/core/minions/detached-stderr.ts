@@ -68,13 +68,23 @@ export function closeDetachedStderrSink(sink: DetachedStderrSink): void {
  * Re-exec the CLI as a fully detached supervisor: stdin/stdout ignored,
  * stderr on the durable sink (NEVER 'inherit' — the #4418 regression).
  */
+export function detachedSupervisorArgv(
+  execPath: string,
+  cliScript: string,
+  childArgs: string[],
+): string[] {
+  // LOCAL PATCH: a compiled binary re-execs itself; its argv[1] is the virtual `/$bunfs/root/gbrain` entry.
+  const isScriptRuntime = /[/\\](bun|node)(\.exe)?$/.test(execPath);
+  return isScriptRuntime ? [cliScript, ...childArgs] : childArgs;
+}
+
 export function spawnDetachedSupervisor(
   execPath: string,
   cliScript: string,
   childArgs: string[],
 ): { pid: number | undefined; stderrPath: string | null } {
   const sink = openDetachedStderrSink();
-  const child = spawn(execPath, [cliScript, ...childArgs], {
+  const child = spawn(execPath, detachedSupervisorArgv(execPath, cliScript, childArgs), {
     detached: true,
     stdio: ['ignore', 'ignore', sink.fd],
     env: process.env,
