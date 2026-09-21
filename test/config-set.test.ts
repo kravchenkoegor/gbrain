@@ -22,6 +22,7 @@ describe('KNOWN_CONFIG_KEYS', () => {
     expect(KNOWN_CONFIG_KEYS).toContain('embedding_model');
     expect(KNOWN_CONFIG_KEYS).toContain('embedding_dimensions');
     expect(KNOWN_CONFIG_KEYS).toContain('embedding_disabled');  // v0.37 D9
+    expect(KNOWN_CONFIG_KEYS).toContain('auto_timeline');  // #4987 off switch
     expect(KNOWN_CONFIG_KEYS).toContain('expansion_model');
     expect(KNOWN_CONFIG_KEYS).toContain('chat_model');
     expect(KNOWN_CONFIG_KEYS).toContain('openrouter_api_key');
@@ -64,6 +65,10 @@ describe('KNOWN_CONFIG_KEYS', () => {
     expect(KNOWN_CONFIG_KEYS).toContain('dream.synthesize.subagent_wait_timeout_ms');
   });
 
+  test('registers cycle.timezone for local-day dream bucketing (#4348)', () => {
+    expect(KNOWN_CONFIG_KEYS).toContain('cycle.timezone');
+  });
+
   test('contains the spend-control keys (v0.42.42.0, #2139) — no --force archaeology', () => {
     expect(KNOWN_CONFIG_KEYS).toContain('spend.posture');
     expect(KNOWN_CONFIG_KEYS).toContain('sync.cost_gate_min_usd');
@@ -80,6 +85,7 @@ describe('KNOWN_CONFIG_KEYS', () => {
     expect(KNOWN_CONFIG_KEYS).toContain('agent.use_gateway_loop');
     expect(KNOWN_CONFIG_KEYS).toContain('openrouter_api_key');
     expect(KNOWN_CONFIG_KEYS).toContain('zeroentropy_api_key');
+    expect(KNOWN_CONFIG_KEYS).toContain('deepseek_api_key');
   });
 
   test('registers the provider_sunset suppression key (v0.46.3 documented command)', () => {
@@ -317,6 +323,30 @@ describe('#2753 — the doctor-proposed gateway-loop command is accepted by `con
     // The false "Nothing in gbrain reads this" line is the bug this fixes.
     expect(errs.join('\n')).not.toContain('Nothing in gbrain reads this');
     expect(setCalls).toEqual([['sources.default', 'wiki']]);
+  });
+
+  test('cycle.timezone: rejects an invalid IANA timezone before writing (#4348)', async () => {
+    const { engine, setCalls } = setStubEngine();
+    const { errs, exit } = await runConfigCapture(
+      engine,
+      ['set', 'cycle.timezone', 'Mars/Olympus_Mons'],
+    );
+
+    expect(exit).toBe(1);
+    expect(errs.join('\n')).toContain('valid IANA timezone');
+    expect(setCalls).toEqual([]);
+  });
+
+  test('cycle.timezone: accepts a valid IANA timezone (#4348)', async () => {
+    const { engine, setCalls } = setStubEngine();
+    const { errs, exit } = await runConfigCapture(
+      engine,
+      ['set', 'cycle.timezone', 'Asia/Kolkata'],
+    );
+
+    expect(exit).toBeNull();
+    expect(errs.join('\n')).not.toContain('valid IANA timezone');
+    expect(setCalls).toEqual([['cycle.timezone', 'Asia/Kolkata']]);
   });
 
   // A DB failure must not be laundered into "source is not registered" — that

@@ -283,7 +283,10 @@ export async function runReindexCode(
               reporter.tick();
               return;
             }
-            if (!row.compiled_truth) {
+            // `compiled_truth` is NOT NULL DEFAULT '': an empty file is legitimately '' (every
+            // `__init__.py`). Only a null row is missing; the falsy check counted every empty
+            // file as a failure (#4902).
+            if (row.compiled_truth == null) {
               failed++;
               failures.push({ slug: row.slug, error: 'missing compiled_truth' });
               reporter.tick();
@@ -478,7 +481,7 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
       }
       const n = v ? parseFloat(v) : NaN;
       if (!Number.isFinite(n) || n <= 0) {
-        console.error(`gbrain reindex --code: ${flag} requires a positive number in USD, or off/unlimited (got ${v ?? '(missing)'})`);
+        console.error(`gbrain reindex-code: ${flag} requires a positive number in USD, or off/unlimited (got ${v ?? '(missing)'})`);
         process.exit(2);
       }
       maxCostUsd = n;

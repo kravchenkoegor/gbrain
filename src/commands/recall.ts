@@ -52,6 +52,7 @@ const KIND_ICON: Record<FactKind, string> = {
   commitment: '🤝',
   belief: '💭',
   fact: '📌',
+  idea: '💡',
 };
 
 interface ParsedFlags {
@@ -308,6 +309,23 @@ async function runRecallVerb(engine: BrainEngine, flags: ParsedFlags, sourceId: 
   process.stdout.write(lines.join('\n') + '\n');
 }
 
+/**
+ * #4720 — shared by the local (fetchRowsLocal) and thin-client entity→text
+ * fallbacks: a bare positional that matched no facts by entity is retried as
+ * a fact-text grep. One gating predicate + one stderr note so the two paths
+ * can't drift. Explicit --grep callers keep exact semantics (their filter
+ * already ran); --supersessions/--session-id keep their own arms.
+ */
+function entityTextFallbackApplies(flags: ParsedFlags, matched: number): boolean {
+  return matched === 0 && !!flags.entity && !flags.grep && !flags.supersessions && !flags.sessionId;
+}
+
+function noteEntityTextFallback(entity: string, matched: number): void {
+  process.stderr.write(
+    `[recall] no facts for entity '${entity}'; matched ${matched} fact(s) by text — use --grep to force text matching.\n`,
+  );
+}
+
 async function runRecallOnce(
   engine: BrainEngine,
   flags: ParsedFlags,
@@ -357,6 +375,26 @@ async function runRecallOnce(
     }>(raw);
     rows = unpacked.facts.map(remoteFactToRow);
     pendingCount = unpacked.pending_consolidation_count;
+
+    // #4720: thin-client mirror of the local entity→text fallback (see
+    // fetchRowsLocal). A bare positional that matched no facts by entity is
+    // retried as a fact-text grep so a literal word from fact text still
+    // recalls over the wire.
+    if (entityTextFallbackApplies(flags, rows.length)) {
+      const fbParams: Record<string, unknown> = { ...params, grep: flags.entity!.toLowerCase() };
+      delete fbParams.entity;
+      const fbRaw = await callRemoteTool(cfg!, 'recall', fbParams, { timeoutMs: 30_000 });
+      const fb = unpackToolResult<{
+        facts: Array<Record<string, unknown>>;
+        total: number;
+        pending_consolidation_count?: number;
+      }>(fbRaw);
+      if (fb.facts.length > 0) {
+        noteEntityTextFallback(flags.entity!, fb.facts.length);
+        rows = fb.facts.map(remoteFactToRow);
+        pendingCount = fb.pending_consolidation_count ?? pendingCount;
+      }
+    }
   } else {
     rows = await fetchRowsLocal(engine, flags, sourceId, resolvedSince);
     if (flags.pending) {
@@ -412,15 +450,63 @@ async function fetchRowsLocal(
       limit: flags.limit,
     });
   }
+  // An explicit `--since DURATION` / `--today` cutoff is a "what happened in
+  // this window" question and keeps event-time ordering; `--since-last-run`
+  // resolves from a creation-time cursor (see the since-only arm below).
+  const windowEventTime = !flags.sinceLastRun;
   if (flags.entity) {
     const slug = (await resolveEntitySlug(engine, sourceId, flags.entity)) ?? flags.entity;
-    return engine.listFactsByEntity(sourceId, slug, {
-      activeOnly: !flags.includeExpired,
-      limit: flags.limit,
-      excludeAuditRows: true,
-    });
+    // With a window, entity ANDs onto since in one query (before LIMIT);
+    // without one, the entity arm keeps its valid_from ordering.
+    const rows = resolvedSince
+      ? await engine.listFactsSince(sourceId, resolvedSince, {
+          eventTime: windowEventTime,
+          entitySlug: slug,
+          sessionId: flags.sessionId || undefined,
+          activeOnly: !flags.includeExpired,
+          limit: flags.limit,
+          excludeAuditRows: true,
+        })
+      : await engine.listFactsByEntity(sourceId, slug, {
+          activeOnly: !flags.includeExpired,
+          limit: flags.limit,
+          excludeAuditRows: true,
+        });
+    // #4720: the bare positional is entity-first, but keyless/casual usage
+    // treats it as a literal word from fact text (`gbrain recall commas`).
+    // resolveEntitySlug never returns null for non-empty input (slugify is
+    // the floor), so an unknown term becomes a phantom slug that matches
+    // nothing and recall reports zero results while `recall --all` and
+    // `--grep` both find the fact. When the entity arm comes up empty, fall
+    // back to the SQL-level fact-text grep (the same pre-limit arm --grep
+    // uses) with a stderr note. Explicit --grep callers keep exact
+    // semantics (their filter already ran; no fallback surprise). Gating +
+    // note are shared with the thin-client mirror in runRecallOnce.
+    if (entityTextFallbackApplies(flags, rows.length)) {
+      const textRows = await engine.listFactsSince(sourceId, resolvedSince ?? new Date(0), {
+        eventTime: resolvedSince ? windowEventTime : true,
+        activeOnly: !flags.includeExpired,
+        limit: flags.limit,
+        grep: flags.entity.toLowerCase(),
+        excludeAuditRows: true,
+      });
+      if (textRows.length > 0) {
+        noteEntityTextFallback(flags.entity, textRows.length);
+        return textRows;
+      }
+    }
+    return rows;
   }
   if (flags.sessionId) {
+    if (resolvedSince) {
+      return engine.listFactsSince(sourceId, resolvedSince, {
+        eventTime: windowEventTime,
+        sessionId: flags.sessionId,
+        activeOnly: !flags.includeExpired,
+        limit: flags.limit,
+        excludeAuditRows: true,
+      });
+    }
     return engine.listFactsBySession(sourceId, flags.sessionId, {
       activeOnly: !flags.includeExpired,
       limit: flags.limit,
@@ -631,10 +717,10 @@ function factRowToJson(r: FactRow): Record<string, unknown> {
   };
 }
 
-export async function runForget(engine: BrainEngine, args: string[]): Promise<void> {
+export async function runForget(engine: BrainEngine | (() => Promise<BrainEngine>), args: string[]): Promise<void> {
   const idArg = args.find(a => /^\d+$/.test(a));
   if (!idArg) {
-    process.stderr.write('Usage: gbrain forget <fact-id> [--reason <text>]\n');
+    process.stderr.write('Usage: gbrain forget <fact-id> [--reason <text>] [--source <id>] [--request-id <uuid>] [--json]\n');
     process.exit(1);
   }
   const id = parseInt(idArg, 10);
@@ -644,6 +730,31 @@ export async function runForget(engine: BrainEngine, args: string[]): Promise<vo
   let reason: string | undefined = undefined;
   const idx = args.indexOf('--reason');
   if (idx >= 0 && idx + 1 < args.length) reason = args[idx + 1];
+  const requestIndex = args.findIndex(arg => arg === '--request-id' || arg.startsWith('--request-id='));
+  const sourceIndex = args.findIndex(arg => arg === '--source' || arg.startsWith('--source='));
+  const requestValue = requestIndex < 0 ? undefined : args[requestIndex].startsWith('--request-id=')
+    ? args[requestIndex].slice('--request-id='.length) : args[requestIndex + 1];
+  const sourceValue = sourceIndex < 0 ? undefined : args[sourceIndex].startsWith('--source=')
+    ? args[sourceIndex].slice('--source='.length) : args[sourceIndex + 1];
+  const { parseWriteRequestId } = await import('../core/persistence/preconditions.ts');
+  const { randomUUID } = await import('node:crypto');
+  const { OperationError, operations } = await import('../core/operations.ts');
+  const { reportPersistenceCliError } = await import('./persistence-delegate.ts');
+  const json = args.includes('--json');
+  let requestId: string;
+  try {
+    if (requestIndex >= 0 && (!requestValue || requestValue.startsWith('--'))) {
+      throw new OperationError('invalid_params', '--request-id requires a UUID.');
+    }
+    if (sourceIndex >= 0 && (!sourceValue || sourceValue.startsWith('--'))) {
+      throw new OperationError('invalid_params', '--source requires a source ID.');
+    }
+    requestId = parseWriteRequestId(requestValue) ?? randomUUID();
+  } catch (error) {
+    if (await reportPersistenceCliError(error, json)) return;
+    throw error;
+  }
+  const params: Record<string, unknown> = { id: String(id), request_id: requestId, ...(reason !== undefined ? { reason } : {}) };
 
   // v0.33: thin-client routing. Without this, `gbrain forget <id>` on a
   // thin-client install would call the local fence helper against the empty
@@ -651,35 +762,45 @@ export async function runForget(engine: BrainEngine, args: string[]): Promise<vo
   // remote brain.
   const cfg = loadConfig();
   if (isThinClient(cfg)) {
-    const params: Record<string, unknown> = { id };
-    if (reason !== undefined) params.reason = reason;
-    const raw = await callRemoteTool(cfg!, 'forget_fact', params, { timeoutMs: 30_000 });
-    const result = unpackToolResult<{ id: number; expired: boolean }>(raw);
-    if (!result.expired) {
-      process.stderr.write(`No active fact with id=${id}\n`);
-      process.exit(1);
+    try {
+      if (sourceValue) throw new OperationError('invalid_params', '--source cannot override the remote memory writer grant.');
+      const raw = await callRemoteTool(cfg!, 'forget', params, { timeoutMs: 30_000 });
+      const result = unpackToolResult<{ id: string; expired: boolean }>(raw);
+      if (json) console.log(JSON.stringify(result, null, 2));
+      else process.stdout.write(result.expired ? `Forgot fact id=${id}\n` : `Fact id=${id} was already withdrawn\n`);
+    } catch (error) {
+      if (await reportPersistenceCliError(error, json)) return;
+      console.error(error instanceof Error ? error.message : String(error));
+      console.error(`Retry the same forget with --request-id ${requestId}.`);
+      const { setCliExitVerdict } = await import('../core/cli-force-exit.ts');
+      setCliExitVerdict(1);
     }
-    process.stdout.write(`Forgot fact id=${id}\n`);
     return;
   }
 
-  // v0.32.2: route through forgetFactInFence so the forget rewrites the
-  // page's `## Facts` fence and survives `gbrain rebuild`. Legacy rows
-  // fall back to the legacy DB-only expire path; the helper handles
-  // the fallback internally.
-  const { forgetFactInFence } = await import('../core/facts/forget.ts');
-  const result = await forgetFactInFence(engine, id, { reason });
-
-  if (!result.ok && result.path === 'not_found') {
-    process.stderr.write(`No fact with id=${id}\n`);
-    process.exit(1);
+  try {
+    const { maybeDelegateLocalOperation } = await import('../core/persistence/local-client.ts');
+    const { getCliOptions } = await import('../core/cli-options.ts');
+    const cli = getCliOptions();
+    const source = sourceValue ?? null;
+    const delegated = await maybeDelegateLocalOperation('forget', params, cfg, {
+      brain: cli.brain, source, timeoutMs: cli.timeoutMs ?? undefined,
+    });
+    let result: { id: string; expired: boolean };
+    if (delegated.handled) result = delegated.result as typeof result;
+    else {
+      const connected = typeof engine === 'function' ? await engine() : engine;
+      const sourceId = await resolveSourceId(connected, source);
+      const op = operations.find(operation => operation.name === 'forget')!;
+      result = await op.handler({ engine: connected, config: cfg ?? { engine: 'pglite' }, remote: false,
+        dryRun: false, sourceId, logger: { info: console.log, warn: console.warn, error: console.error } }, params) as typeof result;
+    }
+    if (json) console.log(JSON.stringify(result, null, 2));
+    else process.stdout.write(result.expired ? `Forgot fact id=${id}\n` : `Fact id=${id} was already withdrawn\n`);
+  } catch (error) {
+    if (await reportPersistenceCliError(error, json)) return;
+    throw error;
   }
-  if (!result.ok && result.path === 'already_expired') {
-    process.stderr.write(`Fact id=${id} is already expired\n`);
-    process.exit(1);
-  }
-  const suffix = result.path === 'fence' ? '' : ' (legacy DB-only — will not survive gbrain rebuild)';
-  process.stdout.write(`Forgot fact id=${id}${suffix}\n`);
 }
 
 function renderToday(rows: FactRow[]): string {

@@ -317,6 +317,24 @@ describe('#4216: buildSynthesisPrompt manifest + allow-list blocks', () => {
     expect(prompt).toContain('Use the search tool to find existing pages first.');
   });
 
+  test('oneshot prompt removes tool-use and final-prose instructions; agentic keeps them', () => {
+    const manifest = '\nLINK CANDIDATES\n- [[people/alice-example]] — Alice Example is a founder.';
+    const oneshot = buildSynthesisPrompt(
+      transcript, 'chunk', 0, 1, '', 'wiki', '', manifest,
+      ['wiki/personal/reflections/*'], undefined, undefined, 'oneshot',
+    );
+    const agentic = buildSynthesisPrompt(
+      transcript, 'chunk', 0, 1, '', 'wiki', '', manifest,
+      ['wiki/personal/reflections/*'], undefined, undefined, 'agentic',
+    );
+
+    expect(oneshot).not.toContain('search tool');
+    expect(oneshot).not.toContain('put_page schema');
+    expect(oneshot).not.toContain('final message');
+    expect(agentic).toContain('use the search tool, if available');
+    expect(agentic).toContain('final message');
+  });
+
   test('ALLOWED WRITE PATHS block renders from prefixes (OV-7: oneshot never sees a tool schema)', () => {
     const prompt = buildSynthesisPrompt(
       transcript, 'chunk', 0, 1, '', 'wiki', '', '',
@@ -332,6 +350,35 @@ describe('#4216: buildSynthesisPrompt manifest + allow-list blocks', () => {
     const prompt = buildSynthesisPrompt(transcript, 'chunk', 0, 1);
     expect(prompt).not.toContain('ALLOWED WRITE PATHS\n');
     expect(prompt).toContain('shown in the put_page schema');
+  });
+});
+
+// ── Eval write-path fix wave: OUTPUT POLICY rules 1/6/7 (F1a/F3/F4a) ──────
+// These pins are NEW — rule 1's verbatim mandate was previously untested.
+// They freeze the load-bearing prompt text the Cat 35 benchmark measures
+// (quote fidelity, fact retention, grounding); rewording needs a deliberate
+// test edit, not a drive-by.
+
+describe('eval fix wave: quote/fact/grounding mandates in OUTPUT POLICY', () => {
+  test('rule 1 carries the verbatim mandate AND the no-fake-quotes escape hatch', () => {
+    const prompt = buildSynthesisPrompt(transcript, 'chunk', 0, 1);
+    expect(prompt).toContain('Quote the user verbatim.');
+    expect(prompt).toContain('Quotation marks are ONLY for spans reproducible EXACTLY from the transcript below');
+    expect(prompt).toContain('paraphrase it WITHOUT quotation marks');
+  });
+
+  test('rule 6 is the salience-scoped fact-retention mandate (never a noise invitation)', () => {
+    const prompt = buildSynthesisPrompt(transcript, 'chunk', 0, 1);
+    expect(prompt).toContain('Preserve concrete facts');
+    expect(prompt).toContain('numbers, dates, dollar amounts, names, and who-decided-what OF the salient content');
+    expect(prompt).toContain('Do not add routine logistics for their own sake.');
+  });
+
+  test('rule 7 grounds claims and bans invented completion states', () => {
+    const prompt = buildSynthesisPrompt(transcript, 'chunk', 0, 1);
+    expect(prompt).toContain('Ground every claim in the transcript.');
+    expect(prompt).toContain('Attribute speculation as speculation');
+    expect(prompt).toContain('never state a completion state or outcome the transcript does not show');
   });
 });
 

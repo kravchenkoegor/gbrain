@@ -15,6 +15,7 @@ import { afterAll, beforeAll, beforeEach, afterEach, describe, expect, test } fr
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { installFixtureChunks } from '../helpers/page-projection.ts';
 import {
   configureGateway,
   resetGateway,
@@ -142,7 +143,17 @@ describe('E2E: fresh gbrain init --pglite → import → embed works end-to-end'
       const colDim = await readContentChunksEmbeddingDim(engine);
       expect(colDim.exists).toBe(true);
       expect(colDim.dims).toBe(NEW_INSTALL_DEFAULT_EMBEDDING_DIMENSIONS);
-      expect(await engine.getConfig('search.reranker.model')).toBe('voyage:rerank-2.5');
+      // v0.48.2: the mode-bundle default IS voyage:rerank-2.5 — a Voyage-keyed
+      // init writes NO explicit row; the RESOLVED reranker is the default.
+      expect(await engine.getConfig('search.reranker.model')).toBeNull();
+      {
+        const { loadSearchModeConfig, resolveSearchMode } = await import('../../src/core/search/mode.ts');
+        const knobs = resolveSearchMode(await loadSearchModeConfig(engine));
+        expect(knobs.reranker_model).toBe('voyage:rerank-2.5');
+        // (reranker_enabled follows the picked mode — non-TTY init may auto-select a
+        // reranker-off bundle; the point here is that no explicit row was written)
+        expect(await engine.getConfig('search.reranker.enabled')).toBeNull();
+      }
     } finally {
       await engine.disconnect();
     }
@@ -317,7 +328,17 @@ describe('E2E: fresh gbrain init --pglite → import → embed works end-to-end'
       const engine = new PGLiteEngine();
       await engine.connect({ database_path: cfg.database_path, engine: 'pglite' });
       try {
-        expect(await engine.getConfig('search.reranker.model')).toBe('voyage:rerank-2.5');
+        // v0.48.2: the mode-bundle default IS voyage:rerank-2.5 — a Voyage-keyed
+        // init writes NO explicit row; the RESOLVED reranker is the default.
+        expect(await engine.getConfig('search.reranker.model')).toBeNull();
+        {
+          const { loadSearchModeConfig, resolveSearchMode } = await import('../../src/core/search/mode.ts');
+          const knobs = resolveSearchMode(await loadSearchModeConfig(engine));
+          expect(knobs.reranker_model).toBe('voyage:rerank-2.5');
+          // (reranker_enabled follows the picked mode — non-TTY init may auto-select a
+          // reranker-off bundle; the point here is that no explicit row was written)
+          expect(await engine.getConfig('search.reranker.enabled')).toBeNull();
+        }
       } finally {
         await engine.disconnect();
       }
@@ -363,7 +384,7 @@ describe('E2E: fresh gbrain init --pglite → import → embed works end-to-end'
         title: 'E2E Test',
         compiled_truth: 'fresh install end-to-end happy path',
       });
-      await engine.upsertChunks('test/e2e-page', [
+      await installFixtureChunks(engine, 'test/e2e-page', [
         { chunk_index: 0, chunk_text: 'fresh install end-to-end happy path', chunk_source: 'compiled_truth' },
       ]);
 

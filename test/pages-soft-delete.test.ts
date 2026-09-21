@@ -12,19 +12,31 @@
  * Runs against PGLite — same SQL contract as Postgres but DATABASE_URL-free.
  * Postgres-specific paths (CONCURRENTLY index, two-stage CTE) covered by
  * separate Postgres E2E tests.
+ *
+ * One shared engine for the whole file (schema init paid once, snapshot
+ * allowed — nothing here asserts bootstrap behavior); each describe gets a
+ * clean slate via a describe-scoped resetPgliteState beforeAll. Reset is
+ * per-DESCRIBE, not per-test: tests within a describe deliberately share
+ * state (the purge/dry-run describes assert against leftover rows from
+ * earlier tests), matching the original one-engine-per-describe semantics.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { installFixtureChunks } from './helpers/page-projection.ts';
 
-delete process.env.GBRAIN_PGLITE_SNAPSHOT;
+let engine: PGLiteEngine;
 
-async function setupBrain(): Promise<PGLiteEngine> {
-  const engine = new PGLiteEngine();
+beforeAll(async () => {
+  engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-  return engine;
-}
+}, 30000);
+
+afterAll(async () => {
+  await engine.disconnect();
+});
 
 async function seedPage(engine: PGLiteEngine, slug: string): Promise<void> {
   await engine.putPage(slug, {
@@ -37,14 +49,8 @@ async function seedPage(engine: PGLiteEngine, slug: string): Promise<void> {
 }
 
 describe('softDeletePage', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = await setupBrain();
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.disconnect();
+    await resetPgliteState(engine);
   });
 
   test('happy path: sets deleted_at and returns slug', async () => {
@@ -75,14 +81,8 @@ describe('softDeletePage', () => {
 });
 
 describe('restorePage', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = await setupBrain();
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.disconnect();
+    await resetPgliteState(engine);
   });
 
   test('clears deleted_at on a soft-deleted page', async () => {
@@ -107,14 +107,8 @@ describe('restorePage', () => {
 });
 
 describe('purgeDeletedPages (TTL boundary)', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = await setupBrain();
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.disconnect();
+    await resetPgliteState(engine);
   });
 
   test('purges pages whose deleted_at is older than the cutoff', async () => {
@@ -194,14 +188,8 @@ describe('purgeDeletedPages (TTL boundary)', () => {
 });
 
 describe('purgeDeletedPages dry-run (shares the delete predicate)', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = await setupBrain();
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.disconnect();
+    await resetPgliteState(engine);
   });
 
   async function pageCount(): Promise<number> {
@@ -311,14 +299,8 @@ describe('purgeDeletedPages dry-run (shares the delete predicate)', () => {
 });
 
 describe('getPage / listPages includeDeleted contract (Q3 IRON RULE)', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = await setupBrain();
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.disconnect();
+    await resetPgliteState(engine);
   });
 
   test('Q3 round-trip: delete → get returns null → get(include_deleted) returns row → restore → get returns row again', async () => {
@@ -368,14 +350,8 @@ describe('getPage / listPages includeDeleted contract (Q3 IRON RULE)', () => {
 });
 
 describe('search visibility (soft-deleted pages hidden from searchKeyword)', () => {
-  let engine: PGLiteEngine;
-
   beforeAll(async () => {
-    engine = await setupBrain();
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.disconnect();
+    await resetPgliteState(engine);
   });
 
   test('searchKeyword hides soft-deleted pages', async () => {
@@ -395,10 +371,10 @@ describe('search visibility (soft-deleted pages hidden from searchKeyword)', () 
       frontmatter: {},
     });
     // Force chunk creation so search has something to index.
-    await engine.upsertChunks('people/nora', [
+    await installFixtureChunks(engine, 'people/nora', [
       { chunk_index: 0, chunk_text: 'gbrainquantum signature term occurs here', chunk_source: 'compiled_truth' as any },
     ]);
-    await engine.upsertChunks('people/oscar', [
+    await installFixtureChunks(engine, 'people/oscar', [
       { chunk_index: 0, chunk_text: 'gbrainquantum signature term occurs here too', chunk_source: 'compiled_truth' as any },
     ]);
 
@@ -419,14 +395,9 @@ describe('search visibility (soft-deleted pages hidden from searchKeyword)', () 
     await engine.executeRaw(
       `INSERT INTO pages (source_id, slug, type, title) VALUES ('archived-src', 'archived-src/secret', 'note', 'Secret')`,
     );
-    const pageRows = await engine.executeRaw<{ id: number }>(
-      `SELECT id FROM pages WHERE slug = 'archived-src/secret'`,
-    );
-    await engine.executeRaw(
-      `INSERT INTO content_chunks (page_id, chunk_index, chunk_text, chunk_source) VALUES ($1, 0, 'gbrainsemaphore unique term', 'compiled_truth')`,
-      [pageRows[0].id],
-    );
-    // Trigger should populate search_vector via the schema trigger.
+    await installFixtureChunks(engine, 'archived-src/secret', [
+      { chunk_index: 0, chunk_text: 'gbrainsemaphore unique term', chunk_source: 'compiled_truth' },
+    ], { sourceId: 'archived-src' });
     const before = await engine.searchKeyword('gbrainsemaphore');
     expect(before.length).toBe(1);
 

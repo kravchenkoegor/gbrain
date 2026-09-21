@@ -1089,12 +1089,27 @@ describe('runExtractConversationFactsCore', () => {
       slug: 'conversations/imessage/alice-example',
       sleepMs: 0,
     });
-    expect(first.pages_processed).toBe(1);
+    // #4869: an unfinished page is a failed claim, not a processed one —
+    // pages_failed is what drives CLI exit 1 / the cycle 'warn' status.
+    expect(first.pages_processed).toBe(0);
+    expect(first.pages_failed).toBe(1);
     const terminals = await engine.executeRaw<{ count: string | number }>(
       `SELECT COUNT(*) AS count FROM facts WHERE source = $1`,
       [TERMINAL_AUDIT_SOURCE],
     );
     expect(Number(terminals[0]?.count ?? 0)).toBe(0);
+    // Partial facts stay durable for the delete-first replay; no completion
+    // checkpoint key is minted for the old snapshot.
+    const partial = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_markdown_slug = $2`,
+      [PER_SEGMENT_SOURCE_PREFIX, 'conversations/imessage/alice-example'],
+    );
+    expect(Number(partial[0]?.count ?? 0)).toBe(2);
+    const cpKeys = await engine.executeRaw<{ ckey: string }>(
+      `SELECT jsonb_array_elements_text(completed_keys) AS ckey FROM op_checkpoints
+        WHERE op = 'extract-conversation-facts'`,
+    );
+    expect(cpKeys.some((r) => r.ckey.startsWith('default|conversations/imessage/alice-example|'))).toBe(false);
 
     const retry = await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
@@ -1103,6 +1118,8 @@ describe('runExtractConversationFactsCore', () => {
     });
     expect(retry.pages_skipped_completed).toBe(0);
     expect(retry.pages_processed).toBe(1);
+    expect(retry.pages_failed).toBe(0);
+    expect(retry.orphan_facts_cleaned).toBe(2);
   });
 
   test('raw transcript sidecar edits invalidate the durable outcome', async () => {
@@ -1188,12 +1205,12 @@ describe('runExtractConversationFactsCore', () => {
 
   test('insert failure leaves no terminal and retries from a clean replay', async () => {
     const engineAny = engine as any;
-    const originalInsertFacts = engineAny.insertFacts.bind(engine);
-    engineAny.insertFacts = async (facts: Array<{ source?: string }>, opts: unknown) => {
+    const originalInsertFacts = engineAny.insertFacts;
+    engineAny.insertFacts = async function(this: PGLiteEngine, facts: Array<{ source?: string }>, opts: unknown) {
       if (facts.some((fact) => fact.source === PER_SEGMENT_SOURCE_PREFIX)) {
         throw new Error('synthetic insert outage');
       }
-      return originalInsertFacts(facts, opts);
+      return originalInsertFacts.call(this, facts, opts);
     };
     try {
       await expect(
@@ -1221,12 +1238,12 @@ describe('runExtractConversationFactsCore', () => {
 
   test('terminal insert failure is reported as unfinished in bulk mode', async () => {
     const engineAny = engine as any;
-    const originalInsertFacts = engineAny.insertFacts.bind(engine);
-    engineAny.insertFacts = async (facts: Array<{ source?: string }>, opts: unknown) => {
+    const originalInsertFacts = engineAny.insertFacts;
+    engineAny.insertFacts = async function(this: PGLiteEngine, facts: Array<{ source?: string }>, opts: unknown) {
       if (facts.some((fact) => fact.source === TERMINAL_AUDIT_SOURCE)) {
         throw new Error('synthetic terminal insert outage');
       }
-      return originalInsertFacts(facts, opts);
+      return originalInsertFacts.call(this, facts, opts);
     };
     try {
       const result = await runExtractConversationFactsCore(engine, {
@@ -1255,10 +1272,10 @@ describe('runExtractConversationFactsCore', () => {
       frontmatter: {},
     });
     const engineAny = engine as any;
-    const originalExecuteRaw = engineAny.executeRaw.bind(engine);
-    engineAny.executeRaw = async (sql: string, params?: unknown[]) => {
+    const originalExecuteRaw = engineAny.executeRaw;
+    engineAny.executeRaw = async function(this: PGLiteEngine, sql: string, params?: unknown[]) {
       if (sql.includes('WITH del AS')) throw new Error('synthetic cleanup outage');
-      return originalExecuteRaw(sql, params);
+      return originalExecuteRaw.call(this, sql, params);
     };
     try {
       await expect(

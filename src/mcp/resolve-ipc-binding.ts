@@ -24,21 +24,24 @@ import { loadConfig } from '../core/config.ts';
 import {
   resolveSocketPathForConfig,
   startResolveIpcServer,
-  cleanupStaleSocket,
   ensureIpcSecretForConfig,
   type IpcHandlers,
 } from '../core/context/resolve-ipc.ts';
 import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/context/retrieval-reflex.ts';
 import { lexicalArmsEnabled } from '../core/context/reflex.ts';
+import { VOLUNTEER_MAX_PAGES_CAP } from '../core/context/volunteer.ts';
 import { assembleTurnContext } from '../core/context/turn-context.ts';
 import { makeContextPackIpcHandler } from './context-pack-handler.ts';
 import { logTurnContextDeliveryFireAndForget } from '../core/context/volunteer-events.ts';
+import { persistenceSocketPathForConfig, startPersistenceIpcServer, type PersistenceIpcProvider, type PersistenceIpcBinding } from '../core/persistence/ipc.ts';
 
 export interface ResolveIpcBinding {
   /** The bound listener, or null when binding was skipped/failed (best-effort). */
   server: Server | null;
   /** The socket path the listener bound (null when not bound). */
   socketPath: string | null;
+  /** Dedicated persistence listener; its larger frames never enter hook handlers. */
+  persistence?: PersistenceIpcBinding;
   /** Idempotent teardown: close the listener + reap the socket file. */
   close(): void;
 }
@@ -51,14 +54,53 @@ const NULL_BINDING: ResolveIpcBinding = { server: null, socketPath: null, close:
  * (resolveMcpStdioSourceScope) — the IPC layer rejects requests naming any
  * other source ([CX2-10]).
  */
+/**
+ * 2026-08 fix wave (ship security review): the volunteer probe claim is a
+ * WIRE FIELD, so it is honored only when the request is volunteer-SHAPED —
+ * slug-only suppression + the wide ungated pool cap volunteerStage always
+ * sends. A normal pointer resolve stamping probe:'volunteer' to evade
+ * delivery telemetry keeps logging. Exported for direct unit testing.
+ *
+ * ADVISORY, not a control (adversarial review, 2026-09): the shape is
+ * publicly reproducible, so a client that deliberately sends the full
+ * volunteer shape receives up to the wide pool with no delivery log line.
+ * Delivery logging is precision/recall telemetry — the caller already holds
+ * read access to the same pages via ordinary ops — but treat the audit
+ * trail as best-effort until the server-side volunteer-report IPC kind
+ * (filed) closes it.
+ */
+export function isVolunteerProbeShaped(req: {
+  probe?: string;
+  suppression?: string;
+  maxPointers?: number;
+} | undefined): boolean {
+  return (
+    req?.probe === 'volunteer' &&
+    req.suppression === 'slug-only' &&
+    req.maxPointers === VOLUNTEER_MAX_PAGES_CAP * 2
+  );
+}
+
 export async function bindResolveIpcForServe(
   engine: BrainEngine,
   defaultSource: string,
+  persistenceProvider?: PersistenceIpcProvider,
 ): Promise<ResolveIpcBinding> {
+  let persistence: PersistenceIpcBinding | null = null;
   try {
     const cfg = loadConfig();
     const resolveSocket = resolveSocketPathForConfig(cfg);
     if (!resolveSocket) return NULL_BINDING;
+
+    if (persistenceProvider && cfg?.engine === 'pglite') {
+      const persistenceSocket = persistenceSocketPathForConfig(cfg);
+      if (persistenceSocket) {
+        try { persistence = await startPersistenceIpcServer(persistenceSocket, persistenceProvider); }
+        catch {
+          process.stderr.write('[persistence-ipc] listener unavailable; local callers will receive owner_unavailable.\n');
+        }
+      }
+    }
 
     // [S3#6] turn_context requires the shared secret from the config-keyed
     // path (created 0600 here if absent). If the secret can't be
@@ -170,7 +212,19 @@ export async function bindResolveIpcForServe(
         // at DELIVERY (post-write), not inside the resolver — a block the
         // client's 250ms budget abandoned was never injected, and counting it
         // would corrupt the volunteered-vs-used precision stats (red-team).
-        onDelivered: (block) => logDeliveredReflexPointers(engine, block.pointers),
+        // Volunteer-stage PROBE resolves (wide ungated pool) are skipped for
+        // the same reason: the pool is not injected pointers. NOTE (ship
+        // security review): on the PGLite/IPC rung the gated survivors are
+        // NOT re-logged anywhere (the client has no engine handle) — openclaw
+        // volunteer events cover the direct-Postgres rung only, see
+        // reflex.ts. The probe claim is a WIRE FIELD, so it is honored only
+        // when the request is volunteer-SHAPED (slug-only suppression + the
+        // wide volunteer pool cap): a normal pointer resolve stamping
+        // probe:'volunteer' to evade delivery telemetry still logs.
+        onDelivered: (block, req) => {
+          if (isVolunteerProbeShaped(req)) return;
+          logDeliveredReflexPointers(engine, block.pointers);
+        },
         // The hook lane's feedback loop (#2095 closed over turn_context):
         // the delivered block's post-trim volunteered pages + pointers land
         // in context_volunteer_events under the request's channel. Body
@@ -185,20 +239,26 @@ export async function bindResolveIpcForServe(
 
     // startResolveIpcServer returns null when the socket is already owned
     // by a live listener (another serve) — that serve is the IPC provider.
-    if (!server) return NULL_BINDING;
+    if (!server && !persistence) return NULL_BINDING;
 
     let closed = false;
     return {
       server,
-      socketPath: resolveSocket,
+      socketPath: server ? resolveSocket : null,
+      ...(persistence ? { persistence } : {}),
       close: () => {
         if (closed) return;
         closed = true;
-        try { server.close(); } catch { /* noop */ }
-        cleanupStaleSocket(resolveSocket);
+        // server.close() unlinks the pathname THIS listener bound; never
+        // blind-unlink the path — it may belong to a newer live serve (#4896).
+        try { server?.close(); } catch { /* noop */ }
+        persistence?.close();
       },
     };
   } catch {
+    if (persistence) {
+      return { server: null, socketPath: null, persistence, close: () => persistence?.close() };
+    }
     /* resolve IPC is best-effort; never block serve */
     return NULL_BINDING;
   }

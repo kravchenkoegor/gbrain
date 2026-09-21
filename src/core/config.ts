@@ -5,6 +5,8 @@ import type { EngineConfig, EmbeddingColumnConfig } from './types.ts';
 import { applyDbPlaneReadSideMerge, type DbPlaneEngineReader } from './config-db-merge.ts';
 import { loadConfigSnapshot } from './config-snapshot.ts';
 import { loadGbrainEnvFile } from './gbrain-env-file.ts';
+import { dotenvValuesForKey } from './env-trust.ts';
+import { REMOTE_PRIVATE_PAGES_KEY } from './search/private-visibility.ts';
 
 /**
  * Where is the active DB URL coming from? Pure introspection, no connection
@@ -34,8 +36,38 @@ export interface GBrainConfig {
    * `gbrain config set` routes these two dotted keys here, not to the DB. */
   push?: { allow_unverified_remote?: boolean };
   hooks?: { stop_push_debounce_min?: number | string };
-  /** Monthly backup-coverage check (src/core/backup/). File-plane: read by
-   * engine-free render sites (hook children, the cli.ts startup rail). */
+  /** Ambient-writeback MIRROR of the DB-plane `memory.*` keys — `gbrain
+   * config set memory.*` dual-writes both planes so the engine-free Stop-hook
+   * child and the stdio boot resolve see the same truth the serve does. The
+   * DB plane stays authoritative (the serve-side harvest gate re-checks it).
+   * Resolved by src/core/facts/writeback-config.ts. */
+  /** Declared brain audience MIRROR (WP8; DB plane authoritative like
+   * `memory.*`): the engine-free bootstrap-harness lane gates its
+   * ambient-writeback enable-nudge on it — a shared-declared brain is never
+   * nudged. Written by `gbrain config set brain.audience personal|shared`. */
+  brain?: { audience?: string };
+  memory?: {
+    auto_writeback?: string;
+    auto_writeback_transient_ttl?: string;
+    /** Visibility POSTURE cache stamped by `config set memory.*` (which has
+     * the engine to resolve the DB-plane facts.default_visibility) so the
+     * engine-free bootstrap-harness renderer can embed it. Doctor's
+     * block-drift check catches staleness against DB truth. */
+    visibility_posture?: string;
+  };
+  /**
+   * Third-party integration gates, file-plane (read by engine-free hook
+   * children). `integrations.memorable.enabled` gates the optional
+   * session-end relay to a locally-installed `memorable` CLI — absent or
+   * anything other than literal `true` means OFF (fail-closed). The boolean
+   * alone is NOT sufficient: the gate also requires the gbrain-authored
+   * consent stamp (`~/.gbrain/integrations/hooks/memorable-consent.json`,
+   * written only by `gbrain config set`'s disclosure flow — deliberately
+   * outside this file, which the external CLI rewrites). See
+   * memorableGateAllowed in core/context/hook-heartbeat.ts.
+   */
+  integrations?: { memorable?: { enabled?: boolean } };
+  /** Monthly backup-coverage check. File-plane for engine-free hook children. */
   backup?: { check_enabled?: boolean | string; check_interval_days?: number | string };
   database_url?: string;
   database_path?: string;
@@ -80,6 +112,7 @@ export interface GBrainConfig {
    * voyage_api_key above.
    */
   dashscope_api_key?: string;
+  deepseek_api_key?: string;
   /**
    * LiteLLM proxy API key. File-plane slot folded into the gateway env as
    * LITELLM_API_KEY (optional in the litellm recipe — proxies may run
@@ -111,9 +144,8 @@ export interface GBrainConfig {
    * auth alternative to the Entra flow below.
    */
   azure_openai_api_key?: string;
-  /** Azure OpenAI (keyless/Entra). Non-secret endpoint + deployment + Entra opt-in,
-   * folded into the gateway env so the azure-openai recipe works in any shell.
-   * The bearer token is minted at request time via `az` — no secret stored here. */
+  /** Azure OpenAI (keyless/Entra). Non-secret endpoint/deployment + Entra opt-in;
+   * bearer token is minted at request time via `az` — no secret stored here. */
   azure_openai_endpoint?: string;
   azure_openai_deployment?: string;
   azure_openai_use_entra?: string;
@@ -216,14 +248,13 @@ export interface GBrainConfig {
       max_usd_per_day?: number;
     };
     /**
-     * v0.42 — keep frontmatter links fresh on the incremental cycle. The cycle's
-     * extract phase re-extracts only the slugs a sync changed, but `extractForSlugs`
-     * extracts BODY links only — frontmatter (`sources:`/`related:` etc.) link edges
-     * silently drift stale when a page's YAML is edited externally and synced in.
-     * Set true to also extract frontmatter links per changed page each cycle, keeping
-     * externally-edited YAML edges fresh without a full rescan. Default false
-     * (preserves current behavior). Read via the file/env/DB plane in the cycle's
-     * extract dispatch. Disable/enable with
+     * v0.42 — extract frontmatter (`sources:`/`related:` etc.) link edges too, not
+     * just body links, on every extraction path: the incremental cycle, sync's
+     * inline extract, the GitHub/Google source inline extracts, the extract_stale
+     * minion, `gbrain maintain`, and a flagless stale extract sweep
+     * (src/core/extract-frontmatter.ts resolves it once for all of them).
+     * Keeps externally-edited YAML edges fresh without a full rescan. Default
+     * false (body links only). Read via the file/DB plane, file wins. Enable with
      * `gbrain config set autopilot.incremental_extract_include_frontmatter <bool>`.
      */
     incremental_extract_include_frontmatter?: boolean;
@@ -233,6 +264,16 @@ export interface GBrainConfig {
     capture?: boolean;
     /** false disables PII scrubbing before insert. Defaults to true. */
     scrub_pii?: boolean;
+  };
+  /**
+   * Adaptive return-sizing (search/return-policy.ts, default OFF). DB-plane
+   * `search.adaptive_return*` rows nest here via loadConfigWithEngine (file > DB).
+   */
+  search?: {
+    adaptive_return?: boolean;
+    adaptive_return_entity_max?: number;
+    adaptive_return_other_max?: number;
+    adaptive_return_min_keep?: number;
   };
 
   /**
@@ -301,6 +342,14 @@ export interface GBrainConfig {
    * reverts on the next turn with a config edit, no redeploy.
    */
   retrieval_reflex_lexical_arms?: boolean;
+  /**
+   * 2026-08 fix wave — kill switch for the reflex's volunteer arm (Arm 2:
+   * confidence-gated volunteered pages fused after the pointer budget, parity
+   * with the claude-code turn-context lane). Default ON (absent = enabled).
+   * File-plane / env (GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER) only — same plane as
+   * the other reflex knobs; the incident lever is the env var.
+   */
+  retrieval_reflex_volunteer?: boolean;
   embedding_image_ocr?: boolean;
   embedding_image_ocr_model?: string;
 
@@ -346,6 +395,15 @@ export interface GBrainConfig {
     /** Master switch for the built-in junk-pattern set. Default: true.
      *  Env override: `GBRAIN_NO_JUNK_PATTERNS=1` flips to false. */
     junk_patterns_enabled?: boolean;
+    /** #4702 — built-in junk-pattern names to skip individually (e.g.
+     *  `['access_denied']` for a brain whose pages quote that error rather
+     *  than being it). Finer than `junk_patterns_enabled: false` (the
+     *  coarser knob, which drops EVERY pattern) and than the `disabled`
+     *  kill-switch (which also drops the load-bearing size gates). Unknown
+     *  names are ignored. DB plane accepts a JSON array or a comma-
+     *  separated list: `gbrain config set content_sanity.disabled_patterns
+     *  access_denied,error_title`. */
+    disabled_patterns?: string[];
     /** Master kill-switch for all sanity checks. When true, ingest emits
      *  loud stderr per page but lets everything through. Default: false.
      *  Env override: `GBRAIN_NO_SANITY=1` flips to true. */
@@ -456,6 +514,14 @@ export interface GBrainConfig {
    */
   mcp?: {
     /**
+     * #4748 — deployment-specific identity and routing guidance appended to
+     * the canonical operating contract in the MCP initialize response (all
+     * three transports). Distinguishes brains sharing one tool catalog.
+     * `GBRAIN_MCP_INSTRUCTIONS` env overrides this slot; blank/absent keeps
+     * the initialize response byte-identical to the canonical contract.
+     */
+    instructions?: string;
+    /**
      * Gate for `list_skills` / `get_skill` over a REMOTE transport. Runtime
      * default is OFF (absent key → OFF) so an upgrade never silently grants
      * existing read tokens host-skill read. `gbrain init` writes `true` for new
@@ -510,6 +576,17 @@ export interface GBrainConfig {
  * thin-client install?" check used by the CLI dispatch guard, doctor
  * branch, and remote subcommands.
  */
+/**
+ * The ONE robust negative parse for boolean env kill switches (2026-08 wave
+ * DRY sweep — previously copy-pasted at four sites with cross-referencing
+ * comments): case-insensitive false/0/off/no, so an operator typing FALSE or
+ * off mid-incident never gets a silent no-op (adversarial F11). An env value
+ * that is unset or empty is NOT "disabled" — callers gate on presence first.
+ */
+export function isEnvDisabled(value: string): boolean {
+  return /^(false|0|off|no)$/i.test(value.trim());
+}
+
 export function isThinClient(config: GBrainConfig | null): boolean {
   return !!config?.remote_mcp;
 }
@@ -568,63 +645,18 @@ export function loadConfigFileOnly(): GBrainConfig | null {
  * #427 guard — DATABASE_URL hijack via Bun's cwd .env auto-load.
  *
  * Bun merges `.env` files from the process cwd into process.env before any
- * user code runs. For a globally-installed tool that is a footgun: running
- * gbrain inside any checkout whose `.env` defines DATABASE_URL (Next.js,
- * Hono, Supabase, most web apps) silently retargets the brain at that app's
- * database. Reads hit the wrong DB; `apply-migrations` can write gbrain's
- * schema — including its DDL event trigger — into a production app database
- * (see the v0.42.8 report on #427).
- *
- * Bun gives no way to ask which vars came from a .env file (the merge
- * happens before module load), so we re-parse the .env files Bun auto-loads
- * from cwd and treat DATABASE_URL as "not operator-provided" when its value
- * matches one of them. Deliberate overrides still work two ways:
- *   - GBRAIN_DATABASE_URL: namespaced to this tool, never auto-ignored;
- *   - exporting DATABASE_URL in the shell: exported vars win over .env in
- *     Bun, and a deliberate export that happens to EQUAL the cwd .env value
- *     would have selected the same database anyway — ignoring it changes
- *     the outcome only by honoring the brain config, which is the safe
- *     reading of ambiguous intent.
- *
- * The file list is a superset of Bun's auto-load set across NODE_ENV values
- * so the guard doesn't depend on replicating Bun's exact selection logic.
+ * user code runs, so running gbrain inside any checkout whose `.env` defines
+ * DATABASE_URL (Next.js, Hono, Supabase, most web apps) would silently
+ * retarget the brain at that app's database — `apply-migrations` could write
+ * gbrain's schema into a production app database (the v0.42.8 report on #427).
+ * The cwd-.env parser (`CWD_DOTENV_FILES`, `dotenvValuesForKey`) lives in
+ * env-trust.ts beside the key-presence security quarantine; both symbols are
+ * re-exported here so import sites never chase the move. This guard keeps
+ * VALUE-match semantics: a DATABASE_URL equal to a cwd-.env assignment is
+ * file-origin; a deliberate export that happens to EQUAL it would have chosen
+ * the same database anyway, and GBRAIN_DATABASE_URL is never auto-ignored.
  */
-const CWD_DOTENV_FILES = ['.env', '.env.local', '.env.development', '.env.production', '.env.test'];
-
-/**
- * All values assigned to `key` across the .env files in `dir`. Collecting
- * every assignment (rather than emulating override order) keeps the guard
- * independent of dotenv precedence rules — a match against ANY assignment
- * means the value is file-origin. Exported for tests.
- */
-export function dotenvValuesForKey(key: string, dir: string = process.cwd()): Set<string> {
-  const values = new Set<string>();
-  const assignment = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/;
-  for (const name of CWD_DOTENV_FILES) {
-    let content: string;
-    try {
-      content = readFileSync(join(dir, name), 'utf-8');
-    } catch {
-      continue; // missing/unreadable file — nothing to guard against
-    }
-    for (const rawLine of content.split('\n')) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
-      const m = line.match(assignment);
-      if (!m || m[1] !== key) continue;
-      let v = m[2].trim();
-      if ((v.startsWith('"') && v.endsWith('"') && v.length >= 2) ||
-          (v.startsWith("'") && v.endsWith("'") && v.length >= 2)) {
-        v = v.slice(1, -1);
-      } else {
-        const hash = v.indexOf(' #');
-        if (hash !== -1) v = v.slice(0, hash).trim();
-      }
-      if (v) values.add(v);
-    }
-  }
-  return values;
-}
+export { CWD_DOTENV_FILES, dotenvValuesForKey } from './env-trust.ts';
 
 let warnedCwdEnvDbUrlIgnored = false;
 
@@ -737,11 +769,14 @@ export function loadConfig(): GBrainConfig | null {
       : {}),
     ...(process.env.GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS
       ? {
-          // Case-insensitive + common negatives — incident escape hatch;
-          // mirrors reflex.ts:lexicalArmsEnabled (adversarial F11).
-          retrieval_reflex_lexical_arms: !/^(false|0|off|no)$/i.test(
-            process.env.GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS.trim(),
-          ),
+          // Incident escape hatch — shared isEnvDisabled parse (also used by
+          // reflex.ts:lexicalArmsEnabled/volunteerEnabled).
+          retrieval_reflex_lexical_arms: !isEnvDisabled(process.env.GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS),
+        }
+      : {}),
+    ...(process.env.GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER
+      ? {
+          retrieval_reflex_volunteer: !isEnvDisabled(process.env.GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER),
         }
       : {}),
     ...(process.env.GBRAIN_REMOTE_CLIENT_SECRET && fileConfig?.remote_mcp
@@ -958,6 +993,25 @@ export async function loadConfigWithEngine(
   const dbJunkDisposition = await dbStr('content_sanity.junk_disposition');
   const dbMaxMarkupRatioStr = await dbStr('content_sanity.max_markup_ratio');
   const dbProseCheckEnabled = await dbBool('content_sanity.prose_check_enabled');
+  // #4702: per-pattern opt-out. Accepts a JSON array ('["access_denied"]')
+  // or a comma-separated list ('access_denied,error_title'); malformed JSON
+  // falls back to the comma parse so a hand-typed value still lands.
+  const dbDisabledPatternsStr = await dbStr('content_sanity.disabled_patterns');
+  let dbDisabledPatterns: string[] | undefined;
+  if (dbDisabledPatternsStr !== undefined) {
+    const raw = dbDisabledPatternsStr.trim();
+    if (raw.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          dbDisabledPatterns = parsed.filter((x): x is string => typeof x === 'string');
+        }
+      } catch { /* fall through to comma parse */ }
+    }
+    if (dbDisabledPatterns === undefined) {
+      dbDisabledPatterns = raw.split(',').map(s => s.trim()).filter(Boolean);
+    }
+  }
 
   const existingCS = merged.content_sanity ?? {};
   const mergedCS: NonNullable<GBrainConfig['content_sanity']> = { ...existingCS };
@@ -985,6 +1039,9 @@ export async function loadConfigWithEngine(
   }
   if (mergedCS.prose_check_enabled === undefined && dbProseCheckEnabled !== undefined) {
     mergedCS.prose_check_enabled = dbProseCheckEnabled;
+  }
+  if (mergedCS.disabled_patterns === undefined && dbDisabledPatterns !== undefined) {
+    mergedCS.disabled_patterns = dbDisabledPatterns;
   }
   if (Object.keys(mergedCS).length > 0) {
     merged.content_sanity = mergedCS;
@@ -1104,6 +1161,25 @@ export async function loadConfigWithEngine(
     merged.eval = mergedEval;
   }
 
+  // #4605 — search.adaptive_return* DB-plane merge, same class as #1475: the
+  // keys are registered and stored, but return-policy.ts reads the NESTED
+  // `cfg.search.*` of THIS merged object (via hybrid.ts), so without this the
+  // row was accepted, echoed by `config get`, and never read. Strict bool;
+  // caps must be finite numbers (return-policy clamps); file > DB; no empty container.
+  const mergedSearch: NonNullable<GBrainConfig['search']> = { ...(merged.search ?? {}) };
+  const dbAdaptiveReturn = await dbBoolStrict('search.adaptive_return');
+  if (mergedSearch.adaptive_return === undefined && dbAdaptiveReturn !== undefined) {
+    mergedSearch.adaptive_return = dbAdaptiveReturn;
+  }
+  for (const cap of ['adaptive_return_entity_max', 'adaptive_return_other_max', 'adaptive_return_min_keep'] as const) {
+    if (mergedSearch[cap] !== undefined) continue;
+    const n = Number(await dbStr(`search.${cap}`));
+    if (Number.isFinite(n)) mergedSearch[cap] = n;
+  }
+  if (Object.keys(mergedSearch).length > 0) {
+    merged.search = mergedSearch;
+  }
+
   // #2119-class read-side merge (also #2137/#4297): provider credentials,
   // chat/expansion pins, chat_fallback_chain, flat cycle.* (env > file > DB).
   // Served from the SAME snapshot as the reads above when available (zero
@@ -1150,6 +1226,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'openrouter_api_key',
   'voyage_api_key',
   'dashscope_api_key',
+  'deepseek_api_key',
   'litellm_api_key',
   'together_api_key',
   'google_api_key',
@@ -1164,11 +1241,14 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'chat_model',
   'chat_fallback_chain',
   'provider_base_urls',
+  // Integration gates (file-plane, hook-lane)
+  'integrations.memorable.enabled',
   // MEMORY_VERBS v1 (Cathedral 1)
   'mcp_surface',
   'protocol_installed_at',
   'provider_chat_options',
   'storage',
+  'schema_pack',
   'eval',
   'eval.capture',
   'eval.scrub_pii',
@@ -1203,25 +1283,82 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // 30 days; interval clamps to >=1 day at read time (backup/status-file.ts).
   'backup.check_enabled',
   'backup.check_interval_days',
-  // DB-plane (v0.32.3 search modes + related)
+  // DB-plane search-mode knobs: one row per key mode.ts reads (its
+  // KNOB_CONFIG_KEY, hand-mirrored so this module stays import-light; pinned
+  // equal by test/config-search-registry.test.ts). camelCase where the code
+  // reads camelCase (#4605 — snake_case rows here had no reader).
   'search.mode',
   'search.cache.enabled',
   'search.cache.similarity_threshold',
   'search.cache.ttl_seconds',
-  'search.token_budget',
+  'search.intentWeighting',
+  'search.keywordOrFallback',
+  'search.tokenBudget',
   'search.expansion',
-  'search.intent_weighting',
-  'search.limit_default',
-  'search.mode_upgrade_notice_shown',
+  'search.searchLimit',
+  'search.reranker.enabled',
+  'search.reranker.model',
+  'search.reranker.top_n_in',
+  'search.reranker.top_n_out',
+  'search.reranker.timeout_ms',
+  'search.floor_ratio',
+  'search.title_boost',
+  'search.evidence_cosine_floor',
+  'search.cross_modal.both_mode_text_weight',
+  'search.cross_modal.both_mode_image_weight',
+  'search.image_query.text_refinement_weight',
+  'search.image_query.image_refinement_weight',
   'search.unified_multimodal',
   'search.unified_multimodal_only',
   'search.cross_modal.llm_intent',
+  'search.graph_signals',
+  'search.contextual_retrieval',
+  'search.contextual_retrieval_disabled',
+  'search.relational_retrieval',
+  'search.relational_retrieval_depth',
+  // DB-plane search.* singletons read directly via engine.getConfig
+  // (commands/upgrade.ts, ops/image.ts, ops/search.ts, private-visibility.ts,
+  // last-retrieved.ts).
+  'search.mode_upgrade_notice_shown',
   'search.image_query.max_bytes',
-  'search.reranker.enabled',
+  'search.image_query.daily_budget_usd_per_client',
+  'search.image_query.remote_max_bytes',
+  'search.mcp_keyword_only',
+  REMOTE_PRIVATE_PAGES_KEY,
   'search.track_retrieval',
   // #4415: per-brain query-intent pattern extensions (JSON bank→regex[]),
   // merged over the shipped banks in src/core/search/query-intent.ts.
   'search.intent_patterns',
+  // 2026-08 fix wave (E5a): the adaptive-return / autocut / CRAG knobs were
+  // read by the search path but never registered — `gbrain config set`
+  // rejected them, making the documented config plane a no-op. Read sites:
+  // return-policy.ts (adaptive_return*), mode.ts (autocut*), ops/search.ts
+  // (crag_*). NOTE: `search.crag_think` (default off) runs `think` — an LLM
+  // call — on weak-graded local queries when enabled; it respects
+  // spend.posture, but enabling it is a per-query spend decision.
+  // `search.crag_escalation` (default off) also spends when enabled: the
+  // high-ceiling re-run sets expansion=true (one LLM multi-query call per
+  // weak-graded query), and unlike crag_think it is reachable by remote
+  // callers — attacker-shaped weak queries drive that spend (ship security
+  // review). See docs/operations/spend-controls.md.
+  'search.adaptive_return',
+  'search.adaptive_return_entity_max',
+  'search.adaptive_return_other_max',
+  'search.adaptive_return_min_keep',
+  'search.autocut',
+  'search.autocut_jump',
+  'search.autocut_min_keep',
+  'search.autocut_min_top',
+  // Ranker wave: shared RRF weight budget for expansion variant lists (mode.ts reads; `legacy` | (0, 4]).
+  'search.expansion_variant_budget',
+  // Ranker wave (R1): relational-arm rows re-pinned above reranked text rows (mode.ts reads; `off` | 0..10).
+  'search.relational_rerank_pin',
+  // Ranker wave (Phase E2): keyword-arm confidence floor — weak keyword arm fuses at half weight (mode.ts reads; `off` | (0, 1]).
+  'search.keyword_arm_confidence_floor',
+  // Ranker wave (Phase E3): metadata boost gate — `lexical` skips post-fusion metadata boosts when the vector arm was the only voter (mode.ts reads; `always` | `lexical`).
+  'search.metadata_boost_gate',
+  'search.crag_escalation',
+  'search.crag_think',
   // Models tier system (v0.31.12)
   'models.default',
   'models.tier.utility',
@@ -1268,10 +1405,36 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'loops.extraction_enabled',
   // #2113: output-token cap for the per-turn facts extractor (default 4000).
   'facts.extraction_max_tokens',
+  // #3852: operator-set system-prompt appendix for the facts extractor (e.g.
+  // a durable-vs-ephemeral rubric for agent work-session transcripts).
+  // Composes with BOTH honest-notability prompt variants.
+  'facts.extraction_prompt_appendix',
+  // #3852: kill-switch for the deterministic junk gate on extracted fact text
+  // (plan narration / provider error strings / meta-chatter). Default on.
+  'facts.extraction_junk_filter',
   // [ENG-8] Brain-level default visibility for facts writes when the caller
   // didn't specify one: 'private' (default) | 'world'. Resolved by
   // src/core/facts/visibility.ts; explicit caller values always win.
   'facts.default_visibility',
+  // Ambient memory writeback (opt-in, default OFF): 'off' | 'salient' | 'all'.
+  // DUAL-PLANE: `gbrain config set` writes the DB plane (authoritative — the
+  // serve-side harvest gate re-checks it) AND mirrors into the file plane's
+  // `memory` slot (read by the engine-free Stop-hook child and the stdio
+  // serve's boot resolve). Resolved by src/core/facts/writeback-config.ts.
+  'memory.auto_writeback',
+  // TTL the instruction template tells agents to pass on TRANSIENT facts
+  // (health/location/travel/mood/near-term schedule). Duration shorthand
+  // only ('3d', '12h'), positive, capped at 365d; default '3d'.
+  'memory.auto_writeback_transient_ttl',
+  // Fire-once sentinel for the ambient-writeback consent nudge (WP8):
+  // stamped 'true' after the init/post-upgrade ask has been shown once.
+  'memory.auto_writeback_notice_shown',
+  // Declared brain audience: 'personal' | 'shared'. Set by the operator, by
+  // company-brainify's Phase-5 handoff (shared), or from the bootstrap
+  // interview. Declaration beats the conservative client-count heuristic in
+  // src/core/facts/writeback-audience.ts; the consent nudge fires only on
+  // personal brains and never auto-enables anything.
+  'brain.audience',
   // Conversation parser LLM fallback. Deliberately register the exact key,
   // not a conversation_parser.* prefix: fallback is the only live opt-in
   // consumer, while the polish scaffold remains unwired.
@@ -1297,11 +1460,15 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // and inline-drain concurrency (default 1; clamped [1,8]; PGLite forced 1).
   'dream.synthesize.mode',
   'dream.synthesize.link_manifest',
+  'dream.synthesize.quote_verify',
   'dream.synthesize.inline_concurrency',
   // #4152 triage knobs. The triage model's preferred key is
   // `models.dream.triage` (models.* prefix, registered via the models.dream.*
   // family); these tune the gate + sampling + pass budget.
   'dream.triage.threshold',
+  'dream.triage.rescue_floor',
+  'dream.triage.rescue_min_segments',
+  'dream.triage.rescue_content_types',
   'dream.triage.max_chars',
   'dream.triage.max_tokens',
   'dream.triage.max_ms',
@@ -1321,6 +1488,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'emotional_weight.high_tags',
   'emotional_weight.user_holder',
   // Cycle phase config
+  // #4348: IANA timezone that owns the dream-cycle calendar day (summary
+  // bucketing). Unset → host timezone → UTC. Validated at set time.
+  'cycle.timezone',
   'cycle.grade_takes.write_gstack_learnings',
   // #4102: off switch for the propose_takes LLM phase (default ON; the
   // phase ships in the default list). Read by src/core/cycle/propose-takes.ts.
@@ -1334,6 +1504,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'content_sanity.junk_disposition',
   'content_sanity.max_markup_ratio',
   'content_sanity.prose_check_enabled',
+  // #4702: per-pattern opt-out (JSON array or comma-separated names) —
+  // finer than junk_patterns_enabled (all patterns) / disabled (kill-switch).
+  'content_sanity.disabled_patterns',
   // MCP skill-catalog publishing (PR1)
   'mcp.publish_skills',
   'mcp.publish_skills_prompted',
@@ -1377,6 +1550,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // reconcile-links, and sweep. The documented off-switch is `gbrain config
   // set auto_link false` — same unregistered-key class as auto_chronicle.
   'auto_link',
+  // #4987: the write-path timeline extractor's off switch (read by
+  // isAutoTimelineEnabled); registered so `gbrain config set auto_timeline off`
+  // works without --force, as the compiled-truth guide documents.
+  'auto_timeline',
   // v0.46.3: the provider_sunset doctor check's own suppression escape hatch
   // (doctor.ts) and docs/guides/embedding-migration.md both document
   // `gbrain config set doctor.suppress_provider_sunset true`, but the key was
@@ -1406,6 +1583,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // Registering it here is what makes `gbrain config set sync.exclude ...`
   // work — the operator path to the feature (unregistered-key class).
   'sync.exclude',
+  // #4901: the dot-directory WAIVER's persisted twin (unioned with the per-call
+  // include-hidden flag, which bulk sync refuses); registered so `config set` accepts it.
+  'sync.include_hidden',
   // #2179: clamp window for DCR-requested per-client token TTLs. Read by
   // `gbrain serve --http` at startup; unset min defaults to 300s, unset max
   // defaults fail-closed to max(--token-ttl, min).
@@ -1424,6 +1604,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // Read by performSync + runImport summary aggregation; 'false'/'0'/'off'
   // silences both surfaces (schema lint rules stay active).
   'schema.type_warnings',
+  // #4795 reindex-search-vector marker (doctor fts_reindex_incomplete reads it); `config unset` is the escape hatch.
+  'fts.reindex_in_progress',
 ];
 
 /**

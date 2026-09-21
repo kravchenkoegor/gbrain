@@ -1,3 +1,5 @@
+import { assertUnmanagedCanonicalWriter } from './persistence/maintenance.ts';
+import { managedPersistenceEnabled } from './persistence/ownership.ts';
 /**
  * gbrain sources-ops — pure async functions for source-management operations
  * (v0.28). Extracted from src/commands/sources.ts so the CLI handlers and the
@@ -36,7 +38,7 @@
  * out of the confine.
  */
 
-import { existsSync, mkdirSync, renameSync, rmSync, lstatSync } from 'fs';
+import { existsSync, mkdirSync, renameSync, rmSync, lstatSync, realpathSync } from 'fs';
 import { join, dirname, basename, resolve as resolvePath } from 'path';
 import { isPathContained, msysToNativePath } from './path-confine.ts';
 import { randomBytes } from 'crypto';
@@ -53,6 +55,7 @@ import {
 } from './git-remote.ts';
 import { gbrainPath } from './config.ts';
 import { isValidSourceId } from './source-id.ts';
+import { DEFAULT_CALENDAR_ID } from './google/types.ts';
 import { resolveSourceWithTier, type SourceTier } from './source-resolver.ts';
 
 // ── Errors ──────────────────────────────────────────────────────────────────
@@ -140,6 +143,8 @@ export interface SourceStatus {
 export interface AddSourceOpts {
   id: string;
   name?: string;
+  requestId?: string;
+  expectedIncarnation?: string;
   localPath?: string | null;
   remoteUrl?: string;
   federated?: boolean | null;
@@ -187,6 +192,8 @@ export interface AddSourceOpts {
     services: string[];
     /** Backfill/reconcile window in days. */
     historyDays: number;
+    /** Calendar swept by this source (default DEFAULT_CALENDAR_ID). */
+    calendarId?: string;
     /** Managed dir where pages are materialized. */
     dir: string;
     /** Token acquisition: gbrain vault (default), a token-printing command, or an env var. */
@@ -202,6 +209,8 @@ export interface RemoveSourceOpts {
   yes?: boolean;
   dryRun?: boolean;
   keepStorage?: boolean;
+  requestId?: string;
+  expectedIncarnation?: string;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -374,6 +383,49 @@ export function unownedHint(
 // ── addSource ───────────────────────────────────────────────────────────────
 
 /**
+ * Overlapping-path guard shared by every surface that binds a local_path to a
+ * source (`sources add`, `sources set-path`): a path equal to, nested inside,
+ * or enclosing any OTHER source's local_path is rejected as
+ * `overlapping_path`. Overlapping trees make sync / write-through attribute
+ * files to the wrong source, so no add or repair path may skip this.
+ */
+export async function assertNoOverlappingPath(
+  engine: BrainEngine,
+  id: string,
+  path: string,
+): Promise<void> {
+  const others = await engine.executeRaw<{ id: string; local_path: string }>(
+    `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL AND id != $1`,
+    [id],
+  );
+  // Compare by spelling AND by realpath: a symlink whose spelling shares no
+  // prefix with another source's tree still resolves onto that tree, and the
+  // sibling may itself be registered via a symlink. Realpath only when the
+  // path exists (a dangling/absent path keeps its spelling — the string check
+  // still applies); the stored value and the error message keep the spelling.
+  const real = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  const overlaps = (x: string, y: string): boolean =>
+    x === y || x.startsWith(y + '/') || y.startsWith(x + '/');
+  const realPath = real(path);
+  for (const other of others) {
+    const b = other.local_path;
+    if (overlaps(path, b) || overlaps(realPath, real(b))) {
+      throw new SourceOpError(
+        'overlapping_path',
+        `path "${path}" overlaps with existing source "${other.id}" at "${b}". ` +
+          `Overlapping sources are not allowed.`,
+      );
+    }
+  }
+}
+
+/**
  * #2707: `--path` registration used to accept any existing directory with
  * zero git validation, deferring the failure to the first `gbrain sync`
  * ("Not inside a git repository: ..."). By the time that surfaces the
@@ -389,6 +441,8 @@ export async function addSource(
   engine: BrainEngine,
   opts: AddSourceOpts,
 ): Promise<SourceRow> {
+  if(await managedPersistenceEnabled(engine))return (await import('./persistence/managed-sources.ts')).addManagedSource(engine,opts);
+  await assertUnmanagedCanonicalWriter(engine, 'sources add');
   validateSourceId(opts.id);
 
   // gbrain#2955: normalize a Git Bash / MSYS drive path (`/c/Users/x`,
@@ -479,23 +533,7 @@ export async function addSource(
   if (parsedUrl) {
     finalPath = opts.cloneDir ?? defaultCloneDir(opts.id);
   }
-  if (finalPath) {
-    const others = await engine.executeRaw<{ id: string; local_path: string }>(
-      `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL AND id != $1`,
-      [opts.id],
-    );
-    for (const other of others) {
-      const a = finalPath;
-      const b = other.local_path;
-      if (a === b || a.startsWith(b + '/') || b.startsWith(a + '/')) {
-        throw new SourceOpError(
-          'overlapping_path',
-          `path "${a}" overlaps with existing source "${other.id}" at "${b}". ` +
-            `Overlapping sources are not allowed.`,
-        );
-      }
-    }
-  }
+  if (finalPath) await assertNoOverlappingPath(engine, opts.id, finalPath);
 
   // ── Path A: --url (clone + INSERT + rename) ────────────────────────────
   if (parsedUrl) {
@@ -617,6 +655,11 @@ export async function addSource(
       g_account: opts.google.account,
       g_services: opts.google.services.join(','),
       g_history_days: opts.google.historyDays,
+      // Only written when non-default so every existing source's config keeps
+      // its exact shape (DEFAULT_CALENDAR_ID stays the parse-time fallback).
+      ...(opts.google.calendarId && opts.google.calendarId !== DEFAULT_CALENDAR_ID
+        ? { g_calendar_id: opts.google.calendarId }
+        : {}),
       // Non-vault access (v0.47): 'command' runs g_token_command locally at
       // sync time (same trust class as recipe health_check argv — the google
       // kind is hard-rejected on remote sources_add and these keys are not
@@ -891,6 +934,15 @@ export async function removeSource(
     );
   }
 
+  if(await managedPersistenceEnabled(engine)){
+    const {runManagedSourceLifecycle}=await import('./persistence/source-lifecycle.ts');
+    const result=await runManagedSourceLifecycle(engine,{operation:'remove',sourceId:opts.id,confirmDestructive:opts.confirmDestructive||opts.yes,
+      dryRun:opts.dryRun,requestId:opts.requestId,expectedIncarnation:opts.expectedIncarnation});
+    if(!opts.dryRun)(await import('./persistence/managed-sources.ts')).assertTopologyCommitted(result);
+    return {id:opts.id,pages_deleted:Number(result.pages_deleted??0),clone_removed:false,
+      clone_path:typeof result.local_path==='string'?result.local_path:typeof result.path==='string'?result.path:null,dryRun:opts.dryRun===true};
+  }
+
   const src = await fetchSourceRow(engine, opts.id);
   if (!src) {
     throw new SourceOpError('not_found', `Source "${opts.id}" not found.`);
@@ -907,6 +959,9 @@ export async function removeSource(
       dryRun: true,
     };
   }
+
+
+  await assertUnmanagedCanonicalWriter(engine, 'sources remove');
 
   // Confirmation gate (caller should usually have already shown the impact
   // preview from destructive-guard.ts).
@@ -1027,6 +1082,18 @@ export async function recloneIfMissing(
   engine: BrainEngine,
   id: string,
 ): Promise<boolean> {
+  if(await managedPersistenceEnabled(engine)){
+    const src=await fetchSourceRow(engine,id);
+    if(!src)throw new SourceOpError('not_found',`Source "${id}" not found.`);
+    const remoteUrl=getRemoteUrl(src.config);
+    if(!remoteUrl||!src.local_path)return false;
+    const binding=await (await import('./persistence/ownership.ts')).getWorktreeBinding(engine,id);
+    if(binding?.local_path&&existsSync(binding.local_path)&&validateRepoState(binding.local_path,remoteUrl)==='healthy')return false;
+    const {runManagedSourceLifecycle}=await import('./persistence/source-lifecycle.ts');
+    const result=await runManagedSourceLifecycle(engine,{operation:'reclone',sourceId:id});
+    (await import('./persistence/managed-sources.ts')).assertTopologyCommitted(result);return true;
+  }
+  await assertUnmanagedCanonicalWriter(engine, 'sources reclone');
   const src = await fetchSourceRow(engine, id);
   if (!src) {
     throw new SourceOpError('not_found', `Source "${id}" not found.`);

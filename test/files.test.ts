@@ -321,6 +321,30 @@ describe('files upload-raw git-storage branch (#2297)', () => {
     expect(meta.type).toBe('report');
   });
 
+  // Pre-landing review: the #4910 ON CONFLICT metadata merge must not null a
+  // stored `type` when the same path is re-uploaded without --type. jsonb `||`
+  // writes a null VALUE over the existing key, so the payload may only carry
+  // `type` when the flag was actually given.
+  test('re-upload without --type keeps the stored metadata type', async () => {
+    await engine.setConfig('sync.repo_path', repo);
+    const src = join(srcDir, 'retyped.txt');
+    writeFileSync(src, 'first bytes');
+    const cap = captureLogs();
+    try {
+      await runFiles(engine, ['upload-raw', src, '--page', 'notes/small-doc', '--type', 'photo']);
+      writeFileSync(src, 'changed bytes');
+      await runFiles(engine, ['upload-raw', src, '--page', 'notes/small-doc']);
+    } finally {
+      cap.restore();
+    }
+    const rows = await engine.executeRaw<{ type: string | null; storage: string | null }>(
+      `SELECT metadata->>'type' AS type, metadata->>'storage' AS storage FROM files WHERE filename = 'retyped.txt'`,
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].storage).toBe('git');
+    expect(rows[0].type).toBe('photo');
+  });
+
   test('no repo configured: exits 1 instead of lying success', async () => {
     await engine.executeRaw(`DELETE FROM config WHERE key = 'sync.repo_path'`);
     const src = join(srcDir, 'orphan.txt');
@@ -361,6 +385,47 @@ describe('files upload-raw git-storage branch (#2297)', () => {
       exitSpy.mockRestore();
     }
     expect(cap.errs.join('\n')).toContain('--page');
+  });
+
+  // A file argument whose basename() is exactly '.' or '..' (rather than a
+  // real leaf filename) would otherwise join onto the sidecar dest dir
+  // (`destDir/${filename}`) and walk the join back OUT of the intended
+  // `.raw/<page-name>/` dir before the copy — reject it early with a clear
+  // error instead of an opaque failure deep inside copyFileSync.
+  test('file argument resolving to "." exits 1 with a clear error, not a filesystem crash', async () => {
+    await engine.setConfig('sync.repo_path', repo);
+    const exitSpy = spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`EXIT:${code}`);
+    }) as never);
+    const cap = captureLogs();
+    try {
+      await runFiles(engine, ['upload-raw', '.', '--page', 'notes/small-doc']);
+      throw new Error('expected exit 1');
+    } catch (e) {
+      expect((e as Error).message).toBe('EXIT:1');
+    } finally {
+      cap.restore();
+      exitSpy.mockRestore();
+    }
+    expect(cap.errs.join('\n')).toContain('resolves to "."');
+  });
+
+  test('file argument resolving to ".." exits 1 with a clear error, not a filesystem crash', async () => {
+    await engine.setConfig('sync.repo_path', repo);
+    const exitSpy = spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`EXIT:${code}`);
+    }) as never);
+    const cap = captureLogs();
+    try {
+      await runFiles(engine, ['upload-raw', '..', '--page', 'notes/small-doc']);
+      throw new Error('expected exit 1');
+    } catch (e) {
+      expect((e as Error).message).toBe('EXIT:1');
+    } finally {
+      cap.restore();
+      exitSpy.mockRestore();
+    }
+    expect(cap.errs.join('\n')).toContain('resolves to ".."');
   });
 });
 

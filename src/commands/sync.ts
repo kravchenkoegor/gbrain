@@ -1,3 +1,6 @@
+import { assertManagedFilesystemWrite } from '../core/persistence/filesystem-guard.ts';
+import { readSourceFileSync, hasSourceFilesystemLock, withSourceFilesystemLock, currentSourceFilesystemSignal, assertSourceFilesystemActive } from '../core/minions/source-filesystem.ts';
+import { currentJobSignal } from '../core/minions/submission-authority.ts';
 import { existsSync, readFileSync, writeFileSync, statSync, lstatSync, realpathSync } from 'fs';
 import { join, relative, resolve as pathResolve } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
@@ -53,9 +56,11 @@ import {
 import {
   withRefreshingLock,
   LockUnavailableError,
+  LockStolenError,
   syncLockId,
 } from '../core/db-lock.ts';
 import {
+  withHumanLogsToStderr,
   withSourcePrefix,
   slog,
   serr,
@@ -95,6 +100,7 @@ import {
   resolveSingleSyncEmbedPlan,
   resolveSyncAllEmbedPlan,
   resolveSyncEmbedBackfill,
+  syncProducedEmbeddableContent,
   type SyncEmbedBackfillOutcome,
 } from '../core/sync-embed-backfill.ts';
 import {
@@ -104,7 +110,6 @@ import {
   hasOriginRemote,
   isDetachedHead,
   unique,
-  resolveSlugByPathOrSourcePath,
   resolveSlugsForRemovedPaths,
   resolveRemovedPathSlug,
   refusedRemovedPathMessage,
@@ -112,6 +117,7 @@ import {
   isWithinRoot,
   resolveNoEmbed,
   discoverGitRoot,
+  gitRelativePath,
 } from '../core/sync-git.ts';
 import {
   readSyncAnchor,
@@ -122,6 +128,7 @@ import {
   resolveSlugRootMode,
   type SlugRootMode,
 } from '../core/sync-anchor.ts';
+import { isSyncDisabledConfig } from '../core/sync-policy.ts';
 import {
   SyncLockBusyError,
   formatLockBusyMessage,
@@ -292,7 +299,7 @@ export interface SyncResult {
    * cron operators can disambiguate timeout vs pull-timeout in monitoring.
    */
   filesImported?: number;
-  reason?: 'timeout' | 'pull_timeout' | 'pull_failed' | 'stall_timeout' | 'checkpoint_unavailable';
+  reason?: 'timeout' | 'pull_timeout' | 'pull_failed' | 'stall_timeout' | 'checkpoint_unavailable' | 'writer_pending' | 'writer_yield';
   /**
    * v0.42.x (#1794): cumulative file paths durably banked to the checkpoint
    * across THIS run + prior resumed runs. Surfaced on every partial/blocked
@@ -393,6 +400,11 @@ export interface SyncOpts {
    * fallback aren't covered). Unlike `exclude`, this has to reach the
    * collection step itself — a pruned path is never collected in the first
    * place, so there's nothing for a post-collection filter to add back.
+   *
+   * Unioned with the persisted `sync.include_hidden` config key (same dialect
+   * and trailing-`/` normalization as `sync.exclude`), so callers that never
+   * touch the CLI — `sync --all`, autopilot, the dream cycle — inherit the
+   * waiver. Union, not override; unset admits nothing.
    */
   includeHidden?: string[];
   /**
@@ -593,7 +605,8 @@ See also:
     },
   );
 
-  console.log(`job_id=${job.id}`);
+  // --json: stdout is JSON lines (the same contract runSync keeps).
+  console.log(args.includes('--json') ? JSON.stringify({ job_id: job.id }) : `job_id=${job.id}`);
 }
 
 // The lock layer minus performSync (SyncLockBusyError, formatLockBusyMessage,
@@ -602,37 +615,64 @@ See also:
 export { SyncLockBusyError, runBreakLock } from '../core/sync-lock.ts';
 
 export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
-  // v0.22.13 CODEX-2: cross-process writer lock prevents two concurrent
-  // syncs from racing on the same last_commit anchor (last writer wins,
-  // bookmark regresses, silent corruption).
-  //
-  // v0.40.5.0: per-source DB lock via `syncLockId(sourceId)`. Two sources
-  // (default + zion-brain) take distinct lock rows and don't serialize.
-  // SYNC_LOCK_ID is now a back-compat alias for syncLockId('default').
-  //
-  // v0.40.6.0 (D11 from PR #1314 review): pair the per-source lock with
-  // `withRefreshingLock` so long-running sources (media-corpus, 250K+
-  // chunks) don't lose their lock at the 30-minute TTL mid-run. Closes
-  // the bug class where a >30min sync could let a parallel acquire steal
-  // the lock and race on the final commit + bookmark write.
-  //
-  // skipLock is reserved for callers that already serialize via another
-  // mechanism (e.g. cycle.ts holds gbrain-cycle for the broader scope).
+  const [managed] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
+  if (managed?.enabled) return (await import('../core/persistence/sync-run.ts')).performManagedSync(engine, opts);
+  assertSourceFilesystemActive(true);
+  const jobSignal = currentJobSignal();
+  if (jobSignal?.aborted) throw jobSignal.reason ?? new Error('Sync job cancelled');
+  const finish = (result: SyncResult): SyncResult => {
+    assertSourceFilesystemActive(true);
+    if (jobSignal?.aborted) throw jobSignal.reason ?? new Error('Sync job cancelled');
+    return result;
+  };
+  const inheritedSignal = currentSourceFilesystemSignal();
+  if (inheritedSignal) opts = { ...opts, signal: opts.signal ? AbortSignal.any([opts.signal, inheritedSignal]) : inheritedSignal };
+  const interruptedBeforeWork = async (): Promise<SyncResult> => {
+    assertSourceFilesystemActive(true);
+    const lastCommit = opts.full ? null : await readSyncAnchor(engine, opts.sourceId, 'last_commit');
+    return buildPartialResult({
+      fromCommit: lastCommit, toCommit: lastCommit ?? '', filesImported: 0,
+      pagesAffected: [], chunksCreated: 0, added: 0, modified: 0, deleted: 0, renamed: 0,
+      reason: 'timeout',
+    });
+  };
+  // The delegated runner treats interruption as a resumable partial result,
+  // including cancellation before acquisition of the new filesystem lock.
+  if (opts.signal?.aborted) return finish(await interruptedBeforeWork());
+  const filesystemRoot = opts.repoPath || await readSyncAnchor(engine, opts.sourceId, 'repo_path');
+  if (filesystemRoot && !hasSourceFilesystemLock(filesystemRoot)) {
+    let entered = false;
+    let result: SyncResult | undefined;
+    try {
+      return finish(await withSourceFilesystemLock(engine, filesystemRoot, async () => {
+        entered = true;
+        return result = await performSync(engine, opts);
+      }, { signal: opts.signal }));
+    } catch (err) {
+      if (err instanceof LockStolenError) throw err;
+      const isCallerAbort = err === opts.signal?.reason || (err instanceof Error && err.name === 'AbortError');
+      if (opts.signal?.aborted && isCallerAbort && !jobSignal?.aborted) {
+        if (result?.status === 'partial') return finish(result);
+        if (!entered) return finish(await interruptedBeforeWork());
+      }
+      if (err instanceof LockUnavailableError) throw new SyncLockBusyError(await formatLockBusyMessage(engine, err.lockId), err.lockId);
+      throw err;
+    }
+  }
+  // Per-source leases protect the commit/bookmark window. A caller may
+  // skip this lease only when its broader scope already serializes the work.
   if (opts.skipLock) {
-    return await performSyncInner(engine, opts);
+    return finish(await performSyncInner(engine, opts));
   }
 
   const lockKey = opts.lockId ?? syncLockId(opts.sourceId ?? 'default');
 
-  // v0.42.x (#1794): ALL non-skipLock syncs use the TTL-refreshing lock — the
-  // bare `gbrain sync` path (no --source/--lockId) included. The pre-v0.42 code
-  // gave that path a NON-refreshing tryAcquireDbLock, so a long hand-run sync
-  // (exactly what you'd run during an incident on the 204K brain) could have its
-  // lock TTL lapse and be stolen mid-run. withRefreshingLock keeps the heartbeat
-  // alive (the import loop's event-loop yields ensure the timer fires), and the
-  // heartbeat-aware takeover refuses to steal a live, refreshing holder.
+  // Renewal loss aborts the import loop and prevents a successful bookmark
+  // result, including callers that did not supply their own cancellation.
   try {
-    return await withRefreshingLock(engine, lockKey, () => performSyncInner(engine, opts));
+    return finish(await withRefreshingLock(engine, lockKey, signal => performSyncInner(engine, {
+      ...opts, signal: opts.signal ? AbortSignal.any([opts.signal, signal]) : signal,
+    })));
   } catch (err) {
     if (err instanceof LockUnavailableError) {
       throw new SyncLockBusyError(await formatLockBusyMessage(engine, lockKey), lockKey);
@@ -739,10 +779,23 @@ interface TrackedSlugIndex {
    */
   slugs: Set<string>;
   complete: boolean;
+  /**
+   * Slugs proven ONLY by the anchor tree (no current tracked file derives
+   * to them) -> the anchor paths that proved them, in the caller's path
+   * mode (`pathKey`). Lets the reconcile tell "another file owned this slug
+   * at the anchor" from "the pre-rename state of the very file this rename
+   * just re-imported" (#4597).
+   */
+  anchorOnlyPaths: Map<string, Set<string>>;
 }
 
-function trackedSlugIndex(gitContextRoot: string, anchorCommit?: string): TrackedSlugIndex {
+function trackedSlugIndex(
+  gitContextRoot: string,
+  anchorCommit?: string,
+  pathKey: (rel: string) => string = (rel) => rel,
+): TrackedSlugIndex {
   const slugs = new Set<string>();
+  const anchorOnlyPaths = new Map<string, Set<string>>();
   let complete = true;
   const addSlug = (slug: string): void => { slugs.add(slug); };
   // --cached --others --exclude-standard mirrors gitListSyncableFiles (see
@@ -793,6 +846,7 @@ function trackedSlugIndex(gitContextRoot: string, anchorCommit?: string): Tracke
   // tree is safe; reads stay bounded by the same size gates and only fire
   // for fallback-regime paths.
   if (anchorCommit && anchorCommit !== 'HEAD') {
+    const currentSlugs = new Set(slugs);
     try {
       const epochs = attributeEpochCommits(gitContextRoot, anchorCommit);
       const historicalFilter = epochs === null || anyFilterAtAttributeEpochs(gitContextRoot, epochs);
@@ -801,7 +855,13 @@ function trackedSlugIndex(gitContextRoot: string, anchorCommit?: string): Tracke
         if (!rel) continue;
         if (resolveSlugForPath(rel) !== '' || isCodeFilePath(rel)) continue;
         const res = anchorBlobSlugs(gitContextRoot, anchorCommit, rel, historicalFilter);
-        for (const s of res.slugs) addSlug(s);
+        for (const s of res.slugs) {
+          addSlug(s);
+          if (currentSlugs.has(s)) continue;
+          let at = anchorOnlyPaths.get(s);
+          if (!at) anchorOnlyPaths.set(s, (at = new Set()));
+          at.add(pathKey(rel));
+        }
         if (!res.proofIntact) {
           complete = false;
           serr(
@@ -820,7 +880,7 @@ function trackedSlugIndex(gitContextRoot: string, anchorCommit?: string): Tracke
       );
     }
   }
-  return { slugs, complete };
+  return { slugs, complete, anchorOnlyPaths };
 }
 
 /**
@@ -1035,7 +1095,7 @@ function fallbackSlugsForFile(
       const st = lstatSync(abs);
       if (!st.isSymbolicLink()) {
         if (st.size > MAX_FILE_SIZE) proofIntact = false;
-        else contents.push(readFileSync(abs, 'utf-8'));
+        else contents.push(readSourceFileSync(abs, 'utf-8'));
       }
     }
     // A symlink's own registrable content is its index blob (the target
@@ -1347,6 +1407,28 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       typeof cfgRows[0]?.config === 'string'
         ? (JSON.parse(cfgRows[0].config as string) as Record<string, unknown>)
         : ((cfgRows[0]?.config ?? {}) as Record<string, unknown>);
+    // #4899: EVERY caller that is not the `--all` fan-out passes no strategy —
+    // the autopilot freshness lane (commands/autopilot.ts -> jobs.ts), the dream
+    // cycle (core/cycle.ts), the MCP `sync` op (core/operations.ts) and the
+    // single-source CLI path below. `isSyncable` then falls back to 'markdown'
+    // (core/sync.ts), which drops every code file in the range. Two consequences:
+    // the run imports nothing yet still advances the anchor (`Update sync state
+    // even with no syncable changes`), freezing the index at HEAD forever; and
+    // every MODIFIED code file reaches the un-syncable delete loop, whose only
+    // exemptions are 'metafile' (#1433) and 'pruned-dir' (#2404), so its page is
+    // soft-deleted.
+    //
+    // Resolve the source's own strategy when the caller states none. An explicit
+    // --strategy still wins, so the `--all` fan-out and the CLI flag are unchanged.
+    if (opts.strategy === undefined && typeof cfg.strategy === 'string') {
+      const persisted = cfg.strategy;
+      if (persisted === 'markdown' || persisted === 'code' || persisted === 'auto') {
+        // Assign the PROPERTY, never `opts = {...opts}`: this block runs inside
+        // `if (opts.sourceId)`, and replacing the object discards that narrowing,
+        // so three downstream call sites stop compiling.
+        opts.strategy = persisted;
+      }
+    }
     const remoteUrl = typeof cfg.remote_url === 'string' ? cfg.remote_url : null;
     if (remoteUrl) {
       const ownSrc = {
@@ -1472,8 +1554,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `Refusing to sync: possible path traversal via --src-subpath.`,
     );
   }
-  // Relative path from git root to sync scope ('' when scope == root).
-  const syncScopeRelPath = syncScopeRoot === gitContextRoot ? '' : relative(gitContextRoot, syncScopeRoot);
+  const syncScopeRelPath = gitRelativePath(gitContextRoot, syncScopeRoot);
   const scoped = syncScopeRelPath !== '';
   // Anchor written back to sync state (sources.local_path / sync.repo_path):
   // the SCOPE path, so a follow-up bare `gbrain sync` auto-discovers the same
@@ -1703,6 +1784,23 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       .map(p => (p.endsWith('/') ? `${p}**` : p));
     if (storedPatterns.length > 0) {
       opts = { ...opts, exclude: [...new Set([...(opts.exclude ?? []), ...storedPatterns])] };
+    }
+  } catch { /* config unreadable — never break a sync over the scope read */ }
+
+  // #4901: the WAIVER's persisted twin, read exactly like `sync.exclude` above
+  // (same dialect, trailing-slash normalization, union, best-effort, position).
+  // `--include-hidden` is refused under `--all` and unavailable to autopilot /
+  // the dream cycle, so this key is the only way the unattended paths get it.
+  // An unset key admits nothing — the dot-directory default does not move.
+  try {
+    const storedHidden = await engine.getConfig('sync.include_hidden');
+    const hiddenPatterns = (storedHidden ?? '')
+      .split(/[\n,]/)
+      .map(p => p.trim())
+      .filter(Boolean)
+      .map(p => (p.endsWith('/') ? `${p}**` : p));
+    if (hiddenPatterns.length > 0) {
+      opts = { ...opts, includeHidden: [...new Set([...(opts.includeHidden ?? []), ...hiddenPatterns])] };
     }
   } catch { /* config unreadable — never break a sync over the scope read */ }
 
@@ -2184,6 +2282,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // unsyncable cleanup in source A doesn't accidentally sweep same-slug
   // pages in sources B/C/D.
   const pageOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
+  // #4786: pages this loop retires count as `deleted` in the result (only rows
+  // that actually transitioned), so a sweep-only run never reports up_to_date.
+  let swept = 0;
   for (const path of unsyncableModified) {
     // v0.41.13 #1433: never delete on metafile classification.
     // #2404 hardening: same for 'pruned-dir' — a page under a pruned
@@ -2216,7 +2317,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           // Scope falls back to DEFAULT_SOURCE_ID to preserve deletePage's
           // old 'default' fallback; softDeletePages requires an explicit
           // sourceId. The purge phase owns the eventual hard delete.
-          await engine.softDeletePages([slug], { sourceId: opts.sourceId ?? DEFAULT_SOURCE_ID });
+          swept += (await engine.softDeletePages([slug], { sourceId: opts.sourceId ?? DEFAULT_SOURCE_ID })).length;
           slog(`  Soft-deleted un-syncable page (recoverable 72h): ${slug}`);
         }
       }
@@ -2228,8 +2329,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // plus zero imports must not produce a clean `up_to_date` (and must not
     // advance the anchor past commits this run never looked at remotely).
     // Reached when local-only commits landed with no syncable content while
-    // the pull kept failing. Nothing is written; the next sync re-diffs the
-    // same trivial range and retries the pull.
+    // the pull kept failing. Nothing is imported (the #4786 sweep above may
+    // have soft-deleted pages — report it); the next sync re-diffs the same
+    // trivial range and retries the pull.
     if (pullFailed) {
       serr(
         `[sync] git pull failed and no syncable changes imported — reporting partial ` +
@@ -2241,7 +2343,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         filesImported: 0,
         pagesAffected: [],
         chunksCreated: 0,
-        added: 0, modified: 0, deleted: 0, renamed: 0,
+        added: 0, modified: 0, deleted: swept, renamed: 0,
         reason: 'pull_failed',
       });
     }
@@ -2268,10 +2370,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // sweep orphaned `<rename:…>` sentinels here too.
     await sweepOrphanedRenameSentinels(engine, opts.sourceId ?? DEFAULT_SOURCE_ID);
     return {
-      status: 'up_to_date',
+      status: swept > 0 ? 'synced' : 'up_to_date',
       fromCommit: lastCommit,
       toCommit: pin,
-      added: 0, modified: 0, deleted: 0, renamed: 0,
+      added: 0, modified: 0, deleted: swept, renamed: 0,
       chunksCreated: 0,
       embedded: 0,
       pagesAffected: [],
@@ -2422,7 +2524,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       chunksCreated,
       added: filtered.added.length,
       modified: filtered.modified.length,
-      deleted: filtered.deleted.length,
+      deleted: filtered.deleted.length + swept,
       renamed: filtered.renamed.length,
       reason: checkpointDead ? 'checkpoint_unavailable' : reason,
       bankedFiles,
@@ -2660,11 +2762,24 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // unreadable fallback-regime file — see trackedSlugIndex), an index miss
     // proves nothing, so the row is spared as 'unknown' rather than deleted.
     let treeSlugIndex: TrackedSlugIndex | undefined;
-    const slugLiveness = (s: string): 'live' | 'stale' | 'unknown' => {
+    const slugLiveness = (s: string, from: string): 'live' | 'stale' | 'unknown' => {
       // lastCommit = the commit the brain reflects; its blob is one of the
-      // consulted content states (see fallbackSlugsForFile).
-      treeSlugIndex ??= trackedSlugIndex(gitContextRoot, lastCommit);
-      if (treeSlugIndex.slugs.has(s)) return 'live';
+      // consulted content states (see fallbackSlugsForFile). Anchor paths
+      // are keyed through modePath so they compare against `from` under
+      // #4342 source-root mode too.
+      treeSlugIndex ??= trackedSlugIndex(gitContextRoot, lastCommit, modePath);
+      if (treeSlugIndex.slugs.has(s)) {
+        // #4597: when the ONLY liveness proof is the anchor blob at THIS
+        // rename's own from-path, that proof is the pre-rename state of the
+        // file just re-imported at `to` (the reconcile only runs once the
+        // destination materialized) — the exact duplicate it exists to
+        // remove. Sparing it checkpointed the rename as converged, so the
+        // duplicate never re-entered an incremental diff. Any current-tree
+        // hit, or anchor proof from a DIFFERENT path (the #3583 data-loss
+        // shapes), still spares the row.
+        const onlyAt = treeSlugIndex.anchorOnlyPaths.get(s);
+        if (!onlyAt || ![...onlyAt].every(p => p === from)) return 'live';
+      }
       return treeSlugIndex.complete ? 'stale' : 'unknown';
     };
 
@@ -2708,10 +2823,17 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     }
 
     // T4: pre-resolve ALL `from` slugs in batches before iterating. Falls
-    // back to per-path resolveSlugByPathOrSourcePath when sourceId is
-    // unset (matches the delete loop's legacy posture). For large rename
-    // commits (rare but possible: prefix sweep, reorganization), this drops
-    // the slug-resolve round-trips from O(renames) to O(renames/500).
+    // back to the guarded per-path resolver when sourceId is unset. For
+    // large rename commits (rare but possible: prefix sweep, reorganization),
+    // this drops the slug-resolve round-trips from O(renames) to O(renames/500).
+    //
+    // #3942: routed through resolveSlugsForRemovedPaths (same guarded
+    // resolver the delete lane uses) instead of a raw resolveSlugsByPaths +
+    // unguarded resolveSlugForPath fallback — a re-slugified fallback can
+    // name a page whose recorded origin is a DIFFERENT file (e.g. a
+    // trailing-hyphen collision). A refused from-path gets no entry in
+    // fromSlugByPath, so the rename below skips the cheap updateSlug and
+    // falls through to add + reconcile instead of repointing that page.
     const fromSlugByPath = new Map<string, string>();
     if (opts.sourceId) {
       const sid = opts.sourceId;
@@ -2722,15 +2844,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           return await partial('timeout');
         }
         const batch = fromPaths.slice(i, i + DELETE_BATCH_SIZE);
-        let m: Map<string, string>;
-        try {
-          m = await engine.resolveSlugsByPaths(batch, { sourceId: sid });
-        } catch {
-          m = new Map();
-        }
-        for (const p of batch) {
-          fromSlugByPath.set(p, m.get(p) ?? resolveSlugForPath(p));
-        }
+        const resolution = await resolveSlugsForRemovedPaths(engine, batch, sid);
+        for (const r of resolution.refused) serr(refusedRemovedPathMessage(r));
+        for (const [p, s] of resolution.slugs) fromSlugByPath.set(p, s);
       }
     }
 
@@ -2753,10 +2869,21 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         progress.finish();
         return await partial('timeout');
       }
-      // T4: the batch-resolved slug for `from` (see fromSlugByPath above).
+      // T4: the batch-resolved slug for `from` (see fromSlugByPath above). A
+      // refused/unresolved from-path has no entry, so this is undefined
+      // rather than falling back to an unverified derived slug.
+      //
+      // #3942: the no-sourceId lane is scoped to DEFAULT_SOURCE_ID (not
+      // left unscoped) — updateSlug below only ever touches the
+      // default-scoped row (renameOpts is undefined here, and updateSlug
+      // defaults its own sourceId to 'default'), so the read that decides
+      // what to rename must agree with that scope. An unscoped resolve
+      // could otherwise return a DIFFERENT source's row sharing this
+      // source_path, licensing the wrong (or a foreign) slug for a
+      // default-scoped rename.
       const oldSlug = opts.sourceId
-        ? (fromSlugByPath.get(from) ?? resolveSlugForPath(from))
-        : await resolveSlugByPathOrSourcePath(engine, from, undefined);
+        ? fromSlugByPath.get(from)
+        : await resolveRemovedPathSlug(engine, from, DEFAULT_SOURCE_ID, serr);
       // The new path doesn't yet have a row, so resolve from path only.
       const newSlug = resolveSlugForPath(to);
       // #3056: the cheap rename is OBSERVED, not assumed. A zero-row UPDATE
@@ -2765,7 +2892,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // the row at the new path while the old row stayed behind live. Both
       // shapes now fall through to the reconcile below.
       let renameApplied = false;
-      if (oldSlug !== '') {
+      if (oldSlug !== undefined) {
         try {
           renameApplied = (await engine.updateSlug(oldSlug, newSlug, renameOpts)) > 0;
         } catch {
@@ -2866,9 +2993,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       //   2. Locate the stale row POSITIVELY by `source_path = from`, never
       //      by the oldSlug guess — after a collision, a path-derived
       //      fallback slug could name an unrelated (e.g. manually curated)
-      //      row. No source_path match → nothing is deleted (this also means
-      //      code-strategy imports, which don't populate source_path, fall
-      //      back safely to leaving the old row rather than guessing).
+      //      row. No source_path match → nothing is deleted (code pages
+      //      imported before `importCodeFile` wrote `source_path` (#4900)
+      //      still carry NULL until their next import and fall back safely
+      //      to leaving the old row rather than guessing).
       //
       // A failed delete records a `<rename:…>` SENTINEL (not an ordinary
       // path failure): the gate hard-blocks the bookmark, and — unlike a
@@ -2927,7 +3055,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
                 );
                 continue;
               }
-              const verdict = slugLiveness(s);
+              const verdict = slugLiveness(s, from);
               if (verdict === 'live') {
                 serr(
                   `  [sync] rename reconcile: skipping live row ${s} — a tracked ` +
@@ -3628,7 +3756,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       toCommit: pin,
       added: filtered.added.length,
       modified: filtered.modified.length,
-      deleted: filtered.deleted.length,
+      deleted: filtered.deleted.length + swept,
       renamed: filtered.renamed.length,
       chunksCreated,
       embedded: 0,
@@ -3759,13 +3887,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   }
   if (!opts.noExtract && totalChanges <= 100 && pagesAffected.length > 0) {
     try {
-      const { extractLinksForSlugs, extractTimelineForSlugs, stampExtracted } = await import('./extract.ts');
+      const { extractLinksForSlugs, extractTimelineForSlugs, stampExtracted, slugsSafeToStamp } = await import('./extract.ts');
       // #774: pages' source_path is git-root-relative, so extract resolves
       // files from gitContextRoot (== repoPath realpath when unscoped).
-      const linksCreated = await extractLinksForSlugs(engine, gitContextRoot, pagesAffected, extractOpts);
-      const timelineCreated = await extractTimelineForSlugs(engine, gitContextRoot, pagesAffected, extractOpts);
-      if (linksCreated > 0 || timelineCreated > 0) {
-        slog(`  Extracted: ${linksCreated} links, ${timelineCreated} timeline entries`);
+      const linksResult = await extractLinksForSlugs(engine, gitContextRoot, pagesAffected, extractOpts);
+      const timelineResult = await extractTimelineForSlugs(engine, gitContextRoot, pagesAffected, extractOpts);
+      if (linksResult.created > 0 || timelineResult.created > 0) {
+        slog(`  Extracted: ${linksResult.created} links, ${timelineResult.created} timeline entries`);
       }
       // v0.42.7 (#1696, CDX-6): stamp the links_extracted_at watermark for the
       // pages we just extracted, AFTER the import set their updated_at, so
@@ -3773,9 +3901,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // Source-correct via opts.sourceId. Stamp at the CALL SITE (not inside
       // extractLinksForSlugs) so we use the per-source sourceId the sync owns.
       // Best-effort: a stamp miss just means extract --stale re-sweeps later.
+      // Only the slugs both hooks actually read — a page the extractor
+      // skipped must stay stale so the sweep still owes it.
       await stampExtracted(
         engine,
-        pagesAffected.map((slug) => ({ slug, source_id: opts.sourceId ?? 'default' })),
+        slugsSafeToStamp(linksResult, timelineResult)
+          .map((slug) => ({ slug, source_id: opts.sourceId ?? 'default' })),
       );
     } catch { /* extraction is best-effort */ }
   }
@@ -3877,7 +4008,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     toCommit: pin,
     added: filtered.added.length,
     modified: filtered.modified.length,
-    deleted: filtered.deleted.length,
+    deleted: filtered.deleted.length + swept,
     renamed: filtered.renamed.length,
     chunksCreated,
     embedded,
@@ -3962,7 +4093,7 @@ async function performFullSync(
   const FULL_SYNC_LARGE_MARKER = Number.MAX_SAFE_INTEGER;
   const fullConcurrency = autoConcurrency(engine, FULL_SYNC_LARGE_MARKER, opts.concurrency);
   slog(`Running full import of ${syncScopeRoot}${fullConcurrency > 1 ? ` (${fullConcurrency} workers)` : ''}...`);
-  const { runImport } = await import('./import.ts');
+  const { runImport, ImportAbortError } = await import('./import.ts');
   const importArgs = [syncScopeRoot];
   if (opts.noEmbed) importArgs.push('--no-embed');
   if (opts.includeGitignored) importArgs.push('--include-gitignored');
@@ -3975,18 +4106,32 @@ async function performFullSync(
   const _fullImportT0 = Date.now();
   serr(`[gbrain phase] sync.fullsync.import start strategy=${opts.strategy ?? 'markdown'}`);
   opts.onProgress?.({ phase: 'full_import' });
-  const result = await runImport(engine, importArgs, {
-    commit: headCommit,
-    strategy: opts.strategy,
-    sourceId: opts.sourceId,
-    exclude: opts.exclude,
-    includeHidden: opts.includeHidden,
-    includeGitignored: opts.includeGitignored,
-    slugRoot,
-    // issue #1939: performFullSync owns the failure ledger + bookmark via the
-    // shared gate below; don't let runImport double-record or write its own.
-    managedBookmark: true,
-  });
+  let result: import('./import.ts').RunImportResult;
+  try {
+    result = await runImport(engine, importArgs, {
+      signal: opts.signal,
+      commit: headCommit,
+      strategy: opts.strategy,
+      sourceId: opts.sourceId,
+      exclude: opts.exclude,
+      includeHidden: opts.includeHidden,
+      includeGitignored: opts.includeGitignored,
+      slugRoot,
+      // issue #1939: performFullSync owns the failure ledger + bookmark via the
+      // shared gate below; don't let runImport double-record or write its own.
+      managedBookmark: true,
+    });
+    if (opts.signal?.aborted) throw new ImportAbortError('interrupted', 1, result);
+  } catch (error) {
+    assertSourceFilesystemActive(true);
+    if (!(error instanceof ImportAbortError) || !error.partialResult || !opts.signal?.aborted || currentJobSignal()?.aborted) throw error;
+    const partial = error.partialResult;
+    return buildPartialResult({
+      fromCommit: await readSyncAnchor(engine, opts.sourceId, 'last_commit'), toCommit: headCommit,
+      filesImported: partial.imported, pagesAffected: [], chunksCreated: partial.chunksCreated,
+      added: partial.imported, modified: 0, deleted: 0, renamed: 0, reason: 'timeout',
+    });
+  }
   serr(
     `[gbrain phase] sync.fullsync.import done ${Date.now() - _fullImportT0}ms ` +
     `imported=${result.imported} skipped=${result.skipped} errors=${result.errors}`,
@@ -4150,7 +4295,7 @@ async function performFullSync(
     // whose source_path lives outside the subpath (e.g. from an earlier
     // root-level sync of this source) are out of this walk's sight and must
     // not be treated as stale.
-    const scopePrefix = slugRoot ? relative(gitContextRoot, syncScopeRoot) + '/' : '';
+    const scopePrefix = slugRoot ? gitRelativePath(gitContextRoot, syncScopeRoot) + '/' : '';
     // 'malformed-path' rows ARE reconcile-eligible: junk filenames (bracket /
     // control-char paths minted by misbehaving producers) can never be
     // re-imported, so their rows are permanent search pollution unless the
@@ -4338,10 +4483,31 @@ export {
 function manageGitignoreAtGitRoot(path: string, engineKind?: 'pglite' | 'postgres'): void {
   let root = path;
   try { root = discoverGitRoot(path); } catch { /* best-effort */ }
-  manageGitignore(root, engineKind);
+  try { manageGitignore(root, engineKind); }
+  catch (error) {
+    // Managed sync already committed through its canonical owner. Ancillary
+    // legacy housekeeping must neither write outside that journal nor turn
+    // the completed sync into a failure before its JSON acknowledgment.
+    if (error instanceof Error && 'code' in error && error.code === 'writer_coordinator_required') {
+      serr('[sync] Skipped automatic .gitignore maintenance for the managed worktree.');
+      return;
+    }
+    throw error;
+  }
 }
 
 export async function runSync(engine: BrainEngine, args: string[]) {
+  // #4888: under --json, stdout is reserved for the ONE JSON envelope (#4684:
+  // the cost-gate status object rides inside it as `cost_gate`); every slog()
+  // human line from performSync and its callees routes to stderr instead.
+  // serr/progress are stderr already, and the envelope's own
+  // console.log(JSON.stringify(..)) site is untouched by the wrap.
+  return args.includes('--json')
+    ? withHumanLogsToStderr(() => runSyncInner(engine, args))
+    : runSyncInner(engine, args);
+}
+
+async function runSyncInner(engine: BrainEngine, args: string[]) {
   // v0.40 Federated Sync v2: `gbrain sync trigger` subcommand
   // Routes to runSyncTrigger which queues a 'sync' minion job with
   // auto_embed_backfill=true. Falls through to the normal sync path
@@ -4387,7 +4553,10 @@ Options:
                        waivable) for paths matching this glob (repeatable).
                        Does not reach a non-git directory's FS-walk import
                        fallback; every git-tracked source (the normal case)
-                       is covered. Cannot combine with --all.
+                       is covered. Cannot combine with --all; persist it as
+                       the sync.include_hidden config key (gbrain config set
+                       sync.include_hidden '<globs>') so --all, autopilot and
+                       the dream cycle honor it.
   --include-gitignored Include otherwise-syncable files matched by .gitignore.
                        Forces a full filesystem walk so periodic syncs see
                        ignored untracked content.
@@ -4438,8 +4607,9 @@ Options:
                        ok_count, error_count, skipped_count}). Sources
                        skipped by --missing-path skip appear with
                        status 'skipped_missing_path' and their
-                       local_path. Human banners route to stderr so
-                       '--json | jq' parses cleanly.
+                       local_path. All human output routes to stderr
+                       (single-source runs too) so '--json | jq'
+                       parses cleanly.
                        Exit codes: 0 = all sources ok or skipped,
                        1 = any error, 2 = cost-prompt-not-confirmed.
   --yes                Accept any interactive prompts (CI / non-TTY).
@@ -4616,7 +4786,9 @@ See also:
     console.error(
       `--src-subpath/--exclude/--include-hidden scope a single sync invocation; they cannot be combined with --all. ` +
       `For --all runs, register the subdirectory as the source's local_path instead ` +
-      `(gbrain sources add <id> --path <repo>/<subdir>).`,
+      `(gbrain sources add <id> --path <repo>/<subdir>), persist exclusions with ` +
+      `\`gbrain config set sync.exclude <globs>\`, and persist the dot-directory waiver with ` +
+      `\`gbrain config set sync.include_hidden <globs>\` so --all, autopilot and the dream cycle honor it.`,
     );
     process.exit(1);
   }
@@ -4689,7 +4861,7 @@ See also:
   // surfaces the auto-route to stderr so the user knows what happened
   // and can pass --source to override if needed.
   const explicitSource = args.find((a, i) => args[i - 1] === '--source') || null;
-  const { resolveSourceWithTier, resolveSourceForRepoPath, formatSoleNonDefaultNudge } =
+  const { resolveSourceWithTier, resolveSourceForRepoPath, formatSoleNonDefaultNudge, defaultWriteAllowedByEnv } =
     await import('../core/source-resolver.ts');
   // #3765: an explicit --repo anchors source resolution at the REPO dir, not
   // the caller's cwd. Pre-fix, `gbrain sync --repo ~/other-vault` parsed the
@@ -4722,6 +4894,22 @@ See also:
     if (nudge) process.stderr.write(nudge + '\n');
   }
 
+  // #4583 (fixes #4564's misrouted-write symptom): refuse an unscoped
+  // single-source sync that would silently land in 'default' on a
+  // bulk-non-default brain. Exempt: `--all` (iterates every source, not an
+  // unscoped-to-default write) and `--dry-run` (writes nothing — the preview
+  // runs and the guard only WARNS that a real run would be refused). Escape:
+  // `--source default` (tier 'flag', never seed_default) or
+  // GBRAIN_ALLOW_DEFAULT_WRITE=1. Fail-open: a query error never blocks a sync.
+  if (resolved.tier === 'seed_default' && !syncAll && !defaultWriteAllowedByEnv()) {
+    const { assessDefaultWriteGuard, formatDefaultWriteRefusal } = await import('../core/source-resolver.ts');
+    const assessment = await assessDefaultWriteGuard(engine);
+    if (assessment.shouldGuard) {
+      console.error((dryRun ? '[dry-run] a real run would be refused:\n' : '') + formatDefaultWriteRefusal('sync', assessment));
+      if (!dryRun) process.exit(1);
+    }
+  }
+
   // --skip-failed: acknowledge pre-existing unacked failures BEFORE the sync
   // runs, not only ones the current run produces. Without this, the common
   // recovery flow — fix the YAML, re-run sync, then run --skip-failed to clear
@@ -4736,7 +4924,7 @@ See also:
   // refusal is lifted below.
   if (skipFailed) {
     const acked = syncAll ? acknowledgeFailures() : acknowledgeFailures(sourceId);
-    if (acked.count > 0) console.log(`Acknowledged ${acked.count} pre-existing failure(s).`);
+    if (acked.count > 0) slog(`Acknowledged ${acked.count} pre-existing failure(s).`);
   }
 
   // v0.19.0 — `sync --all` iterates all registered sources with a
@@ -4769,7 +4957,7 @@ See also:
       );
     }
     if (!sources || sources.length === 0) {
-      console.log('No sources with local_path configured. Use `gbrain sources add <id> --path <path>` first.');
+      slog('No sources with local_path configured. Use `gbrain sources add <id> --path <path>` first.');
       return;
     }
 
@@ -4791,10 +4979,7 @@ See also:
     //     performSync get the [<source-id>] prefix under parallel mode (D6)
     //   - stable JSON envelope {schema_version:1, sources, ...} when --json
     // v0.41.31: v2Enabled resolved once above (cost gate). Reused here.
-    const activeSources = sources.filter((s) => {
-      const cfg = (s.config || {}) as { syncEnabled?: boolean };
-      return cfg.syncEnabled !== false;
-    });
+    const activeSources = sources.filter((s) => !isSyncDisabledConfig(s.config));
     const disabledCount = sources.length - activeSources.length;
     const humanSink: NodeJS.WriteStream = jsonOut ? process.stderr : process.stdout;
     const writeHuman = (line: string) => humanSink.write(line + '\n');
@@ -4957,7 +5142,7 @@ See also:
         !dryRun &&
         result.status !== 'dry_run' &&
         result.status !== 'up_to_date' &&
-        result.status !== 'partial'
+        result.status !== 'partial' && syncProducedEmbeddableContent(result)
       ) {
         try {
           const outcome = await resolveSyncEmbedBackfill(engine, src.id, {
@@ -5107,6 +5292,8 @@ See also:
         ok_count: okCount,
         error_count: errCount,
         skipped_count: perSourceResults.filter((r) => r.status === 'skipped_missing_path').length,
+        // #4684: the cost-gate status object rides inside the ONE envelope.
+        ...(embedPlan.costGate ? { cost_gate: embedPlan.costGate } : {}),
       }));
     }
 
@@ -5161,6 +5348,7 @@ See also:
   // inline spend into informed inline-or-deferred spend.
   let singleSourceAutoDefer = false;
   let singleSourceNoWorkerSurface = false;
+  let singleCostGate: Record<string, unknown> | undefined;
   if (!noEmbed && !dryRun && !watch) {
     const gateRows = await engine.executeRaw<{ local_path: string | null; config: Record<string, unknown>; last_commit: string | null; chunker_version: string | null }>(
       `SELECT local_path, config, last_commit, chunker_version FROM sources WHERE id = $1`,
@@ -5178,6 +5366,7 @@ See also:
         jsonOut, yesFlag, full, includeGitignored, noAutoEmbed,
       });
       singleSourceNoWorkerSurface = gate.workerSurface.status === 'no_worker_surface';
+      singleCostGate = gate.costGate;
       if (gate.stop) return;
       if (gate.autoDeferEmbeds) {
         opts.noEmbed = true;
@@ -5196,9 +5385,9 @@ See also:
     // another source's failures.
     const failures = unacknowledgedSyncFailures().filter(f => f.source_id === sourceId);
     if (failures.length === 0) {
-      console.log('No unacknowledged sync failures to retry.');
+      slog('No unacknowledged sync failures to retry.');
     } else {
-      console.log(`Retrying ${failures.length} previously-failed file(s)...`);
+      slog(`Retrying ${failures.length} previously-failed file(s)...`);
       // Don't acknowledge them yet — they must succeed to clear.
     }
   }
@@ -5261,7 +5450,7 @@ See also:
       )) &&
       result.status !== 'dry_run' &&
       result.status !== 'up_to_date' &&
-      result.status !== 'partial'
+      result.status !== 'partial' && syncProducedEmbeddableContent(result)
     ) {
       try {
         singleEmbedBackfill = await resolveSyncEmbedBackfill(engine, sourceId, {
@@ -5273,14 +5462,14 @@ See also:
       }
     }
     if (jsonOut) {
-      console.log(JSON.stringify(buildSingleSyncJsonEnvelope(sourceId, result, singleEmbedBackfill)));
+      console.log(JSON.stringify(buildSingleSyncJsonEnvelope(sourceId, result, singleEmbedBackfill, singleCostGate)));
     }
     return;
   }
 
   // Watch mode
   let consecutiveErrors = 0;
-  console.log(`Watching for changes every ${interval}s... (Ctrl+C to stop)`);
+  slog(`Watching for changes every ${interval}s... (Ctrl+C to stop)`);
 
   while (true) {
     try {
@@ -5288,7 +5477,7 @@ See also:
       consecutiveErrors = 0;
       if (result.status === 'synced') {
         const ts = new Date().toISOString().slice(11, 19);
-        console.log(`[${ts}] Synced: +${result.added} ~${result.modified} -${result.deleted} R${result.renamed}`);
+        slog(`[${ts}] Synced: +${result.added} ~${result.modified} -${result.deleted} R${result.renamed}`);
       }
       // Same gate as non-watch: only manage .gitignore on successful sync.
       // v0.41.13.0 (T7 / D-V3-5): partial joins the deferred posture.
@@ -5522,6 +5711,8 @@ export function manageGitignore(
   if (process.env.GBRAIN_NO_GITIGNORE === '1') {
     return;
   }
+
+  assertManagedFilesystemWrite(repoPath);
 
   // Submodule + worktree detection (closes #889 misclassification).
   // Both submodules and worktrees use `.git` as a FILE (not a directory), so

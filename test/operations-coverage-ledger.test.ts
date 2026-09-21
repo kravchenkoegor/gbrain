@@ -40,6 +40,9 @@ const LEDGER: Record<string, string> = {
   restore_page: 'test/pages-source-scoping-4329.test.ts',
   purge_deleted_pages: 'test/operations-trust-boundary.test.ts',
   capture: 'test/capture-op.test.ts',
+  get_write_request: 'test/persistence-receipt-operations.test.ts',
+  list_write_requests: 'test/persistence-receipt-operations.test.ts',
+  cancel_write_request: 'test/persistence-receipt-operations.test.ts',
   search: 'test/cli-search-dispatch.test.ts',
   query: 'test/query-image-flag.serial.test.ts',
   search_stats: 'test/search-introspection-ops.test.ts',
@@ -160,6 +163,7 @@ const LEDGER: Record<string, string> = {
   open_loops: 'test/ops-loops.test.ts',
   loops_close: 'test/ops-loops.test.ts',
   loops_mute: 'test/ops-loops.test.ts',
+  loops_unmute: 'test/ops-loops.test.ts',
   // v0.46.28.0+ master-wave ops, mapped at the test-gap-wave master merge.
   fetch: 'test/deep-research-fetch.test.ts',
   get_usage: 'test/chat-usage.test.ts',

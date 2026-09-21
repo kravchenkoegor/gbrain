@@ -16,8 +16,9 @@ import type { PageType, EffectiveDateSource } from './types.ts';
 import { ensureWellFormed } from './text-safe.ts';
 import { stripCodeBlocks } from './markdown-code.ts';
 import { parseInlineCitationTimelineEntries } from './timeline-citations.ts';
-import { slugifyPath } from './sync.ts';
-import { SLUG_WORD_CHARS } from './cjk.ts';
+import { slugifyPath, slugifySegment } from './sync.ts';
+import { SLUG_WORD_CHARS, SLUG_VARIATION_SELECTORS_RE } from './cjk.ts';
+import { foldNonDecomposingLatin } from './latin-fold.ts';
 // #3190: pack-aware link typing. link-inference imports only manifest-v1
 // (zod) + redos-guard (node:vm) — no cycle back into this module.
 import type { SchemaPackManifest } from './schema-pack/manifest-v1.ts';
@@ -48,6 +49,19 @@ export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidat
  * OR updated_at > links_extracted_at`. It is an ISO-8601 string (NOT a number) —
  * the column is TIMESTAMPTZ and the predicate binds it as `::timestamptz`.
  */
+// 2026-09-09: #4985 — normalizeBasename strips Unicode variation selectors (twin
+// of slugifySegment), so emoji+VS16 wikilinks re-resolve to the clean slug.
+// 2026-09-09 (same wave): #4977 — the page-role prior no longer applies to
+// links inside the machine-written list sections rolePriorSuppressedRanges
+// matches (Timeline, See also, Related, Facts, Sources, Links, Email mention
+// links, Backlinks, Significant moments), so pre-fix extractions re-run.
+// NOTE: a re-run ADDS a 'mentions' row beside the prior-typed works_at/advises
+// row — link_type is part of the links conflict key and the insert is
+// ON CONFLICT DO NOTHING with no prune — it does NOT demote the old edge;
+// cleaning those up is a separate maintainer decision.
+// 2026-09-06: #4873 — pass 1b accepts a leading `./` (and, same wave, the
+// `../` / `./../` sibling forms + the folded bare-wikilink grammar), so pages
+// whose links were pruned by the sweep reconcile re-extract on `extract --stale`.
 // 2026-08-21: re-bumped for #2367 — normalizeBasename semantics changed
 // (non-Latin scripts kept, accents folded like the slug grammar), so
 // pre-#2367 extractions must re-run to pick up the newly-resolvable links.
@@ -62,7 +76,7 @@ export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidat
 // PRE-wave code after this date reads as fresh and won't re-extract until
 // the page is next edited; no fixed watermark can cover code that keeps
 // running past it.
-export const LINK_EXTRACTOR_VERSION_TS = '2026-08-21T00:00:00Z';
+export const LINK_EXTRACTOR_VERSION_TS = '2026-09-09T00:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────
 
@@ -113,6 +127,16 @@ export interface EntityRef {
    * so flat directories and sibling links produced zero DB-path edges.
    */
   sameDir?: boolean;
+  /**
+   * Char offset of the link match in the page content
+   * (stripCodeBlocks and the pass masks are length-preserving, so the
+   * offset is valid against the original content). Lets extractPageLinks
+   * anchor the context window and the Timeline/See-also role-prior
+   * suppression at the ACTUAL link, not at the first occurrence of the
+   * display text — a Timeline link whose display name also appears in the
+   * bio used to anchor early and take the bio's typing.
+   */
+  index?: number;
 }
 
 /**
@@ -168,7 +192,7 @@ const ANY_DIR_SEGMENT = '[a-z0-9][a-z0-9_-]*';
  * are dropped by the callers' existence checks, exactly as before.
  */
 const ENTITY_REF_RE = new RegExp(
-  `\\[([^\\]]+)\\]\\((?:\\.\\.\\/)*(${ANY_DIR_SEGMENT}\\/[^)\\s]+?)(?:\\.md)?\\)`,
+  `\\[([^\\]]+)\\]\\((?:\\.\\.\\/)*(${ANY_DIR_SEGMENT}\\/[^)\\s#]+?)(?:\\.md)?(?:#[^)]*)?\\)`,
   'g',
 );
 
@@ -236,13 +260,22 @@ const MARKDOWN_LABEL_WIKILINK_RE = /\[[^\]\n]*\[\[[^\]\n]+\]\][^\]\n]*\]\([^)\n]
 
 /**
  * #3190: same-directory markdown link — `[Name](slug.md)` whose target has
- * NO directory segment and NO scheme/anchor (`/`, `:`, `#` all excluded).
- * The `.md` suffix is REQUIRED (mirrors the FS extractor's mdPattern) so
- * bare parenthetical prose (`[sic](reference)`) never produces a ref.
- * Resolution against the linking page's directory happens in
- * extractPageLinks (this module has no page context here).
+ * NO directory segment and NO scheme (`/`, `:` excluded). A trailing
+ * `#anchor` is stripped (#4995), as every wikilink regex here already does.
+ * #4873: an explicit `./` prefix (`[Name](./slug.md)`, `[Name](./sub/x.md)`)
+ * is the same page-dir-relative intent — the FS walker's join() eats it — so
+ * the relative arm admits `/` in the tail. The arm takes ANY leading run of
+ * `./` / `../` segments (`[Name](../slug.md)`, `[Name](./../slug.md)`): pass 1
+ * only claims `../` targets that carry a directory segment, so a parent-dir
+ * sibling link had no DB candidate at all while the FS walker's join() linked
+ * it — the sweep reconcile then pruned the edge (same class as #4873).
+ * Captures: name, dot-prefix run, relative tail, bare tail. The `.md` suffix
+ * is REQUIRED (mirrors the FS extractor's mdPattern) so bare parenthetical
+ * prose (`[sic](reference)`) never produces a ref. Resolution against the
+ * linking page's directory happens in extractPageLinks (this module has no
+ * page context here).
  */
-const SAME_DIR_MD_RE = /\[([^\]]+)\]\(([^)/:#\s]+?)\.md\)/g;
+const SAME_DIR_MD_RE = /\[([^\]]+)\]\((?:((?:\.{1,2}\/)+)([^):#\s]+?)|([^)/:#\s]+?))\.md(?:#[^)]*)?\)/g;
 
 /**
  * A code-reference found in markdown prose. Created by extractCodeRefs and
@@ -377,25 +410,34 @@ export function extractEntityRefs(content: string): EntityRef[] {
     // exact {name, slug, dir} shape (no upLevels key) so equality consumers
     // are unaffected.
     if (up) ref.upLevels = up[0].length / 3;
+    ref.index = match.index;
     refs.push(ref);
     markdownRanges.push([match.index, match.index + match[0].length]);
   }
 
-  // 1b. #3190: same-directory markdown links — `[Name](slug.md)` (no `/`,
-  //     no scheme). Pass 1 requires a `dir/` segment, so sibling links in
-  //     flat directories were silently dropped on the DB path while the FS
-  //     walker (extractMarkdownLinks → resolveSlug) linked them. Tagged
-  //     `sameDir: true`; extractPageLinks resolves against the page's dir.
-  //     Disjoint from pass 1 (its targets always contain `/`).
+  // 1b. #3190/#4873: same-directory markdown links — `[Name](slug.md)`,
+  //     `[Name](./slug.md)`, `[Name](../slug.md)` (no scheme). Pass 1 requires
+  //     a `dir/` segment, so sibling and dot-relative links were silently
+  //     dropped on the DB path while the FS walker (extractMarkdownLinks →
+  //     resolveSlug) linked them. Tagged `sameDir: true`; the `..` depth of
+  //     the prefix rides on `upLevels` and extractPageLinks resolves against
+  //     the page's dir. A `../dir/x.md` span pass 1 already claimed is skipped
+  //     so the two passes never double-emit.
   const sameDirPattern = new RegExp(SAME_DIR_MD_RE.source, SAME_DIR_MD_RE.flags);
   while ((match = sameDirPattern.exec(stripped)) !== null) {
+    const at = match.index;
+    if (markdownRanges.some(([s, e]) => at >= s && at < e)) continue;
     const name = match[1];
-    let target = match[2];
+    let target = match[3] ?? match[4];
     if (target.includes('%')) {
       try { target = decodeURIComponent(target); } catch { /* keep raw */ }
     }
-    refs.push({ name, slug: target, dir: '', sameDir: true });
-    markdownRanges.push([match.index, match.index + match[0].length]);
+    const ref: EntityRef = { name, slug: target, dir: '', sameDir: true };
+    const ups = match[2] ? match[2].split('/').filter(seg => seg === '..').length : 0;
+    if (ups) ref.upLevels = ups;
+    ref.index = at;
+    refs.push(ref);
+    markdownRanges.push([at, at + match[0].length]);
   }
 
   // 2a. v0.17.0 qualified wikilinks: [[source-id:path]] or [[source-id:path|Display]]
@@ -411,7 +453,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
     const displayName = (match[3] || slug).trim();
     const dir = slug.split('/')[0];
-    refs.push({ name: displayName, slug, dir, sourceId });
+    refs.push({ name: displayName, slug, dir, sourceId, index: match.index });
     qualifiedRanges.push([match.index, match.index + match[0].length]);
   }
 
@@ -427,7 +469,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
     const displayName = (match[2] || slug).trim();
     const dir = slug.split('/')[0];
-    refs.push({ name: displayName, slug, dir });
+    refs.push({ name: displayName, slug, dir, index: match.index });
     unqualifiedRanges.push([match.index, match.index + match[0].length]);
   }
 
@@ -459,7 +501,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
     const displayName = (match[2] || slug).trim();
     const dir = slug.includes('/') ? slug.split('/')[0] : '';
-    refs.push({ name: displayName, slug, dir, needsResolution: true });
+    refs.push({ name: displayName, slug, dir, needsResolution: true, index: match.index });
   }
 
   return refs;
@@ -598,12 +640,19 @@ export async function extractPageLinks(
   // here and every such edge landed as 'mentions'.
   const pack = opts.pack ?? null;
   const packBudget = pack ? new PageRegexBudget() : undefined;
-  const typeFor = (ctx: string, targetSlug: string): string => {
+  // Timeline / See-also links never receive the page-role prior — see
+  // rolePriorSuppressedRanges (matched on the code-stripped content, so a
+  // fenced `## Timeline` never opens a range). idx is the link's position in
+  // `content` (stripCodeBlocks and the wikilink mask are length-preserving,
+  // so indices line up); idx < 0 / undefined keeps the old behavior.
+  const suppressedRanges = rolePriorSuppressedRanges(stripCodeBlocks(content));
+  const typeFor = (ctx: string, targetSlug: string, idx?: number): string => {
     if (pack) {
       const packVerb = inferLinkTypeFromPack(pack, pageType as string, ctx, packBudget);
       if (packVerb) return packVerb;
     }
-    return inferLinkType(pageType, ctx, content, targetSlug);
+    const suppressPrior = idx !== undefined && idx >= 0 && inSuppressedRange(suppressedRanges, idx);
+    return inferLinkType(pageType, ctx, suppressPrior ? undefined : content, targetSlug);
   };
 
   // 1. Markdown entity refs.
@@ -614,14 +663,24 @@ export async function extractPageLinks(
     // `[Alice](Alice%20Chen.md)` reaches `people/alice-chen`. Downstream
     // existence checks drop targets that aren't pages.
     if (ref.sameDir) {
-      const dirSegs = slug.includes('/') ? slug.split('/').slice(0, -1) : [];
-      const target = slugifyPath([...dirSegs, ref.slug].join('/'));
+      const segs = slug.includes('/') ? slug.split('/').slice(0, -1) : [];
+      // `../` / `./../` prefixes (upLevels) and any mid-path `.`/`..` fold
+      // the way the FS walker's join() does; a run that would climb above
+      // the root is a dangling link there too, so it yields no candidate.
+      let climbed = false;
+      for (const seg of ('../'.repeat(ref.upLevels ?? 0) + ref.slug).split('/')) {
+        if (seg === '' || seg === '.') continue;
+        if (seg !== '..') { segs.push(seg); continue; }
+        if (segs.length === 0) { climbed = true; break; }
+        segs.pop();
+      }
+      const target = climbed ? '' : slugifyPath(segs.join('/'));
       if (target && target !== slug) {
-        const idx = content.indexOf(ref.name);
+        const idx = ref.index ?? content.indexOf(ref.name);
         const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
         candidates.push({
           targetSlug: target,
-          linkType: typeFor(context, target),
+          linkType: typeFor(context, target, idx),
           context,
           linkSource: 'markdown',
         });
@@ -647,11 +706,11 @@ export async function extractPageLinks(
       // Pre-fix these refs were silently dropped (flag off) or demoted to
       // untyped wikilink_basename edges (flag on).
       if (slashIdx !== -1 && ref.slug !== slug) {
-        const litIdx = content.indexOf(ref.slug);
+        const litIdx = ref.index ?? content.indexOf(ref.slug);
         const litContext = litIdx >= 0 ? excerpt(content, litIdx, 240) : ref.name;
         candidates.push({
           targetSlug: ref.slug,
-          linkType: typeFor(litContext, ref.slug),
+          linkType: typeFor(litContext, ref.slug, litIdx),
           context: litContext,
           linkSource: 'markdown',
         });
@@ -665,16 +724,21 @@ export async function extractPageLinks(
       // Downstream existence checks (resolveCandidateSources / put_page's
       // allSlugs filter / addLinksBatch's INNER JOINs) drop the candidate
       // when no root page exists, exactly as for slash-shaped refs above.
-      let bareDirect = '';
+      // #4855 twin: both slug grammars — sync's slugifyPath keeps stroke
+      // letters (`đuc-example`), normalizeBasename folds them (`duc-example`)
+      // — so `[[Đức Example]]` reaches whichever root page exists with the
+      // flag off. Exact slugs only; downstream existence checks drop the miss.
+      const bareDirect = new Set<string>();
       if (slashIdx === -1) {
-        bareDirect = slugifyPath(ref.slug);
-        // Self-loop guard: `[[own-basename]]` on the root page itself.
-        if (bareDirect && bareDirect !== slug) {
-          const litIdx = content.indexOf(ref.slug);
+        for (const form of new Set([slugifyPath(ref.slug), normalizeBasename(ref.slug)])) {
+          // Self-loop guard: `[[own-basename]]` on the root page itself.
+          if (!form || form === slug) continue;
+          bareDirect.add(form);
+          const litIdx = ref.index ?? content.indexOf(ref.slug);
           const litContext = litIdx >= 0 ? excerpt(content, litIdx, 240) : ref.name;
           candidates.push({
-            targetSlug: bareDirect,
-            linkType: typeFor(litContext, bareDirect),
+            targetSlug: form,
+            linkType: typeFor(litContext, form, litIdx),
             context: litContext,
             linkSource: 'markdown',
           });
@@ -707,7 +771,7 @@ export async function extractPageLinks(
         // candidate above already covers it (same rule the dir-qualified
         // branch applies to its raw literal). Keeping it would double-emit.
         matches = (await resolver.resolveBasenameMatches(ref.slug))
-          .filter(m => m !== bareDirect);
+          .filter(m => !bareDirect.has(m));
       }
       if (matches.length === 0) continue;
       const idx = content.indexOf(ref.slug);
@@ -725,7 +789,10 @@ export async function extractPageLinks(
       }
       continue;
     }
-    const idx = content.indexOf(ref.name);
+    // Anchor at the ref's true match offset when the pass
+    // recorded one — first-occurrence-of-display-text anchoring let a
+    // Timeline link inherit the bio's context (and its verb typing).
+    const idx = ref.index ?? content.indexOf(ref.name);
     // Wider context window (240 chars vs original 80) catches verbs that
     // appear at sentence-or-paragraph distance from the slug — common in
     // narrative prose where a partner's investment verbs appear once and
@@ -733,11 +800,14 @@ export async function extractPageLinks(
     const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
     // Relative markdown links resolve against THIS page's directory (fixes
     // cross-dir edges for nested / subtree-scoped content); absolute refs pass
-    // through unchanged.
-    const targetSlug = resolveRelativeSlug(slug, ref);
+    // through unchanged. #4995: lowercased (pass-1 markdown + 2a/2b wikilink
+    // refs) — validateSlug stores every slug lowercase on both engines, so a
+    // mixed-case candidate could never resolve. NOT slugifyPath: it strips
+    // characters validateSlug permits and would mangle a legit put_page slug.
+    const targetSlug = resolveRelativeSlug(slug, ref).toLowerCase();
     candidates.push({
       targetSlug,
-      linkType: typeFor(context, targetSlug),
+      linkType: typeFor(context, targetSlug, idx),
       context,
       linkSource: 'markdown',
     });
@@ -771,7 +841,7 @@ export async function extractPageLinks(
     const context = excerpt(strippedContent, m.index, 240);
     candidates.push({
       targetSlug: m[1],
-      linkType: typeFor(context, m[1]),
+      linkType: typeFor(context, m[1], m.index),
       context,
       linkSource: 'markdown',
     });
@@ -920,6 +990,49 @@ const ADVISOR_ROLE_RE = /\b(?:full-time advisor|professional advisor|advises (?:
 // Scope: only fires for person-page → company-page links. Companies' own
 // pages mentioning their employees use the page-role layer differently.
 const EMPLOYEE_ROLE_RE = /\b(?:is an? (?:senior|staff|principal|lead|backend|frontend|full-?stack|ML|data|security|DevOps|platform)? ?engineer at|is an? (?:senior|staff|principal|lead)? ?(?:developer|designer|product manager|engineering manager|director|VP) (?:at|of)|holds? the (?:CTO|CEO|CFO|COO|CMO|CRO|VP) (?:role|position|seat|title) at|is the (?:CTO|CEO|CFO|COO|CMO|CRO) of|employee at|on the team at|works on .{0,30} at)\b/i;
+
+/**
+ * Content index ranges where the page-role prior must NOT apply: the
+ * machine-written list sections — Timeline, See also, Related, Facts,
+ * Sources, Links, Email mention links, Backlinks, Significant moments
+ * (headingRe below is the one source of truth). Links there are list-shaped, per-event references
+ * ("2026-05-12 — met with [[companies/x]]", Iron-Law back-links) — the
+ * role prior is a statement about the AUTHOR's standing relationships, not
+ * about every entity that passes through their timeline, so applying it
+ * there mints unevidenced works_at/advises edges on every re-import (on
+ * one 12k-page brain: ~7.4k such edges re-minted in a month, right after
+ * a ~19.5k cleanup; same class as #3466). Per-edge verbs inside these
+ * sections still type normally — only the globalContext fallback is
+ * suppressed, so absent explicit evidence the edge stays 'mentions'.
+ *
+ * A range runs from its heading to the next heading of the same or higher
+ * level (or EOF). Case-insensitive; matches "See also" / "See-also". Both
+ * grammars require the ATX space after the `#`s, so a column-0 tag line
+ * (`#links`) is neither an opener nor a closer.
+ */
+function rolePriorSuppressedRanges(content: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  const headingRe = /^(#{1,6})[ \t]+(?:timeline|see[ -]also|related|facts|sources|links|email mention links|backlinks|significant moments)\b[^\n]*$/gim;
+  const anyHeadingRe = /^(#{1,6})[ \t]/gm;
+  let m: RegExpExecArray | null;
+  while ((m = headingRe.exec(content)) !== null) {
+    const level = m[1].length;
+    anyHeadingRe.lastIndex = m.index + m[0].length;
+    // Deeper headings (`###` under `## Timeline`) stay inside the range; the
+    // first same-or-higher one closes it.
+    let next: RegExpExecArray | null;
+    while ((next = anyHeadingRe.exec(content)) !== null && next[1].length > level) { /* nested subsection */ }
+    ranges.push([m.index, next ? next.index : content.length]);
+  }
+  return ranges;
+}
+
+function inSuppressedRange(ranges: Array<[number, number]>, idx: number): boolean {
+  for (const [start, end] of ranges) {
+    if (idx >= start && idx < end) return true;
+  }
+  return false;
+}
 
 /**
  * Infer link_type from page context. Deterministic regex heuristics, no LLM.
@@ -1079,14 +1192,25 @@ export interface SlugResolver {
  * build/query through these two functions so they cannot drift.
  *
  * Keying: raw tail + lowercase tail + slugified tail (the final `/`-segment,
- * or the whole slug when it has no `/`). #2367: slugified keys mirror
+ * or the whole slug when it has no `/`). #2367: slugified keys follow
  * slugifySegment (NFD → strip accents → NFC → lowercase → SLUG_WORD_CHARS
- * filter); the old ASCII-only strip emptied CJK basenames.
+ * filter) and then fold stroke letters through latin-fold (#4855), so for
+ * names with đ/ø/ł/ß… the key is NOT byte-identical to the page slug sync
+ * mints; the dir-hint candidate step (makeResolver step 2, the FS resolver)
+ * tries both forms. The old ASCII-only strip emptied CJK basenames.
  */
 const BASENAME_KEEP_RE = new RegExp(`[^${SLUG_WORD_CHARS}\\s\\-]`, 'gu');
 export function normalizeBasename(s: string): string {
-  return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').normalize('NFC')
-    .toLowerCase().replace(BASENAME_KEEP_RE, '').trim().replace(/\s+/g, '-');
+  // The accent strip cannot fold stroke letters \u2014 Unicode gives them no
+  // decomposition \u2014 so the shared table runs after it, on both the index and
+  // the query side. Without it a display name keeps the unfolded letter while
+  // the ASCII page slug does not, and the lookup misses in silence:
+  // `[[\u0110\u1ee9c Example]]` keyed `\u0111uc-example` and never found `people/duc-example`.
+  const folded = foldNonDecomposingLatin(
+    s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').normalize('NFC')
+      .replace(SLUG_VARIATION_SELECTORS_RE, '').toLowerCase(), // twin of slugifySegment's strip (#4985)
+  );
+  return folded.replace(BASENAME_KEEP_RE, '').trim().replace(/\s+/g, '-');
 }
 
 /** Stable order: shorter slug first (likely closer to brain root), then lexical. */
@@ -1213,15 +1337,21 @@ export function makeResolver(
         }
       }
 
-      // Step 2: dir-hint + slugify → exact getPage
-      const slugified = normalizeBasename(trimmed); // #2367: shared normalizer
+      // Step 2: dir-hint + slugify → exact getPage. Two grammars (#4855):
+      // normalizeBasename (#2367) folds stroke letters to ASCII via latin-fold,
+      // while slugifySegment — the page-slug grammar sync mints — keeps them
+      // (#3417), so a page synced from `Đức Example.md` lives at the unfolded
+      // slug. Exact lookups only, so trying both can never false-positive.
+      const forms = new Set([normalizeBasename(trimmed), slugifySegment(trimmed)]);
       for (const hint of hints) {
         if (!hint) continue;
-        const candidate = `${hint}/${slugified}`;
-        const page = await engine.getPage(candidate, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
-        if (page) {
-          cache.set(cacheKey, candidate);
-          return candidate;
+        for (const form of forms) {
+          const candidate = `${hint}/${form}`;
+          const page = await engine.getPage(candidate, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
+          if (page) {
+            cache.set(cacheKey, candidate);
+            return candidate;
+          }
         }
       }
 
@@ -1514,6 +1644,16 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
       summary = cm[5].trim();
     }
     if (!isValidDate(date) || summary.length === 0) { i++; continue; }
+    // #4277: backlink materialization historically wrote dated navigation
+    // receipts such as `- **2026-06-13** | Referenced in [Acme](../companies/acme.md)`.
+    // The date belongs to the backlink write, not to an event involving this
+    // entity — treating it as timeline evidence both invents event dates and
+    // lets graph-maintenance noise satisfy timeline coverage. Guard on the
+    // PRE-split rest (must START with the marker) so a write-through rendered
+    // `source — summary` bullet whose summary merely mentions the phrase is
+    // untouched. Mirrored in extractTimelineFromContent (timeline-extract.ts)
+    // so FS- and DB-side extraction stay in lockstep.
+    if (/^Referenced in\s+\[/i.test(summary)) { i++; continue; }
     // #3957: pipe-separated bullets carry the canonical `Source — Summary`
     // shape; split them exactly like the FS extractor (extractTimelineFromContent
     // Format 1) so FS- and DB-extracted rows share one (source, summary) shape
@@ -1692,8 +1832,10 @@ export async function isGlobalBasenameEnabled(engine: BrainEngine): Promise<bool
  * and surfaced in the extract summary, never silent (issue #2589: the drop
  * was previously indistinguishable from an unresolved link).
  *
- * SCOPE: the DB extract paths only (`extract links --source db`,
- * `extract --stale`) — they resolve against the full multi-source slug map.
+ * SCOPE: the DB extract paths (`extract links --source db`, `extract --stale`),
+ * the mention scan (`findMentionedEntities` callers lift their guard under it),
+ * and the serve-resident maintenance sweep (`sweep.ts`, #3757 — it threads the
+ * same flag so its reconcile keeps the edges the CLI lanes created).
  * The FS-walk paths (dir-driven, incl. the autopilot cycle's extract phase)
  * build their slug set from the walked files of ONE source, so cross-source
  * targets aren't resolvable there; FS-walk parity is a filed follow-up.

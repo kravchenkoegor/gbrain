@@ -56,6 +56,7 @@ export type CheckCategory = 'brain' | 'skill' | 'ops' | 'meta';
  */
 export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'abandoned_threads',
+  'atom_provenance_drift',
   'brain_score',
   'calibration_freshness',
   'child_table_orphans',
@@ -72,6 +73,9 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'cycle_freshness',
   'dangling_aliases',
   'effective_date_health',
+  // #4795 — reindex-search-vector marker still set: keyword index split
+  // across two tokenizers until the resumed run finishes.
+  'fts_reindex_incomplete',
   'embed_staleness',
   'embedding_column_registry',
   'embedding_env_override',
@@ -88,6 +92,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'facts_health',
   'frontmatter_integrity',
   'malformed_path_pages',
+  'memory_writeback',
   'grade_confidence_drift',
   'graph_coverage',
   'graph_signals_coverage',
@@ -161,6 +166,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'bootstrap_harness_health',
   'bootstrap_hooks_heartbeat',
   'bootstrap_last_verify',
+  'memorable_relay_health',
   'backup_coverage',
   'bootstrap_push_health',
   'bootstrap_durability_job',
@@ -217,7 +223,11 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
  */
 export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
   'cycle_phase_scope',
+  'default_source_local_path',
   'eval_capture',
+  // #4613 — links_link_source_check CHECK shape: schema coherence healed by
+  // `gbrain apply-migrations` (sibling of pages_upsert_arbiter).
+  'links_link_source_check',
   'minions_migration',
   'multi_source_drift',
   'pack_upgrade_available',

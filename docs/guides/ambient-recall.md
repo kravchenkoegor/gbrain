@@ -10,6 +10,10 @@ answers well when asked. It is **placement**: the misses come from moments when
 no question fires. Two frozen verbs close that gap with 2-3 deterministic calls
 per session instead of per-message overhead.
 
+This guide is the READ side of ambient memory. The WRITE side — opt-in
+ambient writeback, where agents save directly-stated user facts during
+ordinary conversation — is [ambient-writeback.md](./ambient-writeback.md).
+
 ## The frontier — which verb goes where
 
 | Moment | Call | Why | Cost |
@@ -63,9 +67,12 @@ synopses.
 ## Budgets
 
 Every pack/delta call takes `budget_tokens`. The server packs highest-priority
-arms first (cards → facts for packs; pages → facts for deltas) and reports
-`budget_used` + `dropped_count`; the injectable `text` field is rendered from
-the packed sets, so it honors the same budget the structured arrays report. It
+arms first (cards → facts for packs; pages → facts for deltas — a delta never
+drops threads, their lines are reserved ahead of pages and facts),
+costing each item as the line it renders to and reserving the envelope +
+section headers up front, and reports `budget_used` (the token estimate of
+`text`) + `dropped_count`; the injectable `text` field is rendered from the
+packed sets, so it never exceeds the budget the structured arrays report. It
 never trims client-side — you always know what was left out (`dropped_count`,
 and `has_more` on deltas). Pick a budget to fit the boundary: a session-start
 pack can afford more than a heartbeat delta.

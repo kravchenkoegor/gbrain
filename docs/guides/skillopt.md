@@ -117,7 +117,7 @@ A typical 20-task benchmark with defaults costs ~$0.90 per run:
 For a 100-task benchmark: ~$5.00 (right at the default cap). Preflight
 refuses to start when the estimate exceeds `--max-cost-usd`.
 
-## Safety guards (the cathedral)
+## Safety guards
 
 | Guard | Decision | What it prevents |
 |---|---|---|
@@ -132,7 +132,7 @@ refuses to start when the estimate exceeds `--max-cost-usd`.
 | Cost preflight | D3 | Surprise mid-run budget exhaustion |
 | Dirty-tree refusal | dry-fix pattern | Overwriting your uncommitted changes |
 
-## Hardening notes (#4119)
+## Hardening notes
 
 Operational truths that keep a run honest. Read these before trusting a
 score delta.
@@ -198,10 +198,14 @@ runs, set:
 `1`/`true` points the child's `CLAUDE_CONFIG_DIR` at an isolated empty
 per-process directory; any other value is used verbatim as the config-dir
 path (pre-seed one if you want a fixed minimal config). **Opt-in on
-purpose:** on non-macOS installs the config dir also holds the OAuth session
-credentials, so the empty-dir form logs the child out there (macOS keeps
-credentials in the keychain and survives). If rollouts start failing auth
-after flipping this on, that is why.
+purpose:** the config dir also holds the CLI's session credentials, so the
+empty-dir form logs the child out wherever the CLI reads its session from the
+config dir — macOS included (observed with Claude Code 2.1.x). If rollouts
+start failing auth (`Not logged in · Please run /login`) after flipping this
+on, that is why: the run now ends `errored` with that message as the failure
+detail instead of finishing as a `no_improvement` with a 0.000 score. For a
+hermetic run that stays authenticated, use the explicit-path form and
+pre-seed that directory with a logged-in config.
 
 ## When NOT to use SkillOpt
 

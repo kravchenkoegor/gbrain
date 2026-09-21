@@ -1,4 +1,5 @@
 import type { Recipe } from '../types.ts';
+import { GLM_THINKING_BY_DEFAULT_RE } from './zhipu.ts';
 
 export const ollama: Recipe = {
   id: 'ollama',
@@ -69,7 +70,35 @@ export const ollama: Recipe = {
       supports_tools: false,
       supports_subagent_loop: false,
       supports_prompt_cache: false,
-      supports_structured_outputs: false,
+      // Ollama enforces `response_format: json_schema` server-side
+      // (grammar-constrained decoding since 0.5) for every loaded model, so
+      // unlike tools this is a provider-wide fact, not a per-model one.
+      // chat() sends the caller's `responseSchema` here (facts extraction,
+      // #4863) and expand() takes the strict generateObject lane with its
+      // existing rejected-recipe fallback.
+      supports_structured_outputs: true,
+      // Reasoning-by-default local families spend output budget on internal
+      // reasoning before emitting answer text, and Ollama bills it against
+      // `max_tokens` — so callers that size output caps must grant headroom
+      // (same contract as DeepSeek v4, gbrain#4172). Without this, a 4000-token
+      // default is consumed entirely by reasoning and the caller gets EMPTY
+      // content with finish_reason "length". Verified on qwen38-27b:latest:
+      // max_tokens=16 returned "" (16 reasoning tokens), max_tokens=600
+      // returned "PONG". Model ids are user-managed, so this is a predicate
+      // over the known reasoning families rather than a recipe-wide boolean —
+      // non-reasoning local models (qwen2.5-coder, llama3.x, mistral) keep the
+      // conservative default. `qwen3` is matched with a boundary so the
+      // qwen2.5-* tags can never be swallowed by it, and `qwen3-coder` (the
+      // instruct-only Qwen3 variant, no thinking mode) is excluded by
+      // lookahead. `phi4-mini-reasoning` is a reasoning model and matches
+      // alongside `phi4-reasoning`. GLM-4.5+/5.x (`glm-5.3-flash[:cloud]`,
+      // `glm-4.6`) reuse the zhipu recipe's cutoff (gbrain#4727) — a reporter
+      // hit the 4000 cap on GLM-5.3-flash via Ollama cloud; `glm-4:9b` stays out.
+      thinking_by_default: (modelId: string) =>
+        GLM_THINKING_BY_DEFAULT_RE.test(modelId) ||
+        /^(?:qwen3[0-9]*(?!-coder)(?:[.\-:]|$)|deepseek-r[0-9]|gpt-oss(?:[.\-:]|$)|magistral(?:[.\-:]|$)|phi[0-9]+(?:-mini)?-reasoning)/i.test(
+          modelId,
+        ),
       // Provider-wide routing ceiling only; Ollama still enforces each loaded
       // model's actual context window at request time.
       max_context_tokens: 128_000,

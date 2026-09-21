@@ -1124,7 +1124,7 @@ async function processPage(
       (raw, message) => {
         process.stderr.write(
           `[extract-conversation-facts] ${page.slug} segment ${seg.startIso}..${seg.endIso} ` +
-          `entity resolution failed for ${JSON.stringify(raw)}: ${message}; keeping raw value\n`,
+          `entity resolution failed for ${JSON.stringify(raw)}: ${message}; preserving fact without an entity target\n`,
         );
       },
     );
@@ -1196,7 +1196,10 @@ async function processPage(
     process.stderr.write(
       `[extract-conversation-facts] ${page.slug} changed during extraction; leaving it unfinished for replay\n`,
     );
-    newestEnd = null;
+    // #4869: no terminal, no checkpoint — this claim did not reach a durable
+    // outcome, so it counts as failed (CLI exit 1 / cycle 'warn'), not processed.
+    state.result.pages_failed++;
+    return { newEndIso: null };
   }
 
   if (!state.dryRun && newestEnd !== null) {
@@ -2051,10 +2054,10 @@ export async function runExtractConversationFacts(
     console.log(`  Cleaned ${aggregate.orphan_facts_cleaned} orphan fact(s) from prior partial runs (D11 replay safety).`);
   }
   if (aggregate.fallback_slugify_count > 0) {
-    console.log(`  Minted ${aggregate.fallback_slugify_count} entity slug(s) via fallback_slugify.`);
+    console.log(`  Preserved ${aggregate.fallback_slugify_count} fact(s) without an entity target after unresolved fallback_slugify.`);
   }
   if (aggregate.resolution_errors > 0) {
-    console.log(`  Kept ${aggregate.resolution_errors} raw entity value(s) after best-effort resolution errors.`);
+    console.log(`  Preserved ${aggregate.resolution_errors} fact(s) without an entity target after best-effort resolution errors.`);
   }
   if (anyBudgetExhausted) {
     console.log(`  Budget cap reached. Re-run with a higher --max-cost-usd to continue.`);

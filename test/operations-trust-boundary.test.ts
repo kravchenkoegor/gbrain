@@ -48,6 +48,7 @@ import { operations, type OperationContext } from '../src/core/operations.ts';
 import { verbOperations } from '../src/core/verbs.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
 import { hasScope } from '../src/core/scope.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 
 let engine: PGLiteEngine;
 
@@ -55,13 +56,15 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-});
+}, 60_000);
 
 afterAll(async () => {
+  await disposePersistenceConsumer(engine);
   await engine.disconnect();
 });
 
 beforeEach(async () => {
+  await disposePersistenceConsumer(engine);
   await resetPgliteState(engine);
 });
 
@@ -72,7 +75,7 @@ beforeEach(async () => {
 function makeContext(overrides: Partial<OperationContext> = {}): OperationContext {
   return {
     engine: engine as any,
-    config: {} as any,
+    config: { engine: 'pglite', embedding_disabled: true },
     logger: console as any,
     dryRun: false,
     remote: true,
@@ -304,19 +307,12 @@ describe('handler invocation — historically-broken trust-boundary classes', ()
     expect(submitJob).toBeDefined();
     const ctx = makeContext({ remote: true });
 
-    let threw = false;
-    let message = '';
-    try {
-      await submitJob!.handler(ctx, { name: 'shell', data: { cmd: 'echo hi' } });
-    } catch (e) {
-      threw = true;
-      message = e instanceof Error ? e.message : String(e);
-    }
-    expect(threw, 'submit_job(shell) with remote=true MUST reject').toBe(true);
-    // Should mention the protected status — "permission_denied" is the
-    // canonical OperationError code, plus the user-facing string names
-    // the rejected name.
-    expect(message.toLowerCase()).toContain('shell');
+    await expect(submitJob!.handler(ctx, { name: 'shell', data: { cmd: 'echo hi' } })).rejects.toMatchObject({
+      code: 'permission_denied',
+      // Bounded diagnostics identify the supported alternatives, without
+      // echoing caller-controlled job names or payloads.
+      message: expect.stringContaining('only sync, import, lint and lint-fix'),
+    });
   });
 
   test('submit_job allows shell when ctx.remote=false (local CLI is trusted)', async () => {
@@ -452,7 +448,8 @@ describe('handler invocation — historically-broken trust-boundary classes', ()
     // still reaches the handler rows — the post-filter must classify it
     // private-only via includeDeleted:true or it slips through.
     const del = operations.find(op => op.name === 'delete_page')!;
-    await del.handler(local, { slug: 'people/tb-priv-example' });
+    const beforeDelete = (await engine.readPageSnapshot('people/tb-priv-example', { sourceId: 'default' }))!;
+    await del.handler(local, { slug: beforeDelete.page.slug, expected_revision: beforeDelete.revision });
     const salienceAfterDelete = JSON.stringify(await salience.handler(remote, {}));
     expect(salienceAfterDelete).not.toContain('people/tb-priv-example');
     expect(salienceAfterDelete).not.toContain('TB_PRIVATE_TITLE_PROOF');

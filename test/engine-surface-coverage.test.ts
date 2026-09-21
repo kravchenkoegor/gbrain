@@ -48,9 +48,9 @@ const DIM = 1536;
  */
 const INTERFACE_METHODS: readonly string[] = [
   // Lifecycle
-  'connect', 'disconnect', 'reconnect', 'initSchema', 'transaction', 'withReservedConnection',
+  'connect', 'disconnect', 'reconnect', 'initSchema', 'transaction', 'transactionDirect', 'registerBeforeDisconnect', 'withReservedConnection',
   // Pages CRUD
-  'getPage', 'putPage', 'findDuplicatePage', 'deletePage', 'deletePages', 'resolveSlugsByPaths',
+  'getPage', 'readPageSnapshot', 'lockPageKeys', 'putPage', 'findDuplicatePage', 'deletePage', 'deletePages', 'resolveSlugsByPaths',
   'softDeletePage', 'softDeletePages', 'restorePage', 'purgeDeletedPages', 'listPages', 'resolveSlugs', 'getAllSlugs',
   'listAllPageRefs', 'listAllSources', 'updateSourceConfig', 'listPrefixSampledPages', 'listCorpusSample',
   // Search
@@ -63,7 +63,7 @@ const INTERFACE_METHODS: readonly string[] = [
   'countStalePagesForExtraction', 'listStalePagesForExtraction', 'markPagesExtractedBatch',
   // Links + graph
   'addLink', 'addLinksBatch', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
-  'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'relationalFanout', 'getBacklinkCounts',
+  'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'traversePathsDetailed', 'relationalFanout', 'getBacklinkCounts',
   'getAdjacencyBoosts', 'getContentFlagsByPageIds', 'getUnverifiedExtractionPageIds',
   'getPageTimestamps', 'getEffectiveDates', 'getSalienceScores', 'findOrphanPages',
   // Tags
@@ -94,7 +94,7 @@ const INTERFACE_METHODS: readonly string[] = [
   // Stats + health + ingest log
   'getStats', 'getHealth', 'logIngest', 'getIngestLog',
   // Sync + aliases + narrow updates
-  'updateSlug', 'rewriteLinks', 'resolveSlugWithAlias', 'resolveAliases', 'setPageAliases',
+  'updateSlug', 'rewriteLinks', 'resolveSlugWithAlias', 'resolveSlugWithAliasDetailed', 'resolveAliases', 'setPageAliases',
   'refreshPageBody', 'updatePageContextualRetrievalState', 'migrateFactsToCanonical',
   // Config + migration + raw SQL
   'getConfig', 'setConfig', 'unsetConfig', 'listConfigKeys', 'runMigration',

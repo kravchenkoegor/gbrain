@@ -14,7 +14,7 @@
 
 import { describe, test, expect, afterEach } from 'bun:test';
 import { __setChatTransportForTests, resetGateway } from '../../src/core/ai/gateway.ts';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
@@ -981,6 +981,7 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
     try {
       await rig.engine.setConfig('dream.synthesize.enabled', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
+      await rig.engine.setConfig('cycle.timezone', 'Asia/Kolkata');
       const content = 'User: an important new idea about widget scaling\n'.repeat(120);
       const filePath = join(rig.corpusDir, '2026-08-16-widget-idea.txt');
       writeFileSync(filePath, content);
@@ -1010,9 +1011,19 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
         } as any;
       });
 
-      const result = await runPhaseSynthesize(rig.engine, { brainDir: rig.brainDir, dryRun: false });
+      // #4348: the first instant projects to 2037-04-06 in Kolkata. A second
+      // read would cross another day, so this also pins one phase-start sample.
+      let clockCalls = 0;
+      const result = await runPhaseSynthesize(rig.engine, {
+        brainDir: rig.brainDir,
+        dryRun: false,
+        now: () => new Date(clockCalls++ === 0
+          ? '2037-04-05T21:30:00.000Z'
+          : '2037-04-07T21:30:00.000Z'),
+      });
       expect(result.status).toBe('ok');
       expect(oneshotCalls).toBe(1); // ONE round-trip replaced the whole loop
+      expect(clockCalls).toBe(1);
 
       const synthesis = (result.details as { synthesis: Record<string, unknown> }).synthesis;
       expect(synthesis.mode).toBe('oneshot');
@@ -1020,13 +1031,21 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
       expect(synthesis.fallback_jobs).toBe(0);
       expect(synthesis.dead_jobs).toBe(0);
 
-      // Pages landed with the dream-provenance stamp.
+      // Pages landed with the dream-provenance stamp, bucketed by local day.
       const pageA = await rig.engine.getPage(slugA);
       expect(pageA).not.toBeNull();
       expect((pageA!.frontmatter as Record<string, unknown>).dream_generated).toBeTruthy();
+      expect((pageA!.frontmatter as Record<string, unknown>).dream_cycle_date).toBe('2037-04-06');
+      expect((pageA!.frontmatter as Record<string, unknown>).dream_created_cycle_date).toBe('2037-04-06');
       // Reverse-written to the brain checkout.
       const { existsSync } = require('node:fs') as typeof import('node:fs');
-      expect(existsSync(join(rig.brainDir, `${slugA}.md`))).toBe(true);
+      const reversePath = join(rig.brainDir, `${slugA}.md`);
+      expect(existsSync(reversePath)).toBe(true);
+      const reverseMarkdown = readFileSync(reversePath, 'utf8');
+      expect(reverseMarkdown).toMatch(/dream_cycle_date:\s*['"]?2037-04-06/);
+      expect(reverseMarkdown).toMatch(/dream_created_cycle_date:\s*['"]?2037-04-06/);
+      expect(reverseMarkdown).not.toContain('dream_cycle_date: 2026-08-16');
+      expect(await rig.engine.getPage('dream-cycle-summaries/2037-04-06')).not.toBeNull();
       // Deferred embeds: chunks exist and are unembedded (no embed provider here).
       const chunks = await rig.engine.executeRaw<{ n: number }>(
         `SELECT count(*)::int AS n FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
@@ -1062,16 +1081,20 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
       const content = 'User: routine chat that the model mangles\n'.repeat(120);
       const filePath = join(rig.corpusDir, '2026-08-16-mangled.txt');
       writeFileSync(filePath, content);
-      await seedVerdictFor(rig, filePath, content);
+      const hash = await seedVerdictFor(rig, filePath, content);
+      const slug = `wiki/personal/reflections/2026-08-16-fallback-${hash.slice(0, 6)}`;
 
       let calls = 0;
       __setChatTransportForTests(async () => {
         calls++;
-        const text = calls === 1 ? 'sure! here are your pages, enjoy' : 'nothing worth writing';
+        const text = calls === 1 ? 'sure! here are your pages, enjoy' : 'saved';
         return {
-          text,
-          blocks: [{ type: 'text', text }],
-          stopReason: 'end',
+          text: calls === 2 ? '' : text,
+          blocks: calls === 2 ? [{
+            type: 'tool-call', toolCallId: 'fallback-save', toolName: 'brain_put_page',
+            input: { slug, content: '---\ntitle: Fallback synthesis\ntype: reflection\n---\n\nSaved through the fallback loop.' },
+          }] : [{ type: 'text', text }],
+          stopReason: calls === 2 ? 'tool_calls' : 'end',
           usage: { input_tokens: 100, output_tokens: 20, cache_read_tokens: 0, cache_creation_tokens: 0 },
           model: 'anthropic:claude-sonnet-4-6',
           providerId: 'anthropic',
@@ -1091,6 +1114,9 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
       const jr = (typeof jobs[0]!.result === 'string' ? JSON.parse(jobs[0]!.result as string) : jobs[0]!.result) as Record<string, unknown>;
       expect(jr.synth_mode_used).toBe('agentic_fallback');
       expect(jr.fallback_reason).toBe('unparseable');
+      expect(jr.pages_written).toBe(1);
+      expect((await rig.engine.getPage(slug))?.compiled_truth).toContain('Saved through the fallback loop.');
+      expect(readFileSync(join(rig.brainDir, `${slug}.md`), 'utf8')).toContain('Saved through the fallback loop.');
     } finally {
       if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = savedKey;
@@ -1112,14 +1138,20 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
       const content = 'User: agentic-dial conversation\n'.repeat(120);
       const filePath = join(rig.corpusDir, '2026-08-16-agentic-dial.txt');
       writeFileSync(filePath, content);
-      await seedVerdictFor(rig, filePath, content);
+      const hash = await seedVerdictFor(rig, filePath, content);
+      const slug = `wiki/personal/reflections/2026-08-16-agentic-${hash.slice(0, 6)}`;
 
+      let calls = 0;
       __setChatTransportForTests(async () => {
-        const text = 'nothing to write';
+        calls++;
+        const text = 'saved';
         return {
-          text,
-          blocks: [{ type: 'text', text }],
-          stopReason: 'end',
+          text: calls === 1 ? '' : text,
+          blocks: calls === 1 ? [{
+            type: 'tool-call', toolCallId: 'agentic-save', toolName: 'brain_put_page',
+            input: { slug, content: '---\ntitle: Agentic synthesis\ntype: reflection\n---\n\nSaved through the agentic loop.' },
+          }] : [{ type: 'text', text }],
+          stopReason: calls === 1 ? 'tool_calls' : 'end',
           usage: { input_tokens: 100, output_tokens: 10, cache_read_tokens: 0, cache_creation_tokens: 0 },
           model: 'anthropic:claude-sonnet-4-6',
           providerId: 'anthropic',
@@ -1133,6 +1165,8 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
       expect(synthesis.agentic_jobs).toBe(1);
       expect(synthesis.oneshot_jobs).toBe(0);
       expect(synthesis.fallback_jobs).toBe(0);
+      expect((await rig.engine.getPage(slug))?.compiled_truth).toContain('Saved through the agentic loop.');
+      expect(readFileSync(join(rig.brainDir, `${slug}.md`), 'utf8')).toContain('Saved through the agentic loop.');
     } finally {
       if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = savedKey;

@@ -1,3 +1,4 @@
+import { installFixtureChunks } from '../../../helpers/page-projection.ts';
 /**
  * Relational benchmark corpus (v0.43).
  *
@@ -88,6 +89,9 @@ function basisEmbedding(slug: string, dim: number): Float32Array {
   e[h % dim] = 1.0;
   return e;
 }
+/** The seeder's per-slug basis vector, exported so hermetic tests can aim a
+ *  query vector at chosen pages (e.g. every company) with no embed provider. */
+export const relationalBasisEmbedding = basisEmbedding;
 
 /**
  * Probe the actual `content_chunks.embedding` column width. pgvector stores
@@ -115,7 +119,7 @@ export async function seedRelationalCorpus(engine: BrainEngine): Promise<void> {
       compiled_truth: body,
       timeline: '',
     });
-    await engine.upsertChunks(slug, [{
+    await installFixtureChunks(engine, slug, [{
       chunk_index: 0,
       chunk_text: body,
       chunk_source: 'compiled_truth',

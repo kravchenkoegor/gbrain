@@ -1,7 +1,7 @@
 # MEMORY_VERBS v1 — the memory wire protocol
 
 GBrain's frozen memory-verb interface over MCP: `recall`, `remember`,
-`entity`, `synthesize`, `forget`, plus (v0.45.7, additive) `context_pack` and
+`entity`, `synthesize`, `forget`, plus the additive `context_pack` and
 `delta` — seven verbs, all at `protocol_version: 1`. The contract every harness can rely on the
 way every Postgres client relies on the wire protocol — and the contract any
 OTHER memory server can implement and certify against
@@ -39,9 +39,9 @@ the same registry.
 - Enum values are part of the contract. Where an enum's DERIVATION is
   implementation-defined (noted per field), implementations may improve the
   derivation without a version bump; the values and their meanings stay fixed.
-- **Adding a VERB is additive, not a version bump.** v0.45.7 grew the frozen set
-  from 5 to 7 (`context_pack`, `delta`) at `protocol_version: 1`. New verbs are
-  new optional surface a v1 client discovers via tool-listing; the existing five
+- **Adding a VERB is additive, not a version bump.** `context_pack` and `delta`
+  sit alongside the original five at `protocol_version: 1`. New verbs are
+  new optional surface a v1 client discovers via tool-listing; the existing verbs
   keep stamping `1`. Bumping `protocol_version` would rewrite the frozen five's
   wire output and break every client that pins `== 1` — so we don't.
 
@@ -114,7 +114,10 @@ Retrieve saved facts and (with `query`) budget-packed page snippets.
   pages; both present ⇒ both arms run.
 - `since`: ISO 8601 date/datetime — filters the FACTS arm only in v1. (The
   reference implementation also accepts relative phrases like `"8 hours ago"`
-  as a convenience; only ISO 8601 is part of the frozen contract.)
+  as a convenience; only ISO 8601 is part of the frozen contract.) The window
+  is measured on event time (`valid_from`, falling back to `created_at`) and
+  composes with `entity` and `session_id` in the same query, before the
+  per-arm limit. An unparseable value is rejected with `invalid_params`.
 - `limit` is a PER-ARM cap (facts and search results each).
 - `budget_tokens`: SERVER-side packing — facts pack first (limit-capped
   one-liners, so search-arm starvation is bounded), search results take the
@@ -123,13 +126,13 @@ Retrieve saved facts and (with `query`) budget-packed page snippets.
 - No embedding provider configured? The search arm degrades to keyword-only
   and the response notes `search_degraded` — never an error.
 
-Response — an additive SUPERSET of the pre-v1 facts envelope on EVERY call
-(all legacy fields unchanged; JSON consumers ignore additions):
+Response — an additive SUPERSET of the plain facts envelope on EVERY call
+(the base fact fields are unchanged; JSON consumers ignore additions):
 
 | field | type | semantics |
 |---|---|---|
 | `protocol_version` | int | always present (every verb, every call) |
-| `facts[]` | array | legacy fact fields unchanged, PLUS per fact: `fact_id` (opaque STRING — the value `forget` accepts; the legacy numeric `id` stays for pre-v1 consumers) and `provenance` (the stored source attribution) |
+| `facts[]` | array | the base fact fields, PLUS per fact: `fact_id` (opaque STRING — the value `forget` accepts; the numeric `id` remains alongside it for compatibility) and `provenance` (the stored source attribution) |
 | `total` | int | count of facts returned |
 | `results[]` | array | search arm only: `slug`, `title`, `chunk`, `evidence`, `create_safety`, `provenance` (origin page slug) |
 | `search_degraded` | string? | present when keyword-only fallback fired |
@@ -142,7 +145,7 @@ matched. **create_safety** (enum): `exists` (a page for this already exists)
 signal). The derivation of both is implementation-defined and may improve;
 the values are frozen.
 
-### remember(fact, provenance, ttl?, entity?, kind?, visibility?) — write
+### remember(fact, provenance, ttl?, entity?, kind?, visibility?, request_id?) — write
 
 Save ONE fact with mandatory attribution.
 
@@ -195,7 +198,7 @@ backlink_count, active_fact_count }`.
 - `open_threads` (best-effort in v1): active commitment-kind facts + timeline
   entries from the last 90 days, capped at 3.
 
-#### entity open_threads loop backing (v0.47, additive)
+#### entity open_threads loop backing (additive)
 
 On brains running the open-loop engine, `open_threads` entries may
 additionally be DERIVED from `open_loops` rows (they rank ahead of raw
@@ -213,8 +216,8 @@ pending-decision loops — the ADDITIVE-FOREVER optional fields disambiguate:
 - `status` — loop status (always `open` on cards).
 - `loop_id` — the open_loops row id (`loops_close` takes it).
 
-All five are absent on threads not backed by a loop row and on pre-v0.47
-servers; a server that omits them still certifies. Same propagation to the
+All five are absent on threads not backed by a loop row and on servers that
+do not implement them; a server that omits them still certifies. Same propagation to the
 per-entity cards and top-level `open_threads` of `context_pack`.
 - `edges`: top ~10 typed edges, mentions excluded, out-edges first.
 - The p99 < 100ms promise is op-layer latency (transport excluded), CI-gated
@@ -236,10 +239,10 @@ output_tokens, usd_estimate}, protocol_version }`.
 - No LLM configured ⇒ the protocol error `unavailable` with a fix — never a
   fake answer.
 
-#### synthesize compose status (v0.45.x, additive)
+#### synthesize compose status (additive)
 
-Every response additionally carries four ADDITIVE-FOREVER fields (absent on
-pre-v0.45.x servers; a server that omits them still certifies):
+Every response additionally carries four ADDITIVE-FOREVER fields (optional;
+a server that omits them still certifies):
 
 - `synthesis_status` — how `answer` was produced: `ok` (LLM synthesis) or
   `extractive_fallback` (the LLM compose step failed but retrieval succeeded —
@@ -268,7 +271,7 @@ purpose, no dedicated status); a `max_tokens`-cut envelope parses as
 `output_truncated` (warning `LLM_OUTPUT_TRUNCATED`) so a too-small output
 budget is distinguishable from malformed model output.
 
-### forget(id, reason?) — write
+### forget(id, reason?, request_id?) — write
 
 Expire a fact by its opaque string id (from `remember` or
 `recall.facts[].fact_id` — never a page slug). Idempotent: re-forgetting an
@@ -277,17 +280,57 @@ already-expired fact returns `expired: false` (success); unknown id ⇒
 
 Response: `{ id, expired, reason, protocol_version }`.
 
+#### Durable write receipts (additive)
+
+Write receipts distinguish accepted work from committed memory. Their public
+shape is `{request_id, state, retry_after_ms, revision?, outcome?, persistence?,
+compacted?, created_at?, updated_at?}`. States are `queued`, `running`,
+`recovering`, `committed`, `conflict`, `failed`, and `cancelled`. Terminal
+receipts have `retry_after_ms: null`. `persistence.mode` distinguishes a
+filesystem-backed write from an intentional database-only write; Git progress
+does not change the meaning of committed memory.
+
+A pending write is a protocol `unavailable` error with a populated suggestion,
+`protocol_version: 1`, and optional `write_request` and `write_error` fields.
+It never returns a success `status` or `expired` value. `write_error` carries
+the detailed concurrency reason without changing the frozen protocol error
+enum. A committed receipt retains the original memory-verb success fields.
+Compaction may remove diagnostics, but must preserve those frozen result fields.
+
+The optional caller-generated UUID `request_id` identifies one write intent.
+Retry the same verb with the original arguments and the same ID to recover
+its outcome, including on the verbs-only surface. A terminal request is never
+executed again. Corrected input requires a new ID. Clients that lose a response
+without retaining its request ID cannot assume that retrying content is an
+exactly-once write. A receipt never contains queued content, recovery paths or
+execution credentials.
+
+The starter/full helpers `get_write_request`, `list_write_requests`, and
+`cancel_write_request` require write scope and explicit current operation
+permission. Existing operation snapshots are not widened by an upgrade.
+Helpers expose only the caller's currently authorized receipts; a foreign,
+missing, or no-longer-accessible UUID has the same `not_found` response. Their
+absence from a verb-only or agent-only grant does not prevent same-verb replay.
+See [concurrent writes](../guides/concurrent-writes.md) for exact read guarantees,
+bounded retention, ownership transfer, and the explicit regrant procedure.
+
+For `forget`, a committed source- and visibility-scoped withdrawal is the
+durable memory outcome. Its filesystem mirror may remain pending; stale
+source imports must still respect the withdrawal.
+
 ### context_pack(entities, budget_tokens?, since?, session_id?, include_private?) — read, zero LLM
 
-v0.45.7 (issue #1). One deterministic, budget-packed bundle for a set of standing
+One deterministic, budget-packed bundle for a set of standing
 entities — entity cards + open threads + hot facts. Built for **session
 boundaries**: call it at session start to warm cold context, and immediately
 after compaction to rehydrate what the summary dropped. Composes existing arms
 (`entity` card builder + the hot-facts arm); never calls an LLM.
 
 `entities` is comma-separated, capped at 8 (the response echoes the capped list). `budget_tokens` packs
-server-side (cards first, then facts) and the response reports
-`budget_used` + `dropped_count` — it never trims client-side. `since` filters
+server-side (cards first, then facts; each item costs its rendered line and the
+envelope + section headers are reserved first, so `text` fits the budget) and the
+response reports `budget_used` (the token estimate of `text`) + `dropped_count`
+— it never trims client-side. `since` filters
 open-thread events to those after the cursor. **Visibility is WORLD-ONLY by
 default** on every arm (a pack is injected into an agent context window that may
 be logged or synced to a cloud model). `include_private` widens ALL arms in
@@ -296,11 +339,12 @@ remote caller never widens (fail-closed).
 
 Response: `{ protocol_version, entities, cards[], open_threads[], facts[], text,
 degraded_reason?, budget_tokens?, budget_used?, dropped_count? }`. `text` is the
-pre-rendered, envelope-wrapped injectable block.
+pre-rendered, envelope-wrapped injectable block; with `budget_tokens` it is
+rendered from the packed sets and never exceeds the declared budget.
 
 ### delta(since?, entities?, budget_tokens?, session_id?, include_private?) — read, zero LLM
 
-v0.45.7 (issue #1). "What changed since T" for heartbeats — pages updated after
+"What changed since T" for heartbeats — pages updated after
 the cursor (oldest first) + facts recorded after the cursor + open-thread
 events after the cursor. Lets a periodic wake maintain warm state in
 O(changes) instead of re-deriving. Provide `since` (ISO 8601) OR a
@@ -324,9 +368,17 @@ of livelocking. Stateless callers resume by passing the response's
 
 Response: `{ protocol_version, since, pages[], facts[], threads[], text,
 has_more, next_cursor: { since, slug }, degraded_reason?, budget_tokens?,
-budget_used?, dropped_count? }`. `text` is rendered from the budget-packed sets
-(it honors the declared budget) and `since` is always normalized ISO (never the
-raw input string).
+budget_used?, dropped_count? }`. `budget_tokens` applies to pages and facts
+(pages pack first, then facts) — each item costs its rendered line and the
+envelope + section headers are reserved first, so `text` (rendered from the
+packed sets) fits the declared budget. **Threads are never truncated**: every
+open-thread event after `since` is delivered and its line is reserved ahead of
+pages and facts, so `dropped_count` / `has_more` count only pages and facts.
+If the envelope + headers + threads alone exceed `budget_tokens`, all threads
+are still returned and `budget_used` (the token estimate of `text`) reports the
+real rendered size, which then exceeds the budget. Cursor semantics are the v1
+page keyset alone — facts and threads never move `next_cursor`. `since` is
+always normalized ISO (never the raw input string).
 
 ## Latency classes (per verb)
 

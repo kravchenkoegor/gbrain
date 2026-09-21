@@ -44,10 +44,15 @@ export const EMBEDDING_PRICING: Record<string, EmbeddingPricing> = {
   'voyage:voyage-finance-2':       { pricePerMTok: 0.12 },
   'voyage:voyage-law-2':           { pricePerMTok: 0.12 },
   'voyage:voyage-multimodal-3':    { pricePerMTok: 0.12 },
-  // Voyage rerankers (same pricing page, verified 2026-08-21). Same
-  // budget-tracker rerank-kind fallback rationale as the zerank-2 row below.
+  // Voyage rerankers (same pricing page; 2.5 pair verified 2026-08-21, the
+  // rerank-3 preview pair 2026-09-06). Same budget-tracker rerank-kind
+  // fallback rationale as the zerank-2 row below. Rows carry the list rate:
+  // Voyage's free-token grants are per-account and not modeled here, so
+  // over-reporting inside a grant beats under-reporting past it.
   'voyage:rerank-2.5':             { pricePerMTok: 0.05 },
   'voyage:rerank-2.5-lite':        { pricePerMTok: 0.02 },
+  'voyage:rerank-3':               { pricePerMTok: 0.05 },
+  'voyage:rerank-3-lite':          { pricePerMTok: 0.02 },
   // voyage-4-nano is deliberately absent: it's the open-weight variant (see
   // src/core/ai/recipes/voyage.ts) and Voyage's pricing page lists no hosted
   // rate for it. A 0 entry would under-estimate anyone paying for it via the
@@ -74,6 +79,18 @@ export const EMBEDDING_PRICING: Record<string, EmbeddingPricing> = {
   // Perplexity (https://docs.perplexity.ai/getting-started/pricing, verified 2026-07-28)
   'perplexity:pplx-embed-v1-0.6b': { pricePerMTok: 0.004 },
   'perplexity:pplx-embed-v1-4b':   { pricePerMTok: 0.03 },
+  // Google (https://ai.google.dev/gemini-api/docs/pricing, verified 2026-09-07).
+  // #4344 class: both models are in the hosted recipe list
+  // (src/core/ai/recipes/google.ts) but had no rows, so cost estimates read
+  // "unavailable" for every brain on them — including the OpenRouter-routed
+  // ones, since `openrouter:google/gemini-embedding-001` resolves here through
+  // the #2504 nested-vendor retry. The two rates differ, so one shared row
+  // would misprice whichever model it didn't come from.
+  'google:gemini-embedding-001':   { pricePerMTok: 0.15 },
+  // gemini-embedding-2 is multimodal and priced per input kind ($0.45/1M image,
+  // $6.50 audio, $12.00 video). Same convention as voyage-multimodal-3 above:
+  // the TEXT rate is the row, pixel/audio token pricing is out of scope here.
+  'google:gemini-embedding-2':     { pricePerMTok: 0.20 },
 };
 
 export type PriceLookupResult =
