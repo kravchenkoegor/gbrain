@@ -1,6 +1,6 @@
 /**
  * v0.48.2 — doctor `reranker_health` resolves enablement + model through the
- * mode plane and reports readiness (key present / sunset / skip rows).
+ * mode plane and reports readiness (key present / skip rows).
  *
  * Stub engine: `getConfig` from a Map (loadSearchModeConfig reads per key);
  * env via withEnv (the check folds `loadConfig()` + process.env). Audit rows
@@ -12,7 +12,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { checkRerankerHealth } from '../src/commands/doctor.ts';
 import { logRerankFailure } from '../src/core/rerank-audit.ts';
-import { DEFAULT_RERANKER_MODEL, LEGACY_DEFAULT_RERANKER_MODEL, NEW_INSTALL_DEFAULT_RERANKER_MODEL, ZEROENTROPY_SUNSET_DATE } from '../src/core/ai/defaults.ts';
+import { DEFAULT_RERANKER_MODEL } from '../src/core/ai/defaults.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import { withEnv, emptyHome } from './helpers/with-env.ts';
 
@@ -159,33 +159,9 @@ describe('reranker_health (v0.48.2 readiness-aware)', () => {
       expect(c.status).toBe('warn');
       expect(c.message).toContain('auth failure');
       expect(c.message).toContain('key present but rejected');
-    });
-  });
-
-  test('explicit ZE reranker on/after the sunset → warn with the switch command (injected clock)', async () => {
-    const AFTER = new Date(Date.parse(`${ZEROENTROPY_SUNSET_DATE}T00:00:00Z`) + 86_400_000);
-    const BEFORE = new Date(Date.parse(`${ZEROENTROPY_SUNSET_DATE}T00:00:00Z`) - 1000);
-    await inFreshAudit({ ZEROENTROPY_API_KEY: 'zk', VOYAGE_API_KEY: undefined, GBRAIN_HOME: emptyHome() }, async () => {
-      gw({ ZEROENTROPY_API_KEY: 'zk' });
-      const engine = engineWith({ 'search.reranker.model': LEGACY_DEFAULT_RERANKER_MODEL });
-      const after = await checkRerankerHealth(engine, AFTER);
-      expect(after.status).toBe('warn');
-      expect(after.message).toContain('provider sunset');
-      expect(after.message).toContain(`gbrain config set search.reranker.model ${NEW_INSTALL_DEFAULT_RERANKER_MODEL}`);
-      const before = await checkRerankerHealth(engine, BEFORE);
-      expect(before.status).toBe('ok');
-      expect(before.message).toContain('ready');
-    });
-  });
-
-  test('a provider_base_urls self-host override keeps an explicit ZE reranker ready past the sunset', async () => {
-    const AFTER = new Date(Date.parse(`${ZEROENTROPY_SUNSET_DATE}T00:00:00Z`) + 86_400_000);
-    await inFreshAudit({ ZEROENTROPY_API_KEY: 'zk', VOYAGE_API_KEY: undefined, GBRAIN_HOME: emptyHome() }, async () => {
-      // The gateway carries the base-URL override the CLI folded from config.
-      gw({ ZEROENTROPY_API_KEY: 'zk' }, { base_urls: { zeroentropyai: 'http://127.0.0.1:8080/v1' } });
-      const c = await checkRerankerHealth(engineWith({ 'search.reranker.model': LEGACY_DEFAULT_RERANKER_MODEL }), AFTER);
-      expect(c.status).toBe('ok');
-      expect(c.message).toContain('ready');
+      // #5432: audit-log history, not a live verdict.
+      expect(c.message).toContain('no live probe was run');
+      expect(c.details?.live_probe_performed).toBe(false);
     });
   });
 
@@ -211,8 +187,8 @@ describe('reranker_health (v0.48.2 readiness-aware)', () => {
   test('audit rows for a RETIRED model do not warn on the live default (rows are filtered to the resolved model)', async () => {
     await inFreshAudit({ VOYAGE_API_KEY: 'pa-test' }, async () => {
       gw({ VOYAGE_API_KEY: 'pa-test' });
-      logRerankFailure({ model: LEGACY_DEFAULT_RERANKER_MODEL, reason: 'auth', query_hash: 'old00001', doc_count: 25, error_summary: 'rerank HTTP 401' });
-      logRerankFailure({ model: LEGACY_DEFAULT_RERANKER_MODEL, reason: 'no_key', query_hash: 'old00002', doc_count: 25, error_summary: 'ZEROENTROPY_API_KEY not set' });
+      logRerankFailure({ model: 'fixture-provider:reranker-v1', reason: 'auth', query_hash: 'old00001', doc_count: 25, error_summary: 'rerank HTTP 401' });
+      logRerankFailure({ model: 'fixture-provider:reranker-v1', reason: 'no_key', query_hash: 'old00002', doc_count: 25, error_summary: 'FIXTURE_API_KEY not set' });
       const c = await checkRerankerHealth(engineWith({}));
       expect(c.status).toBe('ok');
       expect(c.message).toContain('No rerank failures in last 7 days');
@@ -226,6 +202,19 @@ describe('reranker_health (v0.48.2 readiness-aware)', () => {
       const c = await checkRerankerHealth(engineWith({ 'search.reranker.enabled': 'false' }));
       expect(c.status).toBe('ok');
       expect(c.message).toContain('Reranker disabled');
+    });
+  });
+  test('Cat 40 R0: repeated unreachable rows (a stale reranker base URL) → warn naming the base-URL key, not a provider outage', async () => {
+    await inFreshAudit({ VOYAGE_API_KEY: 'pa-test' }, async () => {
+      for (let i = 0; i < 3; i++) {
+        logRerankFailure({ model: DEFAULT_RERANKER_MODEL, reason: 'unreachable', query_hash: `0000000${i}`, doc_count: 30, error_summary: 'rerank: Unable to connect' });
+      }
+      gw({ VOYAGE_API_KEY: 'pa-test' });
+      const c = await checkRerankerHealth(engineWith({}));
+      expect(c.status).toBe('warn');
+      expect(c.message).toContain('could not reach');
+      expect(c.message).toContain(`provider_base_urls.${DEFAULT_RERANKER_MODEL.split(':')[0]}`);
+      expect(c.message).not.toContain('status page');
     });
   });
 });

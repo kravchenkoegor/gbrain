@@ -1,10 +1,18 @@
+import { writeJsonDocument } from '../core/cli-force-exit.ts';
+import { importFenceTally, type FencesNormalized } from '../core/fence-repair/report.ts';
+import { opError } from '../core/ops/contract.ts';
 import { hasSourceFilesystemLock, withSourceFilesystemLock, currentSourceFilesystemSignal } from '../core/minions/source-filesystem.ts';
 import { readdirSync, lstatSync, existsSync, mkdirSync } from 'fs';
+import { recordFunnelEvent } from '../core/funnel.ts';
 import { execFileSync } from 'child_process';
-import { isAbsolute, join, relative, resolve, sep } from 'path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { cpus, totalmem } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
-import { importFile, importImageFile, isImageFilePath } from '../core/import-file.ts';
+import { OperationError } from '../core/ops/contract.ts';
+import { importFile, importImageFile, isImageFilePath, type ImportResult } from '../core/import-file.ts';
+import { gitFirstCommitDates } from '../core/git-first-commit.ts';
+import { gitLsFiles } from '../core/git-visible-files.ts';
+import { currentCompanyBrainSync, getCompanyBrainProfile, importCompanyBrainFile } from '../core/company-brain/profile.ts';
 import { loadConfig, gbrainPath } from '../core/config.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
@@ -17,7 +25,7 @@ import {
   matchesAnyGlob,
   pruneDir,
   isPathPruned,
-  SYNC_SKIP_FILES,
+  isSyncMetafile,
   type SyncStrategy,
 } from '../core/sync.ts';
 import { sortNewestFirst } from '../core/sort-newest-first.ts';
@@ -30,6 +38,14 @@ import {
 } from '../core/import-checkpoint.ts';
 import { realpathOrResolve } from '../core/path-confine.ts';
 import { slog } from '../core/console-prefix.ts';
+import { refreshProjectionStatistics } from '../core/search/projection-statistics.ts';
+import { importAnalyzeEveryPages, maybeRefreshPlannerStats, PLANNER_STATS_REPAIR_COMMAND } from '../core/planner-stats.ts';
+import { importManagedFile, nextImportBatch, settleManagedImportBatch } from '../core/persistence/import-mutations.ts';
+import { acceptedPendingReceipt } from '../core/persistence/accepted-pending.ts';
+import { estimateCostFromChars, lookupEmbeddingPrice } from '../core/embedding-pricing.ts';
+import { getEmbeddingModel } from '../core/ai/gateway.ts';
+import { managedRootMarkerFor } from '../core/persistence/root-registry.ts';
+import { readManagedMode } from '../core/persistence/ownership.ts';
 
 /** Return a refusal when an import target lies outside every admitted root. */
 export function configuredRootImportError(dir: string, configuredRoots: string[]): string | null {
@@ -129,12 +145,41 @@ export class ImportAbortError extends Error {
   readonly partialResult?: RunImportResult;
   /** True: the user-facing message was already printed at the throw site. */
   readonly alreadyReported = true;
-  constructor(reason: string, exitCode = 1, partialResult?: RunImportResult) {
-    super(`import aborted: ${reason}`);
+  /** `cause` keeps the underlying error (and its stack) for in-process callers. */
+  constructor(reason: string, exitCode = 1, partialResult?: RunImportResult, cause?: unknown) {
+    super(`import aborted: ${reason}`, cause === undefined ? undefined : { cause });
     this.name = 'ImportAbortError';
     this.exitCode = exitCode;
     this.partialResult = partialResult;
   }
+}
+
+// The CLI dispatch (src/cli/commands/import.ts) exits on any ImportAbortError
+// without printing, so each refusal below prints its reason and the next
+// command to stderr before the caller throws the returned abort.
+
+/** A managed import of a symlinked input root: name the path, its target and the command that works. */
+function symlinkedRootAbort(dirArg: string, dir: string): ImportAbortError {
+  console.error(`Managed import refuses a symlinked input root: ${dirArg} resolves to ${dir}.`);
+  console.error(`Fix: gbrain import ${dir}`);
+  return new ImportAbortError('managed import refuses a symlinked input root');
+}
+
+/** A refused source filesystem lock admission: print its code, message and fix, and keep it as the cause. */
+function lockAdmissionAbort(dirArg: string, dir: string, error: unknown): ImportAbortError {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`Cannot import ${dirArg}: source filesystem lock admission failed.`);
+  if (error instanceof OperationError) {
+    console.error(`Error [${error.code}]: ${message}`);
+    if (error.suggestion) console.error(`Fix: ${error.suggestion}`);
+    const marker = error.code === 'writer_coordinator_required' ? managedRootMarkerFor(dir)?.marker : undefined;
+    if (marker) console.error(`Marker: ${marker}`);
+  } else {
+    console.error(`Error: ${message}`);
+    console.error('Fix: gbrain doctor --json');
+  }
+  const reason = error instanceof OperationError ? `${error.code}: ${message}` : message;
+  return new ImportAbortError(`source filesystem lock admission failed (${reason})`, 1, undefined, error);
 }
 
 /**
@@ -154,6 +199,14 @@ export function shouldLogIngest(
   return counts.imported > 0 || counts.errors > 0 || counts.chunksCreated > 0;
 }
 
+/** Embedding cost of the chunks a safe-chunk re-seal left without vectors; null when the model has no known price. */
+function resealEmbeddingUsd(chars: number): number | null {
+  try {
+    const price = lookupEmbeddingPrice(getEmbeddingModel());
+    return price.kind === 'known' ? estimateCostFromChars(chars, price.pricePerMTok) : null;
+  } catch { return null; }
+}
+
 /** Bug 9 — surface per-file failures so callers (performFullSync) can gate state advances. */
 export interface RunImportResult {
   imported: number;
@@ -165,6 +218,32 @@ export interface RunImportResult {
   malformedSkipped?: number;
   /** Aggregated alias/undeclared explicit-type warnings (schema.type_warnings). */
   type_warnings?: Array<{ kind: 'alias_of' | 'undeclared'; type: string; canonical?: string; directory?: string; count: number }>;
+  /** #5050: unchanged pages re-sealed at the safe-chunk fence, and the embedding work that left. */
+  resealed?: { pages: number; pending_chunks: number; embedding_usd: number | null }; fences_normalized?: FencesNormalized; fence_issues?: unknown;
+}
+
+/**
+ * D2 + A1: under `--json` a keyless brain's import refusal is the one document.
+ * The step the agent can take now is the same import with --no-embed (pages
+ * stay keyword-searchable; vectors come later), routed explicitly to the brain
+ * and source this run resolved; turning embeddings on asks the user.
+ */
+async function keylessImportRefusal(engine: BrainEngine, args: string[], e: unknown) {
+  const { brainRoutingArgs } = await import('../core/brain-resolver.ts');
+  const { resolveSourceWithTier } = await import('../core/source-resolver.ts');
+  const named = args.some(a => a === '--source' || a === '--source-id' || a.startsWith('--source=') || a.startsWith('--source-id='));
+  const target = named ? undefined : await resolveSourceWithTier(engine, null).then(r => r.source_id, () => undefined);
+  return opError('embedding_disabled', String(e instanceof Error ? e.message.split('\n')[0] : e),
+    'Embeddings are off by choice on this brain, so import needs --no-embed; turning embeddings on needs the user\'s consent (gbrain doctor --only embeddings --json shows the command).', {
+      reason: 'disabled_by_choice',
+      why: 'This brain was set up keyword-only. Importing with --no-embed keeps every page keyword-searchable; `gbrain embed --stale` adds vectors once embeddings are enabled.',
+      fix: {
+        argv: ['gbrain', 'import', ...args.filter(a => a !== '--json' && a !== '--no-embed'), '--no-embed', '--json',
+          ...(target ? ['--source', target] : []), ...brainRoutingArgs()],
+        consent: [], actor: 'agent', requires_exclusive: true,
+        why: 'Imports the same files without computing vectors, which needs no provider key.',
+      },
+    });
 }
 
 export async function runImport(
@@ -176,6 +255,10 @@ export async function runImport(
     strategy?: SyncStrategy;
     sourceId?: string;
     managedBookmark?: boolean;
+    /** #5988: paths the caller already held this run; they are skipped without importing (not failures). */
+    heldPaths?: ReadonlySet<string>;
+    /** #5988: each file's outcome (a throw arrives as `{ status: 'error', error }`); `'held'` = the caller held it, not a failure. */
+    onFileResult?: (path: string, filePath: string, result: Pick<ImportResult, 'status' | 'error' | 'refusal' | 'frontmatter_recovery' | 'fences_normalized' | 'fence_issues'>) => Promise<'held' | undefined>;
     /**
      * #753/#774: glob patterns to exclude from the import (same semantics as
      * `isSyncable`'s `exclude` — matched against the dir-relative path).
@@ -241,8 +324,8 @@ export async function runImport(
     try {
       assertEmbeddingEnabled(loadConfig());
     } catch (e) {
-      console.error(`\n${e instanceof Error ? e.message : e}`);
-      console.error('Tip: run `gbrain import <dir> --no-embed` to import without embedding now.');
+      if (jsonOutput) throw await keylessImportRefusal(engine, args, e);
+      console.error(`\n${e instanceof Error ? e.message : e}\nTip: run \`gbrain import <dir> --no-embed\` to import without embedding now.`);
       throw new ImportAbortError('embedding disabled (deferred-setup sentinel)');
     }
 
@@ -255,7 +338,7 @@ export async function runImport(
     } catch (e) {
       if (e instanceof EmbeddingCredentialError) {
         if (jsonOutput) {
-          console.log(JSON.stringify({ status: 'embedding_credentials_missing', diagnosis: e.diagnosis }));
+          await writeJsonDocument(JSON.stringify({ status: 'embedding_credentials_missing', diagnosis: e.diagnosis }));
         } else {
           console.error('');
           console.error(e.userMessage);
@@ -266,22 +349,6 @@ export async function runImport(
       throw e;
     }
   }
-  // v0.39 T1.5: load active pack ONCE at runImport entry; thread to every
-  // per-file importFile call below. Codex perf finding #7 — never per-file.
-  let importActivePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> } | undefined;
-  try {
-    const { loadActivePack } = await import('../core/schema-pack/load-active.ts');
-    const { loadConfig } = await import('../core/config.ts');
-    const resolved = await loadActivePack({
-      cfg: loadConfig(),
-      remote: false, // CLI import is trusted
-      sourceId: opts.sourceId,
-    });
-    importActivePack = { page_types: resolved.manifest.page_types };
-  } catch {
-    importActivePack = undefined;
-  }
-
   // v0.30.x follow-up to PR #707: programmatic sourceId support so internal
   // callers (performFullSync, future Step 6 paths) can route to a named
   // source.
@@ -382,6 +449,19 @@ export async function runImport(
       }
     }
   }
+  if (!currentCompanyBrainSync(sourceId) && await getCompanyBrainProfile(engine, sourceId ?? 'default')) {
+    console.error('This source accepts only its approved committed company-brain manifest. Use sources resume or sync; ordinary import cannot write back to this read-only repository.');
+    throw new ImportAbortError('company-brain sources require approved committed ingestion');
+  }
+  let importActivePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> } | undefined;
+  try {
+    const { loadActivePackForEngine } = await import('../core/schema-pack/engine-resolution.ts');
+    const resolved = await loadActivePackForEngine(engine, { remote: false, sourceId });
+    importActivePack = { page_types: resolved.manifest.page_types };
+  } catch {
+    importActivePack = undefined;
+  }
+
   const workersIdx = args.indexOf('--workers');
   const workersArg = workersIdx !== -1 ? args[workersIdx + 1] : null;
   // v0.22.13 (PR #490 Q2): shared parseWorkers helper rejects bad input
@@ -424,7 +504,12 @@ export async function runImport(
     throw new ImportAbortError(`import target not readable: ${dirArg}`);
   }
 
-  if (!hasSourceFilesystemLock(dir)) {
+  const managedImport = await readManagedMode(engine);
+  if (managedImport && dir !== resolve(dirArg)) throw symlinkedRootAbort(dirArg, dir);
+  const singleFile = managedImport && lstatSync(dir).isFile();
+  const importRoot = singleFile ? dirname(dir) : dir;
+
+  if (!managedImport && !hasSourceFilesystemLock(dir)) {
     let entered = false;
     try {
       return await withSourceFilesystemLock(engine, dir, () => {
@@ -435,7 +520,7 @@ export async function runImport(
       // Root discovery is part of admission. Preserve the CLI/library's typed
       // preflight error contract without changing errors from an import in flight.
       if (entered || signal?.aborted) throw error;
-      throw new ImportAbortError('source filesystem lock admission failed');
+      throw lockAdmissionAbort(dirArg, dir, error);
     }
   }
 
@@ -476,7 +561,9 @@ export async function runImport(
   const _walkT0 = Date.now();
   console.error(`[gbrain phase] import.collect_files start dir=${dir} strategy=${strategy}`);
   const malformedExcluded: string[] = [];
-  let allFiles = collectSyncableFiles(dir, {
+  const company = currentCompanyBrainSync(sourceId);
+  let allFiles = company ? company.plan.manifest.filter(entry => entry.disposition === 'included').map(entry => join(dir, entry.path))
+    : singleFile ? [dir] : collectSyncableFiles(dir, {
     strategy, includeGitignored,
     includeHidden: opts.includeHidden,
     onExcluded: (rel) => { malformedExcluded.push(rel); },
@@ -495,7 +582,7 @@ export async function runImport(
   const fileTypeLabel = strategy === 'code' ? 'code'
     : strategy === 'auto' ? 'syncable' : 'markdown';
   // #753/#774: apply --exclude glob patterns (threaded by performFullSync).
-  if (opts.exclude && opts.exclude.length > 0) {
+  if (!company && opts.exclude && opts.exclude.length > 0) {
     const beforeExclude = allFiles.length;
     allFiles = allFiles.filter(abs => !matchesAnyGlob(relative(dir, abs), opts.exclude));
     info(
@@ -517,19 +604,19 @@ export async function runImport(
   // See src/core/sort-newest-first.ts for the policy.
   sortNewestFirst(allFiles);
 
-  // Resume from checkpoint if available. v0.33.2: path-based resume —
-  // see src/core/import-checkpoint.ts for the bug-class this fixes
-  // (parallel-import silent-skip and failed-file no-retry).
   const checkpointPath = gbrainPath('import-checkpoint.json');
   const completed = new Set<string>();
-  if (!fresh) {
+  if (company) {
+    await company.protect([{ op: 'company-brain-content', fingerprint: company.receiptId, kind: 'content' }]);
+    const [row] = await engine.executeRaw<{ completed_keys: string[] }>("SELECT completed_keys FROM op_checkpoints WHERE op='company-brain-content' AND fingerprint=$1", [company.receiptId]);
+    for (const path of row?.completed_keys ?? []) completed.add(path);
+  } else if (!fresh && !managedImport) {
     const cp = loadCheckpoint(checkpointPath, dir);
     if (cp) {
-      for (const p of cp.completedPaths) completed.add(p);
-      info(`Resuming from checkpoint: skipping ${completed.size} already-processed files`);
+      info(`Resuming from checkpoint: re-checking current files via content_hash (${cp.completedPaths.length} previously completed)`);
     }
   }
-  const files = resumeFilter(allFiles, dir, completed);
+  const files = company ? resumeFilter(allFiles, dir, completed) : allFiles;
 
   // Determine actual worker count. Import owns the same per-worker Postgres
   // pools as sync, so it must honor the shared opt-in connection budget too
@@ -578,13 +665,14 @@ export async function runImport(
   let lastCheckpointMs = Date.now();
   let lastCheckpointSize = completed.size;
   let chunksCreated = 0;
+  const resealed = { pages: 0, pendingChunks: 0, pendingChars: 0 };
   const importedSlugs: string[] = [];
   const errorCounts: Record<string, number> = {};
   const errorSamples: Record<string, string> = {};
   const failures: Array<{ path: string; error: string }> = []; // Bug 9
   // Alias-footgun visibility: aggregate per-file type_warning results once
   // per distinct type per run (same surface `gbrain sync` carries).
-  const typeWarningCounts = new Map<string, import('../core/schema-pack/type-usage.ts').TypeWarningCount>();
+  const typeWarningCounts = new Map<string, import('../core/schema-pack/type-usage.ts').TypeWarningCount>(), fenceTally = importFenceTally(sourceId ?? 'default');
   const noteTypeWarning = (w: { kind: 'alias_of' | 'undeclared'; type: string; canonical?: string; directory?: string } | undefined): void => {
     if (!w) return;
     const key = `${w.kind}\t${w.type}`;
@@ -607,14 +695,23 @@ export async function runImport(
     progress.tick(1, `imported=${imported} skipped=${skipped} errors=${errors}`);
   }
 
-  async function processFile(eng: BrainEngine, filePath: string) {
-    if (signal?.aborted) return;
-    const relativePath = relative(dir, filePath);
+  // A12 (opt-in): git first-commit dates anchor undated new pages instead of clone-time mtimes.
+  const firstCommits = !singleFile && await engine.getConfig('sync.git_first_commit_dates').catch(() => null) === 'true'
+    ? gitFirstCommitDates(dir) : null;
+
+  // F4b: PGLite has no autovacuum; refresh stale planner statistics every N files so the import
+  // never plans against the empty tables it started with (O-CEO-17).
+  const analyzeEvery = await importAnalyzeEveryPages(engine);
+
+  async function processFile(eng: BrainEngine, filePath: string, settled?: PromiseSettledResult<ImportResult>) {
+    if (!settled && signal?.aborted) return;
+    const relativePath = singleFile ? basename(filePath) : relative(dir, filePath);
     // #753/#774: slug + source_path base. When performFullSync syncs a
     // monorepo subdir, slugRoot is the git root so slugs stay git-root-
     // relative (matching the incremental path's git-diff paths). The
-    // checkpoint (`completed`) stays dir-relative — resumeFilter's contract.
-    const importRelPath = opts.slugRoot ? relative(opts.slugRoot, filePath) : relativePath;
+    // checkpoint (`completed`) stays dir-relative.
+    const importRelPath = opts.slugRoot ? relative(opts.slugRoot, filePath) : relative(importRoot, filePath);
+    if (opts.heldPaths?.has(importRelPath)) { skipped++; completed.add(relativePath); processed++; tickProgress(); return; }
     // v0.31.2 (D5): per-file slow-path log. Fires only when a single
     // file takes >5s. The user's hang surfaces as one file taking
     // forever — without this, the agent can't see which file.
@@ -624,17 +721,23 @@ export async function runImport(
       // multimodal is enabled. The walker (collectMarkdownFiles) only picks
       // up images when GBRAIN_EMBEDDING_MULTIMODAL=true so this branch is
       // unreachable when the gate is off; defense-in-depth check anyway.
-      const result = isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
+      if (settled?.status === 'rejected') throw settled.reason;
+      const result = settled ? settled.value : company ? await importCompanyBrainFile(eng, filePath, sourceId!) : managedImport
+        ? await importManagedFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, signal, slugRoot: opts.slugRoot })
+        : isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
         ? await importImageFile(eng, filePath, importRelPath, { noEmbed, sourceId })
-        : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack });
+        : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, firstCommitAt: firstCommits?.get(filePath) });
       // An import that landed while cancellation arrived is still complete.
       // Account for it before stopping, so resume never loses a successful path.
-      noteTypeWarning((result as { type_warning?: Parameters<typeof noteTypeWarning>[0] }).type_warning);
+      noteTypeWarning((result as { type_warning?: Parameters<typeof noteTypeWarning>[0] }).type_warning); fenceTally.note(importRelPath, result);
       const _fileMs = Date.now() - _fileT0;
-      if (_fileMs > 5000) {
+      if (!settled && _fileMs > 5000) {
         console.error(`[gbrain phase] import.process_file slow ${_fileMs}ms ${relativePath}`);
       }
-      if (result.status === 'imported') {
+      if (await opts.onFileResult?.(importRelPath, filePath, result) === 'held') {
+        skipped++;
+        completed.add(relativePath);
+      } else if (result.status === 'imported') {
         imported++;
         chunksCreated += result.chunks;
         importedSlugs.push(result.slug);
@@ -643,6 +746,11 @@ export async function runImport(
         succeededPaths.push(importRelPath); // #3839
       } else {
         skipped++;
+        if ('resealed' in result && result.resealed) {
+          resealed.pages++;
+          resealed.pendingChunks += result.resealed.pendingChunks;
+          resealed.pendingChars += result.resealed.pendingChars;
+        }
         if (result.skip_reason === 'malformed_path') {
           // Informational skip (bracket/control-char filename): never a
           // failure-ledger row, and stable across runs — checkpoint as done.
@@ -669,19 +777,32 @@ export async function runImport(
         if (e !== signal.reason && !(e instanceof Error && e.name === 'AbortError')) throw e;
         return;
       }
-      const msg = e instanceof Error ? e.message : String(e);
-      const { count, sample } = recordImportFailure(errorCounts, errorSamples, msg);
-      if (count <= 5) {
-        console.error(`  Warning: skipped ${relativePath}: ${msg}`);
-      } else if (count === 6) {
-        console.error(`  (suppressing further "${sample.slice(0, 60)}..." errors)`);
+      // #5600: an accepted managed import still publishing is not a failure; the next run resumes its request.
+      if (acceptedPendingReceipt(e)) { skipped++; console.error(`  Pending: ${relativePath} was accepted and is still publishing; rerun to confirm it.`); }
+      else if (await opts.onFileResult?.(importRelPath, filePath, { status: 'error', error: e instanceof Error ? e.message : String(e) }) === 'held') { skipped++; completed.add(relativePath); } else {
+        const msg = e instanceof Error ? e.message : String(e);
+        const { count, sample } = recordImportFailure(errorCounts, errorSamples, msg);
+        if (count <= 5) {
+          console.error(`  Warning: skipped ${relativePath}: ${msg}`);
+        } else if (count === 6) {
+          console.error(`  (suppressing further "${sample.slice(0, 60)}..." errors)`);
+        }
+        errors++;
+        skipped++;
+        failures.push({ path: importRelPath, error: msg });
       }
-      errors++;
-      skipped++;
-      failures.push({ path: importRelPath, error: msg });
     }
     processed++;
     tickProgress();
+    if (analyzeEvery > 0 && processed % analyzeEvery === 0) {
+      await maybeRefreshPlannerStats(engine, 'import', { throttle: false }).catch((e: unknown) =>
+        console.error(`  Warning: planner statistics refresh failed (${e instanceof Error ? e.message : String(e)}); the import continues. Afterwards run: ${PLANNER_STATS_REPAIR_COMMAND}`));
+    }
+    if (company) {
+      await engine.executeRaw("INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('company-brain-content',$1,$2::text::jsonb) ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys,updated_at=now()",
+        [company.receiptId, JSON.stringify([...completed])]);
+      return;
+    }
     // Save checkpoint every 100 SUCCESSFUL adds (not every 100 processed).
     // Failed files never enter `completed`, so a flaky file can't push the
     // checkpoint past it — the next run will retry it.
@@ -712,6 +833,11 @@ export async function runImport(
     }
   }
 
+  async function processBatch(eng: BrainEngine, batch: string[]) {
+    const settled = batch.length > 1 && !signal?.aborted ? await settleManagedImportBatch(eng, batch, file => opts.slugRoot ? relative(opts.slugRoot, file)
+      : relative(importRoot, file), rel => !!opts.heldPaths?.has(rel), { noEmbed, sourceId, activePack: importActivePack, signal, slugRoot: opts.slugRoot }) : undefined;
+    for (const [i, file] of batch.entries()) await processFile(eng, file, settled?.[i]);
+  }
   let workerError: unknown;
   let workerFailed = false;
   try {
@@ -721,13 +847,10 @@ export async function runImport(
       // checks belt-and-suspenders so we never crash on a null assertion.
       const config = loadConfig();
       if (engine.kind === 'pglite' || !config?.database_url) {
-        for (const file of files) {
-          if (signal?.aborted) break;
-          await processFile(engine, file);
-        }
+        for (let i = 0, batch: string[]; i < files.length && !signal?.aborted; i += batch.length) await processBatch(engine, batch = nextImportBatch(files, i, managedImport && !company));
       } else {
         const { PostgresEngine } = await import('../core/postgres-engine.ts');
-        const { resolvePoolSize } = await import('../core/db.ts');
+        const { connectWithRetry, resolvePoolSize } = await import('../core/db.ts');
         // Each child keeps the established two-connection pool. GBRAIN_POOL_SIZE
         // controls the parent pool; GBRAIN_MAX_CONNECTIONS clamps the child
         // count above so the combined footprint stays within the operator's cap.
@@ -743,7 +866,7 @@ export async function runImport(
           for (let i = 0; i < actualWorkers; i++) {
             if (signal?.aborted) break;
             const eng = new PostgresEngine();
-            await eng.connect({ database_url: databaseUrl, poolSize: workerPoolSize });
+            await connectWithRetry(eng, { database_url: databaseUrl, poolSize: workerPoolSize }, { retryConnectTimeout: true });
             workerEngines.push(eng);
           }
 
@@ -754,9 +877,9 @@ export async function runImport(
           const outcomes = await Promise.allSettled(workerEngines.map(async (eng) => {
             try {
               while (!stopWorkers && !signal?.aborted) {
-                const idx = queueIndex++;
-                if (idx >= files.length) break;
-                await processFile(eng, files[idx]);
+                if (queueIndex >= files.length) break;
+                const batch = nextImportBatch(files, queueIndex, managedImport && !company); queueIndex += batch.length;
+                await processBatch(eng, batch);
               }
             } catch (error) {
               stopWorkers = true;
@@ -782,10 +905,7 @@ export async function runImport(
       } // end else (postgres parallel)
     } else {
       // Sequential: use the provided engine
-      for (const filePath of files) {
-        if (signal?.aborted) break;
-        await processFile(engine, filePath);
-      }
+      for (let i = 0, batch: string[]; i < files.length && !signal?.aborted; i += batch.length) await processBatch(engine, batch = nextImportBatch(files, i, managedImport && !company));
     }
   } catch (error) {
     workerFailed = true;
@@ -804,6 +924,7 @@ export async function runImport(
   // Save the successful tail on interruption/failure. Keep this synchronous:
   // checkpoint and cancellation decisions must not race another worker.
   function preserveCompletedPaths(): void {
+    if (company) return;
     if (completed.size <= lastCheckpointSize) return;
     try {
       mkdirSync(gbrainPath(), { recursive: true });
@@ -909,7 +1030,7 @@ export async function runImport(
   // ledger + bookmark via the shared gate (applySyncFailureGate). Skipping the
   // internal handling here prevents double-recording (which would double-count
   // the auto-skip `attempts` streak) and a competing bookmark write.
-  if (gitHead && !opts.managedBookmark) {
+  if (gitHead && !opts.managedBookmark && !managedImport) {
     // Record failures into the central JSONL so doctor can surface them.
     // Use gitHead as the commit so a later sync can tell "same broken
     // state as last time" from "new broken state." Source-scoped (#1939 #2).
@@ -996,7 +1117,7 @@ export async function runImport(
   // that silently dropped files isn't "clean" for freshness purposes even
   // with zero recorded failures.
   const totalMalformed = malformedExcluded.length + malformedFileSkips;
-  if (sourceId && failures.length === 0 && totalMalformed === 0 && !opts.managedBookmark) {
+  if (sourceId && failures.length === 0 && totalMalformed === 0 && !opts.managedBookmark && !managedImport) {
     try {
       const [row] = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
         `SELECT local_path, config FROM sources WHERE id = $1`,
@@ -1049,10 +1170,13 @@ export async function runImport(
 
   throwIfInterrupted();
   // Only a fully completed run removes resume state, including async metadata.
-  if (errors === 0) clearCheckpoint(checkpointPath);
+  if (errors === 0 && !company) clearCheckpoint(checkpointPath);
   else if (existsSync(checkpointPath)) info(`  Checkpoint preserved (${errors} errors). Run again to retry failed files.`);
 
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+  const resealSummary = resealed.pages > 0
+    ? { pages: resealed.pages, pending_chunks: resealed.pendingChunks, embedding_usd: resealEmbeddingUsd(resealed.pendingChars) }
+    : null;
   if (jsonOutput) {
     // `skipped` includes every per-file failure importFile RETURNS (invalid
     // frontmatter, oversize, symlink, slug mismatch) as well as content-hash
@@ -1061,9 +1185,10 @@ export async function runImport(
     // written only for git-repo dirs (see the gitHead gate below), so a caller
     // importing a scratch directory has no other channel. Emit the per-file
     // list so state can be gated per file.
-    console.log(JSON.stringify({
+    await writeJsonDocument(JSON.stringify({
       status: errors > 0 ? 'partial' : 'success', duration_s: parseFloat(totalTime),
       imported, skipped, errors, chunks: chunksCreated,
+      ...(resealSummary ? { resealed: resealSummary } : {}), ...fenceTally.fields(),
       total_files: allFiles.length,
       unchanged: skipped - failures.length - malformedFileSkips,
       malformed_skipped: malformedFileSkips,
@@ -1075,11 +1200,18 @@ export async function runImport(
     slog(`\nImport complete (${totalTime}s):`);
     slog(`  ${imported} pages imported`);
     slog(`  ${skipped} pages skipped (${skipped - failures.length - malformedFileSkips} unchanged, ${errors} errors, ${malformedFileSkips} malformed filenames)`);
-    slog(`  ${chunksCreated} chunks created`);
+    slog(`  ${chunksCreated} chunks created`); for (const line of fenceTally.lines()) slog(line);
+    if (resealSummary) {
+      slog(`  ${resealSummary.pages} unchanged page(s) re-sealed for remote search; ${resealSummary.pending_chunks} chunk(s) need embedding`
+        + `${resealSummary.embedding_usd === null ? '' : ` (~$${resealSummary.embedding_usd.toFixed(4)})`}${noEmbed ? ' — run gbrain embed --stale' : ''}`);
+    }
   }
 
+  if (imported > 0 && !opts.managedBookmark) await refreshProjectionStatistics(engine, imported);
+  if (imported > 0) recordFunnelEvent('import');
   return {
     imported, skipped, errors, chunksCreated, failures,
+    ...(resealSummary ? { resealed: resealSummary } : {}), ...fenceTally.fields(),
     ...(totalMalformed > 0 ? { malformedSkipped: totalMalformed } : {}),
     ...(typeWarningCounts.size > 0 && typeWarningsEnabled
       ? { type_warnings: [...typeWarningCounts.values()] }
@@ -1125,7 +1257,8 @@ interface CollectOpts {
  * — preserve the walker semantic explicitly.
  *
  * Closes #345: exclude `SYNC_SKIP_FILES` metafiles
- * (`README.md` / `index.md` / `log.md` / `schema.md` / `RESOLVER.md`).
+ * (`README.md` / `index.md` / `log.md` / `schema.md` / `RESOLVER.md`) and, since
+ * #5186, the root-level `AGENTS.md` / `CLAUDE.md` (`SYNC_ROOT_SKIP_FILES`).
  * Incremental `sync` skips these via `isSyncable`, but the bulk-import
  * walker only filtered by extension — so a directory import imported every
  * directory README as a page, titled by its folder ("People", "Companies",
@@ -1160,11 +1293,10 @@ function isCollectibleForWalker(
   if (hasMalformedPathSegment(path)) return false;
 
   // Metafiles are directory scaffolding (READMEs / index / log / schema /
-  // resolver), not typed brain pages — same exclusion `sync`'s `isSyncable`
-  // applies. Guards both the FS-walk and the git-fast-path collection routes.
-  const segments = path.split('/');
-  const basename = segments[segments.length - 1] || '';
-  if ((SYNC_SKIP_FILES as readonly string[]).includes(basename)) return false;
+  // resolver, and the root AGENTS.md / CLAUDE.md harden writes), not typed
+  // brain pages — same exclusion `sync`'s `isSyncable` applies. Guards both
+  // the FS-walk and the git-fast-path collection routes.
+  if (isSyncMetafile(path)) return false;
 
   switch (strategy) {
     case 'code':
@@ -1177,6 +1309,16 @@ function isCollectibleForWalker(
         isCodeFilePath(path) ||
         (multimodalOn && isImageFilePathFromSync(path))
       );
+  }
+}
+
+/** Whether the git work tree around `dir` ignores `dir` itself (`git check-ignore` exits 0). */
+function gitIgnoresDir(dir: string): boolean {
+  try {
+    execFileSync('git', ['-C', dir, 'check-ignore', '-q', '.'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -1200,16 +1342,11 @@ function gitListSyncableFiles(
   onExcluded?: (relPath: string) => void,
   includeHidden?: string[],
 ): string[] | null {
-  let stdout: string;
-  try {
-    stdout = execFileSync(
-      'git',
-      ['-C', dir, 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
-      { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] },
-    );
-  } catch {
-    return null; // not a git work tree, or git not on PATH → FS-walk fallback
-  }
+  const stdout = gitLsFiles(dir, ['--cached', '--others', '--exclude-standard', '-z']);
+  if (stdout === null) return null; // not a git work tree, or git not on PATH → FS-walk fallback
+  // A directory the enclosing repository ignores (a scratch or cache folder inside a checkout) lists
+  // nothing here, so an explicit import of it would succeed with zero files. Walk it directly instead.
+  if (stdout === '' && gitIgnoresDir(dir)) return null;
   const files: string[] = [];
   for (const rel of stdout.split('\0')) {
     if (!rel) continue;

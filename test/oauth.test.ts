@@ -944,7 +944,7 @@ describe('operation scope annotations', () => {
     // #2598, same allowlist as test/operations-trust-boundary.test.ts: think
     // is read-scoped for OAuth/MCP because its handler forces save/take off
     // for remote callers before persistence (pinned by
-    // test/takes-mcp-allowlist.serial.test.ts); local CLI can still persist.
+    // test/takes-mcp-allowlist.test.ts); local CLI can still persist.
     // WP4/D9: request_tools is read-scoped + mutating — its only write (the
     // {surface} persist branch) self-enforces the D2 ceiling, the operator
     // lock, and a per-client rate limit; the read scope keeps discovery
@@ -952,6 +952,15 @@ describe('operation scope annotations', () => {
     const remoteReadOnlyMutatingOps = new Set(['think', 'request_tools']);
     for (const op of operations) {
       if (op.mutating) {
+        if (['join_brain', 'sync_brain_skills', 'leave_brain'].includes(op.name)) {
+          const { operationScopesAllowed } = require('../src/core/scope.ts');
+          expect(op.scope).toBe('read');
+          expect(op.requiredScopes).toEqual(['skills_member_self']);
+          expect(operationScopesAllowed(['read'], op)).toBe(false);
+          expect(operationScopesAllowed(['admin'], op)).toBe(false);
+          expect(operationScopesAllowed(['read', 'skills_member_self'], op)).toBe(true);
+          continue;
+        }
         if (remoteReadOnlyMutatingOps.has(op.name)) {
           expect(op.scope, `${op.name} remote-gated mutating op should be read-scoped`).toBe('read');
           continue;

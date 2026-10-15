@@ -25,57 +25,50 @@ export const collectSetupSmells: AdvisorCollector = {
     const findings: AdvisorFinding[] = [];
     const cfg = ctx.config ?? ({} as typeof ctx.config);
 
-    // Embeddings disabled — deferred setup never completed. No command_argv:
-    // `config set embedding_model` is hard-refused (schema-sizing file-plane
-    // key); the sanctioned path is a re-init.
+    // Embeddings disabled by the user's choice (keyless brain): information,
+    // not a warning (E2: never coach on disabled_by_choice). The enable step is
+    // readiness's one embeddingEnablement command (resolved datastore path, a
+    // provider that fits), the same argv doctor, embed and MCP name.
     if (cfg.embedding_disabled === true) {
+      const { embeddingEnablement } = await import('../readiness.ts');
+      const enable = embeddingEnablement(cfg as Parameters<typeof embeddingEnablement>[0]);
       findings.push({
         id: 'embeddings_disabled',
+        severity: 'info',
+        title: 'Embeddings are off by choice — search is keyword-only and dedup is exact-match.',
+        detail: `${enable.why} Turning them on needs the user's consent (${enable.consent.join(', ') || 'none'}).`,
+        fix: { command_argv: enable.argv ?? null },
+        collector: 'setup-smells',
+        ask_user: true,
+      });
+    } else if (!cfg.embedding_model?.trim()) {
+      findings.push({
+        id: 'embedding_identity_missing',
         severity: 'warn',
-        title: 'Embeddings are disabled — semantic search and dedup are off.',
-        detail:
-          'Enable with `gbrain init --force --embedding-model voyage:voyage-4` ' +
-          '(set VOYAGE_API_KEY first).',
+        title: 'The embedding model is unconfigured — existing vectors are not reinterpreted using a default.',
+        detail: 'Run gbrain migrate embeddings --status and preview an explicit migration with gbrain migrate embeddings --to voyage:voyage-4 --dim 1024 --dry-run. Keyword search remains available.',
         fix: { command_argv: null },
         collector: 'setup-smells',
         ask_user: true,
       });
     } else {
-      // v0.46.3: key the "will embeds work" claim on the EFFECTIVE model —
-      // configless brains resolve the legacy runtime fallback until the
-      // September cutover, so the credential that matters is that provider's,
-      // not the recommended default's. Both key planes are checked (env +
-      // file config; the DB plane is never read by the embed pipeline).
-      const { DEFAULT_EMBEDDING_MODEL } = await import('../ai/defaults.ts');
       const { getRecipe } = await import('../ai/recipes/index.ts');
-      const effectiveModel = cfg.embedding_model ?? DEFAULT_EMBEDDING_MODEL;
+      const effectiveModel = cfg.embedding_model;
       const provider = effectiveModel.split(':')[0];
       const recipe = getRecipe(provider);
       const keyName = recipe?.auth_env?.required?.[0];
       const fileKeys: Record<string, string | undefined> = {
         OPENAI_API_KEY: cfg.openai_api_key,
         VOYAGE_API_KEY: cfg.voyage_api_key,
-        ZEROENTROPY_API_KEY: cfg.zeroentropy_api_key,
       };
       const keyMissing = !!keyName && !process.env[keyName] && !fileKeys[keyName];
       if (keyMissing) {
-        const { NEW_INSTALL_DEFAULT_EMBEDDING_MODEL, renderCanonicalMigrationCommands } =
-          await import('../ai/defaults.ts');
-        const rep = recipe?.sunset?.replacement?.embedding;
-        const migrateCmd = !rep || rep === NEW_INSTALL_DEFAULT_EMBEDDING_MODEL
-          ? renderCanonicalMigrationCommands().recommendedDryRun
-          : `gbrain migrate embeddings --to ${rep} --dry-run`;
-        const sunsetNote = recipe?.sunset
-          ? ` NOTE: ${recipe.name} shuts down ${recipe.sunset.date} — migrate instead of ` +
-            `setting its key: \`${migrateCmd}\`.`
-          : '';
         findings.push({
           id: 'embedding_key_missing',
           severity: 'warn',
           title: `Embedding resolves to ${effectiveModel} but ${keyName} is not set — embedding will fail at write time.`,
           detail:
             `Set ${keyName} in the environment (or add it to ~/.gbrain/config.json).` +
-            sunsetNote +
             ' To switch providers: `gbrain init --force --embedding-model voyage:voyage-4` with VOYAGE_API_KEY set.',
           fix: { command_argv: null },
           collector: 'setup-smells',

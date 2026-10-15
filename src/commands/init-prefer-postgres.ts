@@ -54,6 +54,7 @@ export interface PreferPostgresOpts {
   allowDocker: boolean;
   allowCreateDb: boolean;
   localPostgres: boolean;
+  content?: Parameters<typeof initPostgresCore>[0]['content'];
 }
 
 type LadderRung = 'env_url' | 'supabase_token' | 'local_postgres' | 'docker' | 'pglite';
@@ -142,6 +143,7 @@ async function initPostgresRung(
       aiOpts: o.aiOpts,
       schemaPack: o.schemaPack,
       skipEmbedCheck: o.skipEmbedCheck,
+      content: o.content,
     } as Parameters<typeof initPostgresCore>[0]));
     return rung;
   } catch (e) {
@@ -168,7 +170,7 @@ export async function runPreferPostgresLadder(o: PreferPostgresOpts): Promise<vo
       '[prefer-postgres] a brain is already configured — refusing to re-run the ladder over it.\n' +
       '  Inspect:            gbrain engine status --probe\n' +
       '  Access broken?      gbrain db-repair\n' +
-      '  Move PGLite → PG:   gbrain migrate --to supabase --url <conn>  (the postgres-adopt skill walks it)\n' +
+      '  Move PGLite → PG:   gbrain migrate --to postgres --url-env GBRAIN_TARGET_URL --plan  (the postgres-adopt skill walks it)\n' +
       '  Really start over:  gbrain init --url <conn>  (explicit target, no ladder)',
     );
     process.exit(1);
@@ -385,7 +387,7 @@ export async function runPreferPostgresLadder(o: PreferPostgresOpts): Promise<vo
 
   // Rung 5 — PGLite, the zero-config floor. Terminal; no silent anything.
   if (!rung) {
-    note('falling back to PGLite. Upgrade later: gbrain migrate --to supabase --url <postgres-conn> (docs/ENGINES.md; the postgres-adopt skill walks it).');
+    note('falling back to PGLite. Upgrade later: gbrain migrate --to postgres --plan (docs/guides/move-to-postgres.md; the postgres-adopt skill walks it).');
     await withStdoutToStderr(o.jsonOutput, () => initPGLite({
       jsonOutput: false,
       apiKey: o.apiKey ?? undefined,
@@ -393,17 +395,20 @@ export async function runPreferPostgresLadder(o: PreferPostgresOpts): Promise<vo
       aiOpts: o.aiOpts,
       schemaPack: o.schemaPack,
       skipEmbedCheck: o.skipEmbedCheck,
+      content: o.content,
     } as Parameters<typeof initPGLite>[0]));
     rung = 'pglite';
     urlSource = null;
   }
 
   if (o.jsonOutput) {
-    console.log(JSON.stringify({
+    // D2: the ladder's envelope replaces the inner init's document (written once by runInit).
+    const { setInitJsonResult } = await import('./init-json.ts');
+    setInitJsonResult({
       status: 'ok',
       engine: rung === 'pglite' ? 'pglite' : 'postgres',
       ladder_rung: rung,
       url_source: urlSource,
-    }));
+    }, { replace: true });
   }
 }

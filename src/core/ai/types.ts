@@ -54,6 +54,13 @@ export interface EmbeddingTouchpoint {
    */
   model_dims?: Readonly<Record<string, number>>;
   /**
+   * PR #5921 / wave 14: models whose endpoint returns the native width whatever `dimensions` asked, and whose model
+   * card documents dynamic sizes as "slice from the start, then L2-normalize". Keyed by folded model id
+   * (`modelMatchKey`). When such a model answers at `native` and the brain expects one of `prefixes`, the gateway fits
+   * the vector (`fitMatryoshkaPrefix`); any other width keeps the dim-mismatch refusal. Partial by design.
+   */
+  matryoshka?: Readonly<Record<string, { native: number; prefixes: readonly number[] }>>;
+  /**
    * #4530: per-model maximum tokens PER SINGLE INPUT, keyed like model_dims
    * (partial by design — declare only the models whose limit is known).
    * Distinct from max_batch_tokens (whole-request budget): some hosted
@@ -137,16 +144,7 @@ export interface EmbeddingTouchpoint {
    *    for shorthand `--model <provider>` and prints a setup hint.
    */
   user_provided_models?: true;
-  /**
-   * #2271: trust a user-supplied `--embedding-dimensions` for this recipe even
-   * when it's not in the known-Matryoshka allowlist. Set ONLY on local /
-   * bring-your-own-backend recipes where the user knows their model's native dim
-   * and we can't enumerate every model (ollama, llama-server, litellm). The
-   * provider's `/embeddings` response-dim validation catches a genuine mismatch
-   * pre-storage. Must NOT be set on fixed-dim hosted providers (openai/voyage/
-   * zeroentropy stay fail-closed) or on recipes that declare recipe-wide
-   * `dims_options` (e.g. openrouter, whose Tier-1 options legitimately govern).
-   */
+
   trust_custom_dims?: true;
   /**
    * v0.32 (#779 reworked): explicit opt-out of the missing-max_batch_tokens
@@ -252,23 +250,16 @@ export interface ExpansionTouchpoint {
 export interface RerankerTouchpoint {
   models: string[];
   default_model: string;
+  /** Native request/response dialect. Omitted means the standard rerank shape. */
+  wire_format?: 'typesafe-systemone';
+  /** Score semantics: `rubric` scores are level indices, not calibrated relevance (autocut/CRAG ignore them). */
+  score_semantics?: 'rubric';
   cost_per_1m_tokens_usd?: number;
   price_last_verified?: string;
   max_payload_bytes: number;
-  /**
-   * Override the rerank URL path. Defaults to '/models/rerank' (ZeroEntropy's
-   * legacy path; ZE-compatible-wire-shape providers like llama.cpp set
-   * '/v1/rerank').
-   */
+
   path?: string;
-  /**
-   * v0.46.3: request-body key for the "return top N" parameter. Named by wire
-   * shape, not provider. Defaults to 'top_n' (ZeroEntropy/llama-server/jina
-   * dialect); Voyage's /v1/rerank takes 'top_k'. Response parsing accepts
-   * both array keys (`results[]` for ZE/llama-server, `data[]` for Voyage's
-   * REST — live-wire verified) since the item shape
-   * `{index, relevance_score}` is shared.
-   */
+
   top_param?: 'top_n' | 'top_k';
   /**
    * Recipe-level timeout fallback for `gateway.rerank()` and search-mode
@@ -278,6 +269,21 @@ export interface RerankerTouchpoint {
    * without forcing every user to discover the config key.
    */
   default_timeout_ms?: number;
+}
+
+/** Typed decision questions (System One, src/core/ai/decide/). */
+export interface DecideTouchpoint {
+  models: string[];
+  default_model: string;
+  /** Moving aliases accepted with a doctor warning; the response names the version that answered. */
+  aliases: string[];
+  path: string;
+  max_payload_bytes: number;
+  /** Per-request limits: state + all questions, and state + the longest question. */
+  max_request_tokens: number;
+  max_state_question_tokens: number;
+  cost_per_1m_tokens_usd: number;
+  price_last_verified: string;
 }
 
 export interface ChatTouchpoint {
@@ -345,6 +351,23 @@ export interface Recipe {
   tier: 'native' | 'openai-compat';
   /** Maps to the gateway's implementation switch. */
   implementation: Implementation;
+  /**
+   * How the provider bills. `subscription`: calls draw on a flat-rate plan
+   * (claude-cli), so the operator may price every model of the provider at
+   * once with a `<provider>:*` key in `pricing.overrides`. Unset means per
+   * token, where a provider wildcard is refused (one rate cannot be right
+   * for every model of a per-token API).
+   */
+  billing?: 'subscription';
+  /**
+   * Model ids this recipe lists in a touchpoint that gbrain ships no price
+   * for. They run under a default cost cap with a warning; a cap the user
+   * set refuses them with the no_pricing guidance until the operator
+   * registers a rate (`gbrain pricing set`). `bun run check:recipe-pricing`
+   * requires every listed model to be priced or named here, and fails on a
+   * stale entry (now priced, or no longer listed).
+   */
+  unpriced_models?: string[];
   /** For openai-compatible tier: default base URL. May be overridden by env or wizard. */
   base_url_default?: string;
   /** Env var name(s) for auth; first is required, rest are optional. */
@@ -358,6 +381,7 @@ export interface Recipe {
     expansion?: ExpansionTouchpoint;
     chat?: ChatTouchpoint;
     reranker?: RerankerTouchpoint;
+    decide?: DecideTouchpoint;
   };
   /**
    * Optional alias map for friendlier `provider:model` strings.
@@ -371,27 +395,6 @@ export interface Recipe {
   aliases?: Record<string, string>;
   /** One-line description of setup (shown in wizard + env subcommand). */
   setup_hint?: string;
-  /**
-   * v0.46.3: the provider announced a hosted-API shutdown. Drives, from one
-   * source: init picker/auto-pick exclusion, the once-per-process warn-on-use
-   * in the gateway, and the `gbrain providers` DEPRECATED annotation.
-   * (`provider_sunset` in doctor stays provider-specific until the removal
-   * release — this field does not make the doctor generic yet.)
-   * `replacement` is per-touchpoint: one provider can be replaced by different
-   * targets for embedding vs reranking.
-   */
-  sunset?: {
-    /** ISO date the hosted API stops working. */
-    date: string;
-    /** Optional extra context appended to warnings. */
-    message?: string;
-    replacement?: {
-      /** Recommended `provider:model` replacement for the embedding touchpoint. */
-      embedding?: string;
-      /** Recommended `provider:model` replacement for the reranker touchpoint. */
-      reranker?: string;
-    };
-  };
   /**
    * v0.32 (D12=A): unified auth resolver across embed / expansion / chat
    * touchpoints. Returns the header name (`Authorization`, `api-key`, etc.)
@@ -412,6 +415,8 @@ export interface Recipe {
     headerName: string;
     token: string;
   };
+  /** With a custom resolveAuth: whether its env credential is present (readiness and no_key preflights). */
+  authPresent?(env: Record<string, string | undefined>): boolean;
   /**
    * v0.37.6.0: static request headers applied to every openai-compatible
    * touchpoint (embedding, expansion, chat, reranker). Use for static-per-recipe
@@ -489,6 +494,7 @@ export interface Recipe {
 export interface AIGatewayConfig {
   /** Current embedding model as "provider:modelId" (e.g. "openai:text-embedding-3-large"). */
   embedding_model?: string;
+  embedding_identity_unverified?: boolean;
   /** Target embedding dims. Gateway asserts returned embeddings match this. */
   embedding_dimensions?: number;
   /**
@@ -508,19 +514,16 @@ export interface AIGatewayConfig {
   expansion_model?: string;
   /** Default chat model for `gateway.chat()` callers (subagent default). */
   chat_model?: string;
-  /**
-   * v0.35.0.0+: default reranker model for `gateway.rerank()` callers. As
-   * `'provider:model'` (e.g. `'zeroentropyai:zerank-2'`). Resolved at
-   * configure time and re-resolved by reconfigureGatewayWithEngine() when
-   * mode-bundle or config-key overrides change.
-   */
+
   reranker_model?: string;
   /**
-   * Optional silent-refusal fallback chain ("provider:modelId" entries).
-   * Plumbed for `chatWithFallback()` (commit 3). Blocked from critic/judge/
-   * synthesize flows in their respective handlers.
+   * Optional chat fallback chain ("provider:modelId" entries), walked by
+   * `chatWithFallback()` (chat-fallback.ts) when a chat call fails or refuses.
+   * Judge, critic and eval call sites opt out with `allowFallback: false`.
    */
   chat_fallback_chain?: string[];
+  /** `false` keeps outage fallback but never sends a refused request to the next chain entry. Default true. */
+  chat_fallback_on_refusal?: boolean;
   /** Optional per-provider base URL override (openai-compatible variants). */
   base_urls?: Record<string, string>;
   /** Optional chat providerOptions overrides keyed by recipe id or "recipe:modelId". */

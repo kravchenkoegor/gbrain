@@ -126,6 +126,7 @@ describe('put_page persistence boundary', () => {
     execFileSync('git', ['init', root], { stdio: 'ignore' });
     const scoped = join(root, 'public'); mkdirSync(scoped);
     await engine.setConfig('sync.repo_path', scoped);
+    await engine.setConfig('sync.slug_root_mode', 'git-root');
     const slug = 'notes/scoped-path';
     expect((await put(slug, content('Original scoped body.'))).payload.state).toBe('committed');
     const initial = (await engine.readPageSnapshot(slug, { sourceId: 'default' }))!;
@@ -143,21 +144,28 @@ describe('put_page persistence boundary', () => {
   });
 
   test('a stale queued embedding reports superseded without invoking its provider', async () => {
-    const slug = 'notes/stale-before-provider';
-    const stale = await put(slug, content('Old queued embedding.'));
-    await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now()+interval '1 hour'");
-    const latest = await put(slug, content('Current canonical body.'));
-    await disposePersistenceConsumer(engine);
-    await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now()+interval '1 hour'");
-    await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now() WHERE request_id=(SELECT id FROM persistence_requests WHERE request_id=$1::uuid) AND kind='embedding'", [stale.payload.request_id]);
-    let calls = 0;
-    await runPersistenceEffects(engine, { engine: 'pglite' }, { hostId: localHostId(), limit: 1,
-      embedding: { signature: 'test:1536', model: 'test', embed: async () => { calls++; throw new Error('stale provider must not run'); } } });
-    expect(calls).toBe(0);
-    expect(await embedding(stale)).toMatchObject({ state: 'committed', reason: 'revision_changed' });
-    expect((await replay(stale)).payload.revision).toBe(stale.payload.revision);
-    expect((await engine.readPageSnapshot(slug, { sourceId: 'default' }))!.revision).toBe(latest.payload.revision);
-    expect(readFileSync(join(root, `${slug}.md`), 'utf8')).toContain('Current canonical body.');
+    await engine.executeRaw("ALTER TABLE persistence_effects ALTER COLUMN next_attempt_at SET DEFAULT (now()+interval '1 hour')");
+    try {
+      const slug = 'notes/stale-before-provider';
+      const stale = await put(slug, content('Old queued embedding.'));
+      await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now()+interval '1 hour'");
+      const latest = await put(slug, content('Current canonical body.'));
+      await disposePersistenceConsumer(engine);
+      expect(await engine.executeRaw("SELECT state FROM persistence_effects WHERE request_id=(SELECT id FROM persistence_requests WHERE request_id=$1::uuid) AND kind='embedding'", [stale.payload.request_id]))
+        .toEqual([{ state: 'queued' }]);
+      await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now()+interval '1 hour'");
+      await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now() WHERE request_id=(SELECT id FROM persistence_requests WHERE request_id=$1::uuid) AND kind='embedding'", [stale.payload.request_id]);
+      let calls = 0;
+      await runPersistenceEffects(engine, { engine: 'pglite' }, { hostId: localHostId(), limit: 1,
+        embedding: { signature: 'test:1536', model: 'test', embed: async () => { calls++; throw new Error('stale provider must not run'); } } });
+      expect(calls).toBe(0);
+      expect(await embedding(stale)).toMatchObject({ state: 'committed', reason: 'revision_changed' });
+      expect((await replay(stale)).payload.revision).toBe(stale.payload.revision);
+      expect((await engine.readPageSnapshot(slug, { sourceId: 'default' }))!.revision).toBe(latest.payload.revision);
+      expect(readFileSync(join(root, `${slug}.md`), 'utf8')).toContain('Current canonical body.');
+    } finally {
+      await engine.executeRaw('ALTER TABLE persistence_effects ALTER COLUMN next_attempt_at SET DEFAULT now()');
+    }
   });
 
   test('contended worktree durably queues existing and new pages while another root writes', async () => {
@@ -402,14 +410,21 @@ describe('put_page persistence boundary', () => {
     const body = content('Content with a replaced chunk generation.');
     await engine.setConfig('sync.repo_path', '');
     configureGateway({ embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536, env: { OPENAI_API_KEY: 'sk-test' } });
+    let rechunked: Array<[number, number, string]> = [];
     __setEmbedTransportForTests(async ({ values }) => {
       await importFromContent(engine, slug, body, { noEmbed: true, sourceId: 'default', forceRechunk: true });
+      rechunked = (await engine.getChunks(slug, { sourceId: 'default' })).map(chunk => [chunk.id, chunk.chunk_index, chunk.chunk_text]);
       return { values, warnings: [], embeddings: values.map(() => new Array(1536).fill(0.1)), usage: { tokens: 1 } };
     });
     const result = await put(slug, body);
     expect(result.response.isError).not.toBe(true);
-    expect(await embedding(result)).toMatchObject({ state: 'committed', reason: 'revision_changed' });
-    expect((await engine.getChunks(slug, { sourceId: 'default' })).every(chunk => chunk.embedding_is_null)).toBe(true);
+    // A4: the vectors describe the same chunk text and embedding input, so they land on the
+    // rechunked rows; the newer chunk generation itself stays (same ids, indices and text).
+    expect(await embedding(result)).toMatchObject({ state: 'committed' });
+    const after = await engine.getChunks(slug, { sourceId: 'default' });
+    expect(rechunked.length).toBeGreaterThan(0);
+    expect(after.map(chunk => [chunk.id, chunk.chunk_index, chunk.chunk_text])).toEqual(rechunked);
+    expect(after.every(chunk => !chunk.embedding_is_null)).toBe(true);
   });
 
   for (const action of ['soft-delete', 'hard-delete', 'recreate'] as const) {

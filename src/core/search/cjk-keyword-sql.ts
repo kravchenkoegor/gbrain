@@ -3,7 +3,7 @@
  *
  * `websearch_to_tsquery` with an ASCII-stemming FTS config ('english', …)
  * can't tokenize CJK, so FTS keyword recall is zero for Chinese / Japanese /
- * Korean queries. Both engines fall back to a term-by-term ILIKE match with
+ * Korean queries. Both engines fall back to a term-by-term LIKE/ILIKE match with
  * term-frequency ranking (v0.32.7 on PGLite; ported to Postgres by #3986).
  * The SQL is built ONCE here with $N positional params so the two engines
  * cannot drift; each engine supplies only its own executor.
@@ -17,7 +17,7 @@
  *   - LIKE parameters are individually escaped with escapeLikePattern and
  *     wrapped with %.
  *   - Raw terms and raw query are bound unescaped for ranking arithmetic.
- *   - Explicit `ESCAPE '\'` on ILIKE clauses.
+ *   - Explicit `ESCAPE '\'` on LIKE/ILIKE clauses; caseless terms use LIKE.
  *   - Empty-query guard returns null without binding SQL.
  */
 import type { SearchOpts } from '../types.ts';
@@ -44,12 +44,28 @@ export interface CjkKeywordSql {
   params: unknown[];
 }
 
-export function buildCJKKeywordSql(query: string, ctx: CjkKeywordCtx): CjkKeywordSql | null {
+/**
+ * `match: 'all'` (default) is today's strict AND; `'any'` is the OR fallback
+ * (#6043): a chunk matching any term qualifies and ranks by how many terms it
+ * matches, then by the usual term-frequency score, so all-term chunks always
+ * outrank partial ones. `candidateIds` restricts scoring to a candidate set
+ * from `buildCJKCandidateSql` (the capped retry, #5989).
+ */
+export interface CjkKeywordVariant {
+  match?: 'all' | 'any';
+  candidateIds?: number[];
+}
+
+/** Bound for the matched-term count inside the OR score, above any realistic per-chunk TF sum. */
+const MATCHED_TERM_WEIGHT = 1000;
+
+export function buildCJKKeywordSql(query: string, ctx: CjkKeywordCtx, variant: CjkKeywordVariant = {}): CjkKeywordSql | null {
   const { limit, offset, innerLimit, sourceFactorCase, hardExcludeClause, visibilityClause, detailFilter, opts, dedup } = ctx;
   const qRaw = query;
   if (qRaw.length === 0) return null;
   const terms = splitCJKQueryTerms(qRaw);
   if (terms.length === 0) return null;
+  const any = variant.match === 'any' && terms.length > 1;
 
   const params: unknown[] = [];
 
@@ -90,6 +106,89 @@ export function buildCJKKeywordSql(query: string, ctx: CjkKeywordCtx): CjkKeywor
     offsetIndex = params.length;
   }
 
+  const extraFilter = shapeFilters(opts, params);
+  let fromClause = 'content_chunks cc';
+  if (variant.candidateIds) {
+    params.push(variant.candidateIds);
+    fromClause = `unnest($${params.length}::bigint[]) AS cand(id) JOIN content_chunks cc ON cc.id = cand.id`;
+  }
+  const { whereLikeClause, matchedExpr } = likeClauses(terms, likeParamIndices, any);
+
+  const termFreqExpr = rawTermIndices
+    .map(idx => `((LENGTH(cc.chunk_text) - LENGTH(REPLACE(cc.chunk_text, $${idx}, ''))) / NULLIF(LENGTH($${idx}), 0)::real)`)
+    .join(' + ');
+
+  const qRawBonusExpr = terms.length > 1
+    ? ` + ((LENGTH(cc.chunk_text) - LENGTH(REPLACE(cc.chunk_text, $${qRawIndex}, ''))) / NULLIF(LENGTH($${qRawIndex}), 0)::real)`
+    : '';
+
+  const positionExpr = `COALESCE(1.0 / NULLIF(POSITION($${qRawIndex} IN cc.chunk_text), 0)::real, 0.0)`;
+  const orderExpr = any ? `(${matchedExpr}) DESC, score DESC` : 'score DESC';
+
+  // Term-frequency count: count occurrences of each term in chunk_text via
+  // (length(chunk) - length(replace(chunk, term, ''))) / length(term),
+  // plus bonus for contiguous raw query occurrences when multi-term, and
+  // position()-tiebreaker so earlier-in-chunk hits outrank later ones.
+  // The OR fallback adds the matched-term count outside the source factor,
+  // so a boosted partial match never outscores an all-term chunk.
+  const tfScoreExpr = `
+      ((${termFreqExpr}${qRawBonusExpr}
+        + ${positionExpr})
+      * ${sourceFactorCase})
+    `;
+  const scoreExpr = any ? `(${MATCHED_TERM_WEIGHT} * (${matchedExpr}) + ${tfScoreExpr})` : tfScoreExpr;
+  return assemble({ dedup, fromClause, scoreExpr, orderExpr, whereLikeClause, detailFilter, extraFilter, hardExcludeClause, visibilityClause, innerLimitIndex, limitIndex, offsetIndex, params });
+}
+
+/**
+ * The capped candidate stage (#5989): up to `cap` chunk ids matching every
+ * term (`match: 'all'`) or any term (`'any'`, excluding `excludeIds`), by an
+ * unordered LIKE scan with the same shape, source and visibility filters as
+ * the scoring query. Ids only, so the scan stops at the cap instead of
+ * scoring every match.
+ */
+export function buildCJKCandidateSql(
+  query: string,
+  ctx: CjkKeywordCtx,
+  stage: { match: 'all' | 'any'; cap: number; excludeIds?: number[] },
+): CjkKeywordSql | null {
+  const terms = splitCJKQueryTerms(query);
+  if (query.length === 0 || terms.length === 0) return null;
+  const params: unknown[] = [];
+  const likeParamIndices = terms.map(term => { params.push(`%${escapeLikePattern(term)}%`); return params.length; });
+  let extraFilter = shapeFilters(ctx.opts, params);
+  if (stage.excludeIds?.length) {
+    params.push(stage.excludeIds);
+    extraFilter += ` AND cc.id != ALL($${params.length}::bigint[])`;
+  }
+  params.push(stage.cap);
+  const capIndex = params.length;
+  const { whereLikeClause } = likeClauses(terms, likeParamIndices, stage.match === 'any' && terms.length > 1);
+  return {
+    sql: `SELECT cc.id AS chunk_id
+          FROM content_chunks cc
+          JOIN pages p ON p.id = cc.page_id
+          JOIN sources s ON s.id = p.source_id
+          WHERE ${whereLikeClause} ${ctx.detailFilter}${extraFilter} ${ctx.hardExcludeClause} ${ctx.visibilityClause}${ctx.dedup ? `
+            AND cc.modality = 'text'` : ''}
+          LIMIT $${capIndex}`,
+    params,
+  };
+}
+
+function likeClauses(terms: string[], likeParamIndices: number[], any: boolean): { whereLikeClause: string; matchedExpr: string } {
+  const likes = likeParamIndices.map((idx, termIndex) => {
+    const term = terms[termIndex];
+    const operator = term.toLowerCase() === term.toUpperCase() ? 'LIKE' : 'ILIKE';
+    return `cc.chunk_text ${operator} $${idx} ESCAPE '\\'`;
+  });
+  return {
+    whereLikeClause: any ? `(${likes.join(' OR ')})` : likes.join(' AND '),
+    matchedExpr: likes.map(l => `(${l})::int`).join(' + '),
+  };
+}
+
+function shapeFilters(opts: SearchOpts | undefined, params: unknown[]): string {
   let extraFilter = '';
   // #4480: the CJK arm must honor the SAME shape filters as the main
   // keyword arm. type/types/exclude_slugs were silently dropped here, so a
@@ -118,11 +217,11 @@ export function buildCJKKeywordSql(query: string, ctx: CjkKeywordCtx): CjkKeywor
   }
   if (opts?.afterDate) {
     params.push(opts.afterDate);
-    extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+    extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${opts?.afterDateInclusive ? '>=' : '>'} $${params.length}::text::timestamptz`;
   }
   if (opts?.beforeDate) {
     params.push(opts.beforeDate);
-    extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+    extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${opts?.beforeDateInclusive ? '<=' : '<'} $${params.length}::text::timestamptz`;
   }
   // v0.34.1 (#861 — P0 leak seal): source-isolation on the CJK fallback path.
   if (opts?.sourceIds && opts.sourceIds.length > 0) {
@@ -132,31 +231,14 @@ export function buildCJKKeywordSql(query: string, ctx: CjkKeywordCtx): CjkKeywor
     params.push(opts.sourceId);
     extraFilter += ` AND p.source_id = $${params.length}`;
   }
+  return extraFilter;
+}
 
-  const whereLikeClause = likeParamIndices
-    .map(idx => `cc.chunk_text ILIKE $${idx} ESCAPE '\\'`)
-    .join(' AND ');
-
-  const termFreqExpr = rawTermIndices
-    .map(idx => `((LENGTH(cc.chunk_text) - LENGTH(REPLACE(cc.chunk_text, $${idx}, ''))) / NULLIF(LENGTH($${idx}), 0)::real)`)
-    .join(' + ');
-
-  const qRawBonusExpr = terms.length > 1
-    ? ` + ((LENGTH(cc.chunk_text) - LENGTH(REPLACE(cc.chunk_text, $${qRawIndex}, ''))) / NULLIF(LENGTH($${qRawIndex}), 0)::real)`
-    : '';
-
-  const positionExpr = `COALESCE(1.0 / NULLIF(POSITION($${qRawIndex} IN cc.chunk_text), 0)::real, 0.0)`;
-
-  // Term-frequency count: count occurrences of each term in chunk_text via
-  // (length(chunk) - length(replace(chunk, term, ''))) / length(term),
-  // plus bonus for contiguous raw query occurrences when multi-term, and
-  // position()-tiebreaker so earlier-in-chunk hits outrank later ones.
-  const scoreExpr = `
-      ((${termFreqExpr}${qRawBonusExpr}
-        + ${positionExpr})
-      * ${sourceFactorCase})
-    `;
-
+function assemble(a: {
+  dedup: boolean; fromClause: string; scoreExpr: string; orderExpr: string; whereLikeClause: string; detailFilter: string; extraFilter: string;
+  hardExcludeClause: string; visibilityClause: string; innerLimitIndex: number; limitIndex: number; offsetIndex: number; params: unknown[];
+}): CjkKeywordSql {
+  const { dedup, fromClause, scoreExpr, orderExpr, whereLikeClause, detailFilter, extraFilter, hardExcludeClause, visibilityClause, innerLimitIndex, limitIndex, offsetIndex, params } = a;
   if (dedup) {
     return {
       sql: `WITH ranked AS (
@@ -172,12 +254,12 @@ export function buildCJKKeywordSql(query: string, ctx: CjkKeywordCtx): CjkKeywor
              CASE WHEN p.updated_at < (
                SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
              ) THEN true ELSE false END AS stale
-           FROM content_chunks cc
+           FROM ${fromClause}
            JOIN pages p ON p.id = cc.page_id
            JOIN sources s ON s.id = p.source_id
            WHERE ${whereLikeClause} ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
              AND cc.modality = 'text'
-           ORDER BY score DESC
+           ORDER BY ${orderExpr}, page_id ASC, chunk_id ASC
            LIMIT $${innerLimitIndex}
          ),
          ${buildBestPerPagePoolCte('ranked')}
@@ -200,11 +282,11 @@ export function buildCJKKeywordSql(query: string, ctx: CjkKeywordCtx): CjkKeywor
            CASE WHEN p.updated_at < (
              SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
            ) THEN true ELSE false END AS stale
-         FROM content_chunks cc
+         FROM ${fromClause}
          JOIN pages p ON p.id = cc.page_id
          JOIN sources s ON s.id = p.source_id
          WHERE ${whereLikeClause} ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
-         ORDER BY score DESC
+         ORDER BY ${orderExpr}, page_id ASC, chunk_id ASC
          LIMIT $${limitIndex} OFFSET $${offsetIndex}`,
     params,
   };

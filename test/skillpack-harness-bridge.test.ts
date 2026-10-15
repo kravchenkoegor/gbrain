@@ -331,8 +331,8 @@ describe('remove', () => {
 
 describe('surface + servability contracts', () => {
   test('get_skill is NOT in STARTER_OPS (the stub preflight warning premise) — if this ever flips, update the harness CLI warn text', () => {
-    expect(STARTER_OPS.has('get_skill')).toBe(false);
-    expect(STARTER_OPS.has('list_skills')).toBe(false);
+    expect(STARTER_OPS.has('get_skill')).toBe(true);
+    expect(STARTER_OPS.has('list_skills')).toBe(true);
     expect(STARTER_OPS.has('request_tools')).toBe(true);
   });
 
@@ -433,5 +433,15 @@ describe('review-driven hardening (ship pre-landing findings)', () => {
     const ref = runHarnessReference({ gbrainRoot: root, destDir: dest, slugs: ['alpha'], harness: 'claude-code', statePath });
     expect(ref.summary.missing).toBe(0); // alpha/aux.md expected-absent, judged by the file marker
     expect(ref.summary.differs).toBe(0);
+  });
+});
+
+describe('ownedBridgeSlugs (#5912)', () => {
+  test('drops the reserved shared-dep key, sorts, and handles an absent entry', async () => {
+    const { ownedBridgeSlugs, SHARED_DEP_LEDGER_KEY } = await import('../src/core/skillpack/harness-bridge.ts');
+    const rec = { mode: 'full' as const, files: {} };
+    expect(ownedBridgeSlugs({ written: { query: rec, [SHARED_DEP_LEDGER_KEY]: rec, enrich: rec } as never })).toEqual(['enrich', 'query']);
+    expect(ownedBridgeSlugs({ written: { [SHARED_DEP_LEDGER_KEY]: rec } as never })).toEqual([]);
+    expect(ownedBridgeSlugs(undefined)).toEqual([]);
   });
 });

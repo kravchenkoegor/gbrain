@@ -34,7 +34,7 @@ beforeAll(async () => {
   // content_chunks vector column at the gateway's configured dim. The
   // bunfig preload pins OpenAI/1536, but its beforeEach only re-applies
   // legacy when the gateway was RESET (throws) — it does NOT correct a
-  // sibling that configured a different LIVE dim (e.g. ZE/1280) and never
+  // sibling that configured a different LIVE dim (e.g. Voyage/1024) and never
   // reset. Under weight-based shard bin-packing, such a sibling can run
   // first, so pin 1536 explicitly here BEFORE initSchema (this is exactly
   // the "call configureGateway() in your own beforeAll" escape hatch the
@@ -56,14 +56,14 @@ afterAll(async () => {
 
 describe('readContentChunksEmbeddingDim', () => {
   test('returns dims from a migrated brain (1536d via legacy-embedding preload)', async () => {
-    // v0.37 fix wave: the canonical gateway default is now 1280 (ZE).
+    // v0.37 fix wave: the canonical gateway default is now 1024 (Voyage).
     // However, `bunfig.toml` preloads `test/helpers/legacy-embedding-preload.ts`
     // which configures the gateway to OpenAI/1536 BEFORE any test runs.
     // This preserves the 20+ test files with hardcoded 1536-d
     // Float32Array fixtures. So initSchema() under tests produces a
     // 1536-d column.
     //
-    // New v0.37 tests that need to assert the ZE/1280 default can call
+    // New v0.37 tests that need to assert the Voyage/1024 default can call
     // configureGateway() explicitly in their own beforeAll, which
     // overrides the preload.
     const result = await readContentChunksEmbeddingDim(engine);
@@ -128,6 +128,13 @@ describe('embeddingMismatchMessage', () => {
     expect(nullIdx).toBeLessThan(alterIdx);
   });
 
+  test('Postgres recipe stamps embedding_pending_since where it NULLs the vectors', () => {
+    // Doctor's embeddings check ages the re-embed backlog from the stamp; a
+    // recipe that NULLs without it leaves the backlog's age unknown.
+    const msg = embeddingMismatchMessage({ currentDims: 1536, requestedDims: 768, source: 'init', engineKind: 'postgres' });
+    expect(msg).toContain('UPDATE content_chunks SET embedding = NULL, embedded_at = NULL, embedding_pending_since = now();');
+  });
+
   test('Postgres branch skips HNSW recreate when requested dims exceed pgvector cap', () => {
     // Codex finding #8: 2048d (Voyage 4 Large) cannot be HNSW-indexed in pgvector.
     // The recipe must NOT instruct a CREATE INDEX HNSW for that dim.
@@ -152,43 +159,59 @@ describe('embeddingMismatchMessage', () => {
     expect(doctorMsg).toContain('Embedding dimension mismatch detected');
   });
 
-  // v0.37 fix wave Lane D.1: PGLite branch uses wipe-and-reinit recipe
-  // because PGLite can't ALTER vector column types.
-  test('PGLite branch uses wipe-and-reinit, not ALTER COLUMN', () => {
+  // PGLite can't ALTER vector column types. A7 (agent operator wave): the
+  // recipe keeps pages and DB-only facts (keep-width init, previewed
+  // migration) and never prints a hand-run wipe of the datastore.
+  test('PGLite branch keeps data: keep-width init and migration, no hand-run wipe, not ALTER COLUMN', () => {
     const msg = embeddingMismatchMessage({
       currentDims: 1536,
-      requestedDims: 1280,
-      requestedModel: 'zeroentropyai:zembed-1',
+      requestedDims: 1024,
+      requestedModel: 'openai:text-embedding-3-small',
       source: 'init',
       engineKind: 'pglite',
       databasePath: '/tmp/test-brain.pglite',
     });
     expect(msg).toContain('vector(1536)');
-    expect(msg).toContain('vector(1280)');
-    expect(msg).toContain('mv /tmp/test-brain.pglite /tmp/test-brain.pglite.bak');
-    expect(msg).toContain('gbrain init --pglite --embedding-model zeroentropyai:zembed-1 --embedding-dimensions 1280');
+    expect(msg).toContain('vector(1024)');
+    expect(msg).toContain('gbrain init --force --embedding-model openai:text-embedding-3-small --embedding-dimensions 1536 --path /tmp/test-brain.pglite');
+    expect(msg).toContain('gbrain migrate embeddings --to openai:text-embedding-3-small --dim 1024 --dry-run');
     expect(msg).toContain('PGLite cannot ALTER vector column types');
+    expect(msg).not.toMatch(/\bmv /);
     // Must NOT contain the Postgres-only SQL recipe.
     expect(msg).not.toContain('ALTER TABLE content_chunks ALTER COLUMN');
     expect(msg).not.toContain('DROP INDEX IF EXISTS idx_chunks_embedding');
+  });
+
+  test('PGLite branch omits the keep-width line when the model cannot produce the existing width', () => {
+    const msg = embeddingMismatchMessage({
+      currentDims: 1536,
+      requestedDims: 1024,
+      requestedModel: 'voyage:voyage-4',
+      source: 'init',
+      engineKind: 'pglite',
+      databasePath: '/tmp/test-brain.pglite',
+    });
+    expect(msg).not.toContain('gbrain init --force');
+    expect(msg).toContain('gbrain migrate embeddings --to voyage:voyage-4 --dim 1024 --dry-run');
   });
 
   test('PGLite branch falls back to default database path when omitted', () => {
     const msg = embeddingMismatchMessage({
       currentDims: 1536,
       requestedDims: 1280,
+      requestedModel: 'openai:text-embedding-3-small',
       source: 'init',
       engineKind: 'pglite',
     });
     // Default falls back to gbrainPath('brain.pglite').
-    expect(msg).toMatch(/mv .+brain\.pglite .+brain\.pglite\.bak/);
+    expect(msg).toMatch(/--embedding-dimensions 1536 --path \S+brain\.pglite/);
   });
 
   test('PGLite branch must NOT recommend `gbrain config set embedding_model` (no-op after Lane C.2)', () => {
     const msg = embeddingMismatchMessage({
       currentDims: 1536,
       requestedDims: 1280,
-      requestedModel: 'zeroentropyai:zembed-1',
+      requestedModel: 'voyage:voyage-4',
       source: 'doctor',
       engineKind: 'pglite',
     });
@@ -215,32 +238,32 @@ describe('resolveSchemaEmbeddingDim', () => {
     });
   });
 
-  test('ZeroEntropy zembed-1 resolves at recipe default', () => {
-    const got = resolveSchemaEmbeddingDim({ embedding_model: 'zeroentropyai:zembed-1' });
+  test('Voyage voyage-4 resolves at recipe default', () => {
+    const got = resolveSchemaEmbeddingDim({ embedding_model: 'voyage:voyage-4' });
     expect(got.ok).toBe(true);
     if (got.ok) {
-      expect(got.provider).toBe('zeroentropyai');
-      expect(got.model).toBe('zeroentropyai:zembed-1');
+      expect(got.provider).toBe('voyage');
+      expect(got.model).toBe('voyage:voyage-4');
       expect(got.dim).toBeGreaterThan(0);
     }
   });
 
-  test('ZeroEntropy Matryoshka explicit dim (1280) accepted', () => {
+  test('Voyage Matryoshka explicit dim (512) accepted', () => {
     const got = resolveSchemaEmbeddingDim({
-      embedding_model: 'zeroentropyai:zembed-1',
-      embedding_dimensions: 1280,
+      embedding_model: 'voyage:voyage-4',
+      embedding_dimensions: 512,
     });
     expect(got.ok).toBe(true);
-    if (got.ok) expect(got.dim).toBe(1280);
+    if (got.ok) expect(got.dim).toBe(512);
   });
 
-  test('ZeroEntropy Matryoshka invalid dim (1024) rejected — 1024 is Voyage step, not ZE', () => {
+  test('Voyage Matryoshka invalid dim (1280) rejected — 1280 is not a Voyage step', () => {
     const got = resolveSchemaEmbeddingDim({
-      embedding_model: 'zeroentropyai:zembed-1',
-      embedding_dimensions: 1024,
+      embedding_model: 'voyage:voyage-4',
+      embedding_dimensions: 1280,
     });
     expect(got.ok).toBe(false);
-    if (!got.ok) expect(got.error).toMatch(/does not support custom dimensions 1024|only emits/);
+    if (!got.ok) expect(got.error).toBe('Voyage model "voyage-4" rejects custom dimensions 1280 (allowed: 256, 512, 1024, 2048).');
   });
 
   test('OpenAI text-3-large rejects 2048 (not in declared dims_options)', () => {

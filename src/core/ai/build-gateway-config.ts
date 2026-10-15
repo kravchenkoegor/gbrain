@@ -1,29 +1,12 @@
-/**
- * buildGatewayConfig — translate a stored GBrainConfig into the gateway's
- * AIGatewayConfig (env dict + base_urls + model strings).
- *
- * v0.42 (#1780 Gap 2): extracted from src/cli.ts into a core module so
- * `src/core/init-embed-check.ts` can reuse it without importing the CLI
- * entrypoint (which would create a load-time cycle). cli.ts re-exports
- * `buildGatewayConfig` for back-compat with existing callers + tests that
- * import it from `../../src/cli.ts`.
- *
- * The single ownership site for: (a) folding file-plane API keys
- * (openai/anthropic/zeroentropy/openrouter/voyage/dashscope/google) into the gateway env, and (b) threading
- * local-server `*_BASE_URL` env vars into base_urls. Both matter for the
- * init-time embedding-key probe — without (a) it would false-warn on
- * config.json-keyed users, and without (b) a live probe could hit the wrong
- * endpoint (custom OpenAI base URL, llama-server, etc.).
- */
-
 import type { GBrainConfig } from '../config.ts';
 import { loadConfig } from '../config.ts';
 import type { AIGatewayConfig } from './types.ts';
 import { mergedProviderEnv } from './provider-env.ts';
 
 /**
- * #3350: fold FILE-plane `provider_base_urls.{anthropic,openai}` into the
- * gateway env as `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`, same shape as the
+ * #3350: fold FILE-plane `provider_base_urls.{anthropic,openai,google}` into the
+ * gateway env as `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` /
+ * `GOOGLE_GENERATIVE_AI_BASE_URL`, same shape as the
  * credential folds (env wins for keys carrying a real value). Native
  * providers read their base URL exclusively from env via
  * `resolveNativeBaseUrl` (which also normalizes the `/v1` suffix), so before
@@ -49,6 +32,7 @@ export function foldNativeBaseUrlsFromFilePlane(
   for (const [provider, envKey] of [
     ['anthropic', 'ANTHROPIC_BASE_URL'],
     ['openai', 'OPENAI_BASE_URL'],
+    ['google', 'GOOGLE_GENERATIVE_AI_BASE_URL'],
   ] as const) {
     const fileUrl = urls[provider];
     // Env wins: only fold when the env carries no real value.
@@ -96,12 +80,14 @@ export function buildGatewayConfig(c: GBrainConfig): AIGatewayConfig {
 
   return {
     embedding_model: c.embedding_model,
+    embedding_identity_unverified: !c.embedding_model?.trim(),
     embedding_dimensions: c.embedding_dimensions,
     embedding_multimodal_model: c.embedding_multimodal_model,
     embedding_image_ocr_model: c.embedding_image_ocr_model,
     expansion_model: c.expansion_model,
     chat_model: c.chat_model,
     chat_fallback_chain: c.chat_fallback_chain,
+    chat_fallback_on_refusal: c.chat_fallback_on_refusal,
     base_urls: { ...envBaseUrls, ...(c.provider_base_urls ?? {}) }, // config wins over env
     provider_chat_options: c.provider_chat_options,
     // #1249 empty-string drop + GEMINI alias applied inside mergedProviderEnv.

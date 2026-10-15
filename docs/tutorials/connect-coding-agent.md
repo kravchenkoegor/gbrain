@@ -24,8 +24,10 @@ before initializing. Start keyless, relay the required search-mode matrix, and
 confirm my choice. Save only explicit requests to remember unless I opt into
 automatic capture. Do not add paid enrichment, connectors, or schedules implicitly.
 Verify a unique memory write/readback and report native activation and recall in
-a new conversation separately. If my brain is hosted, provision there and install
-the private handoff here using the actual harness adapter.
+a new conversation separately. If my brain is hosted, use its existing endpoint
+and select this harness's native OAuth/PKCE flow when supported; otherwise have
+the owner provision the chosen machine connection and install its private handoff
+here using the actual harness adapter.
 ```
 
 ## Path B: start from nothing (local brain, local agent)
@@ -81,19 +83,20 @@ Configure the agent you are using:
 
 ```bash
 # Claude Code
-claude mcp add gbrain -- gbrain serve --surface verbs
+claude mcp add gbrain -- "$(command -v gbrain)" serve --surface full
 
 # Codex
-codex mcp add gbrain -- gbrain serve --surface verbs
+codex mcp add gbrain -- "$(command -v gbrain)" serve --surface full
 ```
 
 These launch a local stdio MCP process. Use the same intended brain and source
 you inspected above; if an isolated installation already provided an absolute
 launcher, use that command in place of the bare `gbrain`.
 
-The verbs surface exposes exactly `recall`, `remember`, `entity`,
-`synthesize`, `forget`, `context_pack`, and `delta`.
-Start with keyless recall and remembering. Server-side synthesis and semantic
+The full surface serves every operation, including the seven memory verbs
+(`recall`, `remember`, `entity`, `synthesize`, `forget`, `context_pack`,
+`delta`); a harness that caps its tool count can register `--surface verbs`
+for exactly those seven. Start with keyless recall and remembering. Server-side synthesis and semantic
 retrieval may require separately configured capabilities.
 
 PGLite allows one process to own its database at a time. Do not launch two
@@ -118,18 +121,25 @@ material, and backups may remain.
 
 ## Path A: connect an agent to a brain you already have
 
-Use [hosted harness access](../guides/hosted-harness-access.md) for the full
-procedure. There are two environments: the owner grants access on the brain
-host, then you install the private handoff inside your coding agent's environment.
+Use [hosted harness access](../guides/hosted-harness-access.md) to choose the
+connection method. A harness with native OAuth settings follows the
+[native OAuth path](../guides/hosted-harness-access.md#native-oauth-path).
+The steps below install a private machine connection: the owner grants access
+on the brain host, then you install the handoff inside your coding agent's
+environment. Dashboard access and client management use the separate
+[owner administration](../mcp/ADMIN.md) protocol.
 
 ### A1. On the host, grant memory access
 
-Start from the host's existing HTTPS MCP deployment. Preview or create a
-separate `memory-writer` client for each intended agent:
+Start from the host's existing HTTPS MCP deployment (on your own computer,
+`gbrain mcp expose` provides one; see [use your brain from anywhere over
+MCP](../guides/remote-mcp.md)). Preview or create a separate `memory-writer`
+client for each intended agent:
 
 ```bash
 gbrain mcp grant coding-example --harness codex --profile memory-writer \
   --source default --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/owner-token \
   --credentials-out /absolute/private/coding-example.json --json
 ```
 
@@ -174,6 +184,9 @@ ordinary permission repair does not rotate secrets or duplicate clients.
 
 ## Now make it actually useful
 
+Read [memory boundaries](../guides/memory-boundaries.md) before promising graph
+freshness, provider-local processing, or recovery from Markdown export.
+
 ### A compact standing instruction
 
 Add this section to the agent's existing instructions:
@@ -186,6 +199,8 @@ decisions, projects, or prior work. On the memory surface, use recall or entity;
 only use paid synthesis when that capability has been configured and authorized.
 
 Save explicit requests to remember with provenance and the intended brain/source.
+Durable preferences belong in shared memory; transient task state, credentials,
+local configuration, and harness activation state do not.
 Do not automatically capture conversations unless I opt in. A request to save one
 fact does not enable ongoing capture. Chat-only instructions suppress persistence.
 
@@ -231,15 +246,17 @@ connection, repeat `gbrain connect` with its handoff and `--remove`.
 Revoke the client on the host when its authority should end. Removing a client
 configuration does not delete memory or revoke credentials.
 
-| Symptom | Next step |
-| --- | --- |
-| PGLite busy | Close the current owner before opening another process. Never delete a live lock. |
-| Wrong or empty brain | Inspect root, engine, brain, and source routing; do not initialize over existing memory. |
-| Only seven tools visible | Expected for the verbs surface; use `recall` and `remember` rather than classic tool names. |
-| Hosted read works but write fails | Inspect issued/current scopes, operation grants, source access, and write fences. |
-| Credential delivery interrupted | Resume delivery on the host with the existing client ID. |
-| Server checks pass, new conversation fails | Reload the client, confirm native instruction activation, and observe the actual GBrain call. |
-| Optional embeddings unavailable | Continue keyless or explicitly configure the capability; do not silently spend. |
+<a id="connect-coding-agent-symptoms"></a>
+
+| Symptom | Next step | Who acts | Consent | Verify |
+| --- | --- | --- | --- | --- |
+| PGLite busy | Close the current owner before opening another process. Never delete a live lock. | user | none | `gbrain doctor --only connection --json` |
+| Wrong or empty brain | Inspect root, engine, brain, and source routing; do not initialize over existing memory. | agent | none | `gbrain engine status --json` |
+| Only seven tools visible | Expected for the verbs surface; use `recall` and `remember` rather than classic tool names. | agent | none | the harness's tool list |
+| Hosted read works but write fails | Inspect issued/current scopes, operation grants, source access, and write fences. | brain host | none | the token's scopes in the client list |
+| Credential delivery interrupted | Resume delivery on the host with the existing client ID. | brain host | `credentials` | the client list |
+| Server checks pass, new conversation fails | Reload the client, confirm native instruction activation, and observe the actual GBrain call. | user (reloads the client) | none | a `recall` in a new conversation |
+| Optional embeddings unavailable | Continue keyless or explicitly configure the capability; do not silently spend. | agent, after the user agrees | `credentials`, `paid` to enable embeddings | `gbrain doctor --only embeddings --json` |
 
 As of **2026-09-10**, local CLI and HTTP tests establish the server behavior
 described in [validation evidence](../guides/harness-validation.md).

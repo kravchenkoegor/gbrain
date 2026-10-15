@@ -18,6 +18,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { errorFor, serializeError } from '../core/errors.ts';
 import { resolveCliCodeScope, positionalArgs, parseFlag } from './code-scope.ts';
 import { resolveCodeReadiness, readinessHint } from '../core/code-graph-readiness.ts';
+import { legacyNestedErrorDocument } from '../core/agent-output.ts';
 
 function shouldEmitJson(args: string[]): boolean {
   if (args.includes('--json')) return true;
@@ -36,7 +37,7 @@ export async function runCodeCallees(engine: BrainEngine, args: string[]): Promi
       hint: 'gbrain code-callees <symbol> [--source S | --all-sources] [--limit N] [--json]',
     });
     if (shouldEmitJson(args)) {
-      console.log(JSON.stringify({ error: err.envelope }));
+      console.log(JSON.stringify(legacyNestedErrorDocument(err.envelope, ['gbrain', 'code-callees', '--help'])));
     } else {
       console.error(err.message);
     }
@@ -65,6 +66,7 @@ export async function runCodeCallees(engine: BrainEngine, args: string[]): Promi
     const readiness = await resolveCodeReadiness(engine, {
       kind: 'edge', count: edges.length, sourceId: sourceId ?? undefined, allSources, remote: false,
     });
+    const hint = readinessHint(readiness);
 
     if (shouldEmitJson(args)) {
       const out: Record<string, unknown> = {
@@ -73,19 +75,18 @@ export async function runCodeCallees(engine: BrainEngine, args: string[]): Promi
       };
       // #3707: see code-callers.ts — scope problem vs never-built.
       if (readiness.scoped_source_id) out.scoped_source_id = readiness.scoped_source_id;
-      if (edges.length === 0 && !allSources && sourceId) {
-        out.hint = readiness.status === 'out_of_scope'
-          ? (readinessHint(readiness) ?? `No callees in source '${sourceId}'.`)
-          : `No callees in source '${sourceId}'. Try --all-sources to search every source.`;
+      if (hint) out.hint = hint;
+      if (edges.length === 0 && !allSources && sourceId
+        && !['projection_pending', 'unknown', 'out_of_scope'].includes(readiness.status)) {
+        out.hint = `No callees in source '${sourceId}'. Try --all-sources to search every source.`;
       }
       console.log(JSON.stringify(out, null, 2));
     } else if (edges.length === 0) {
       if (!allSources && sourceId) {
-        console.log(`No callees found for "${sym}" in source '${sourceId}'. Try --all-sources to search every source.`);
+        console.log(`No callees found for "${sym}" in source '${sourceId}'.${!['projection_pending', 'unknown'].includes(readiness.status) ? ' Try --all-sources to search every source.' : ''}`);
       } else {
         console.log(`No callees found for "${sym}".`);
       }
-      const hint = readinessHint(readiness);
       if (hint) console.log(hint);
     } else {
       console.log(`${edges.length} callee(s) for "${sym}":`);
@@ -93,6 +94,7 @@ export async function runCodeCallees(engine: BrainEngine, args: string[]): Promi
         const res = e.resolved ? 'resolved' : 'unresolved';
         console.log(`  ${e.from_symbol_qualified}  → ${e.to_symbol_qualified}  [${res}]`);
       }
+      if (hint) console.log(hint);
     }
   } catch (e: unknown) {
     const env = serializeError(e);

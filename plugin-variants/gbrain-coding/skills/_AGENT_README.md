@@ -22,6 +22,42 @@ skills/
 Other files in the host repo's `src/`, `docs/`, `recipes/` etc. are owned by the
 host, not by gbrain. Don't treat them as gbrain artifacts.
 
+## Shared-brain skills are a different ownership model
+
+The local scaffolding rules below apply to independent copied skills. When
+connected to a shared brain, canonical skills live beside knowledge in that
+brain's source repository; installed files are managed artifacts, not a second
+authority. The original parent follows the same revisions as other members.
+Preserve unrelated identity and instructions.
+
+Use the recorded absolute launcher or named MCP connection. Discover with
+`list_skills` and `schema_version: 2`; match descriptions/triggers, then fetch
+the relevant qualified identity and exact revision with `get_skill`. Fetch
+only declared, approved dependencies through `get_skill_asset` at that revision.
+Do not choose an ambiguous same-name skill or treat ordinary knowledge as
+published instructions. A failed catalog read is not an empty catalog.
+
+Follow only under the approved source policy and explicit `skills_member_self`
+grant. Membership does not confer `skill_editor`, `skill_publisher`, tools,
+script execution, spending, or capture. New connection grants default to follow
+with `--skills memory-only` as the opt-out; old grants require explicit regrant.
+Different installations need independent principals, including the parent.
+
+Inspect `shared_skills` receipts and pending actions. Router installation for
+Claude Code, Codex, and opencode can require restart and is native-unverified;
+manual adapters remain pending. Router instructions are advisory, not an
+enforced invocation hook. Check the current authorized view before selection,
+and do not activate stale cached skills if that check fails. Verify actual
+new-conversation use separately from protocol access and installed files.
+
+Never run scaffold/reference mutation or `rm` instructions below against a
+managed canonical skill or cache. Preserve edited copies as conflicts; request
+authorized publication or managed leave/removal instead. Leaving removes only
+unchanged owned artifacts and does not revoke credentials or erase history.
+The guide in the GBrain distribution is
+`docs/guides/shared-brain-skills.md`; existing installations follow
+`skills/migrations/v0.53.0.0.md` without changing unrelated consent.
+
 ## Routing — your first job
 
 Discover skills at runtime by walking every `skills/<slug>/SKILL.md` here and
@@ -48,7 +84,11 @@ skill — read its SKILL.md body in full and follow the workflow described there
 useful for scanning every skill and its trigger phrases in one place, and it
 carries the disambiguation rules for overlapping matches. If the two disagree,
 frontmatter wins. (There is no machine-managed block inside `RESOLVER.md` or
-`AGENTS.md`; that pattern was retired.)
+`AGENTS.md`; that pattern was retired.) `RESOLVER.md` ships in the gbrain
+install's `skills/` directory; `gbrain skillpack scaffold` does not copy it,
+and the Claude Code / Codex plugin lanes do not ship it. Where it is absent,
+routing rests on each skill's frontmatter alone (`triggers:`, `description`,
+and the `when_to_use` the plugin lanes add from the triggers).
 
 ## The memory loop
 
@@ -61,6 +101,14 @@ Start with keyless recall and explicit remembering:
 3. Read the stored record before correcting it, retire the old fact, and save
    the correction. `forget` withdraws active memory; history and backups may remain.
 4. Verify with `recall`, `entity`, or `get_page` before claiming the change landed.
+
+Choose verification that can read the intended visibility: trusted local CLI
+can recall private facts; MCP (including stdio) and a thin CLI connected to MCP
+currently recall and withdraw world-visible facts only. Preserve the user's intended privacy.
+A committed remote private-write receipt confirms storage, not private recall; explain
+when trusted local readback is unavailable rather than claiming verification or
+widening access. Use only harmless synthetic world-visible facts for an
+authorized MCP connection test, then withdraw them.
 
 After explicit automatic-capture opt-in, apply the bundled `signal-detector`
 contract to substantive messages. Delegation and paid enrichment require their
@@ -84,7 +132,8 @@ directly unless the SKILL.md tells you to.
 
 ## Updates — when gbrain ships a new version
 
-The user runs `gbrain upgrade`. Skill files DO NOT change automatically.
+For independent scaffolded copies, the user runs `gbrain upgrade`. Those skill
+files DO NOT change automatically.
 gbrain becomes a reference library you compare against.
 
 On every cold start, or any time the user mentions an upgrade, run:
@@ -162,6 +211,6 @@ This file (`_AGENT_README.md`) is the routing contract — keep it short.
   lookup chain — an unexplained exemption is a conformance failure.
 - **`priority:` is NOT part of the routing contract.** Nothing in the routing
   path consumes it — matching is substring-over-`triggers:` (see "Routing"
-  above), with `RESOLVER.md` disambiguation for overlaps. A `priority:` key is
+  above), with `RESOLVER.md` disambiguation for overlaps where it ships. A `priority:` key is
   inert; don't add one expecting it to reorder matches. Encode precedence in
   trigger specificity and the resolver's disambiguation rules instead.

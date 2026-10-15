@@ -28,14 +28,14 @@ import {
   type ResolvedSearchKnobs,
 } from '../../src/core/search/mode.ts';
 import { resolveHardExcludes } from '../../src/core/search/source-boost.ts';
-import { DEFAULT_RERANKER_MODEL, LEGACY_DEFAULT_RERANKER_MODEL } from '../../src/core/ai/defaults.ts';
+import { DEFAULT_RERANKER_MODEL } from '../../src/core/ai/defaults.ts';
 
 /** Build a baseline resolved knob set with all reranker fields filled. */
 function baseKnobs(): ResolvedSearchKnobs {
   return {
     ...MODE_BUNDLES.balanced,
     reranker_enabled: false,
-    reranker_model: 'zeroentropyai:zerank-2',
+    reranker_model: 'voyage:rerank-2.5',
     reranker_top_n_in: 30,
     reranker_top_n_out: null,
     reranker_timeout_ms: 5000,
@@ -45,7 +45,7 @@ function baseKnobs(): ResolvedSearchKnobs {
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 29 (…; 24→25 keywordOrFallback knob kof= #3617; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256/#3695; 28→29 evb= expansion variant budget fold)', () => {
+  test('version is 31 (…; 24→25 keywordOrFallback knob kof= #3617; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256/#3695; 28→29 evb= expansion variant budget fold; 29→30 exact-title order #5889; 30→31 rrg=/rrgg=/ecf= rerank gate fold W3)', () => {
     // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
     // floor_ratio. v0.36 wave: piggybacks on v=3 with 7 cross-modal knobs
     // (D2) PLUS column + provider context (D8/CDX-2 cross-column isolation).
@@ -100,7 +100,9 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // Phase E2 / Cat 13) — same unshipped epoch; null hashes as off.
     // v=29 ALSO carries mbg= (metadata boost gate, ranker wave Phase E3 /
     // Cat 13) — same unshipped epoch; a partial literal hashes as always.
-    expect(KNOBS_HASH_VERSION).toBe(29);
+    // 29→30 (#5889): exact-title-first title-arm order + weight-A remote
+    // title predicate reorder rows for identical knobs; version-only.
+    expect(KNOBS_HASH_VERSION).toBe(31);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {
@@ -119,10 +121,10 @@ describe('Each reranker field flips the hash (cache-row separation)', () => {
   });
 
   test('reranker_model differs → different hash', () => {
-    const z2 = knobsHash({ ...baseKnobs(), reranker_model: 'zeroentropyai:zerank-2' });
-    const z1 = knobsHash({ ...baseKnobs(), reranker_model: 'zeroentropyai:zerank-1' });
-    const z1s = knobsHash({ ...baseKnobs(), reranker_model: 'zeroentropyai:zerank-1-small' });
-    expect(new Set([z2, z1, z1s]).size).toBe(3);
+    const full = knobsHash({ ...baseKnobs(), reranker_model: 'voyage:rerank-2.5' });
+    const lite = knobsHash({ ...baseKnobs(), reranker_model: 'voyage:rerank-2.5-lite' });
+    const preview = knobsHash({ ...baseKnobs(), reranker_model: 'voyage:rerank-3' });
+    expect(new Set([full, lite, preview]).size).toBe(3);
   });
 
   test('reranker_top_n_in differs → different hash', () => {
@@ -282,12 +284,12 @@ describe('v=12 hard-exclude participation (#2825)', () => {
 });
 
 describe('v0.48.2 reranker default flip re-keys the cache (rrm= is folded unconditionally)', () => {
-  test('per mode: hash(DEFAULT voyage) !== hash(LEGACY zerank) even with the reranker OFF', () => {
-    expect(DEFAULT_RERANKER_MODEL).toBe('voyage:rerank-2.5');
+  test('per mode: hash(DEFAULT voyage) !== hash(synthetic model) even with the reranker OFF', () => {
+    expect(DEFAULT_RERANKER_MODEL).toBe('voyage:rerank-3-lite');
     for (const mode of ['conservative', 'balanced', 'tokenmax'] as const) {
       const base = { ...baseKnobs(), reranker_enabled: MODE_BUNDLES[mode].reranker_enabled };
       const withDefault = knobsHash({ ...base, reranker_model: DEFAULT_RERANKER_MODEL });
-      const withLegacy = knobsHash({ ...base, reranker_model: LEGACY_DEFAULT_RERANKER_MODEL });
+      const withLegacy = knobsHash({ ...base, reranker_model: 'fixture-provider:reranker-v1' });
       expect(withDefault).not.toBe(withLegacy);
     }
   });

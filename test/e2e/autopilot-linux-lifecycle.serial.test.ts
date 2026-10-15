@@ -188,7 +188,6 @@ exit 0
   delete runEnv.GBRAIN_PGBOUNCER_URL;
   delete runEnv.GBRAIN_PGBOUNCER_DIRECT_URL;
   delete runEnv.VOYAGE_API_KEY;
-  delete runEnv.ZEROENTROPY_API_KEY;
   delete runEnv.OPENAI_API_KEY;
   delete runEnv.ANTHROPIC_API_KEY;
   delete runEnv.GOOGLE_API_KEY;
@@ -251,7 +250,7 @@ describe('autopilot linux lifecycle (PATH-shimmed crontab/systemctl)', () => {
   });
 
   test('install --target linux-cron adds ONE autopilot line; foreign lines survive byte-identical', () => {
-    const r = runCli(['autopilot', '--install', '--force', '--target', 'linux-cron', '--repo', repoDir]);
+    const r = runCli(['autopilot', '--install', '--force', '--yes', '--target', 'linux-cron', '--repo', repoDir]);
     expect(r.status, `install failed:\nSTDOUT:\n${r.stdout}\nSTDERR:\n${r.stderr}`).toBe(0);
     expect(r.stdout).toContain('Installed crontab entry for gbrain autopilot (every 5 minutes)');
 
@@ -280,7 +279,7 @@ describe('autopilot linux lifecycle (PATH-shimmed crontab/systemctl)', () => {
 
   test('reinstall is idempotent: exactly one autopilot line, no table rewrite, foreign intact', () => {
     const callsBefore = readLines(cronArgvLog).length;
-    const r = runCli(['autopilot', '--install', '--force', '--target', 'linux-cron', '--repo', repoDir]);
+    const r = runCli(['autopilot', '--install', '--force', '--yes', '--target', 'linux-cron', '--repo', repoDir]);
     expect(r.status, `reinstall failed:\nSTDOUT:\n${r.stdout}\nSTDERR:\n${r.stderr}`).toBe(0);
     expect(r.stdout).toContain('Crontab entry already exists');
 
@@ -311,7 +310,7 @@ describe('autopilot linux lifecycle (PATH-shimmed crontab/systemctl)', () => {
 
   test('install --target linux-systemd writes a 0644 unit and runs daemon-reload → enable --now → try-restart', () => {
     rmSync(sysctlLog, { force: true });
-    const r = runCli(['autopilot', '--install', '--force', '--target', 'linux-systemd', '--repo', repoDir]);
+    const r = runCli(['autopilot', '--install', '--force', '--yes', '--target', 'linux-systemd', '--repo', repoDir]);
     expect(r.status, `systemd install failed:\nSTDOUT:\n${r.stdout}\nSTDERR:\n${r.stderr}`).toBe(0);
     expect(r.stdout).toContain('Installed systemd user service: gbrain-autopilot.service');
 

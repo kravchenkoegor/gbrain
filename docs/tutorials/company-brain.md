@@ -1,9 +1,19 @@
 # Tutorial: Extend your personal brain into a company brain
 
+Already have a company Markdown repository and only want to index it? Start with
+[connecting an existing company brain](../guides/company-brain-ingestion.md).
+That local workflow offers an offline demo, read-only inspection, and a verified
+import into a separate initialized company brain without requiring the hosted
+team deployment described below. Its source policy keeps sync keyless and
+writeback-free; the personal-brain reuse and automatic enrichment steps in this
+tutorial are a different workflow, not follow-up steps for that import.
+
 This tutorial picks up where the [personal brain tutorial](personal-brain.md) leaves off. You already have a working agent (OpenClaw on Render, talking to you on Telegram, with GBrain as memory and Supabase storing embeddings). Now you want your whole team to use it as shared institutional memory, with each person seeing only what they're allowed to see.
 
 **Time:** about 90 more minutes on top of the personal-brain install.
 **Cost:** under $100 a month sustained for a 25-person company.
+
+> **Want a team brain without operating one?** [gbrain.io](https://gbrain.io/?ref=company-brain) is hosted GBrain built for exactly this: one brain the whole team prompts together, accounts connected once with a permission level for each AI, and pricing per workspace rather than per person. Keep reading to deploy and run it yourself.
 
 If you haven't done the personal-brain install yet, [start there first](personal-brain.md). Come back when you've got the agent responding to you on Telegram. This tutorial assumes that's already working.
 
@@ -40,13 +50,21 @@ It is also **not** a thin-client-everywhere setup. Your personal agent stays as 
 
 The personal-brain install uses Supabase as the embeddings layer but the GBrain runtime itself might be using PGLite (single-machine) depending on which path you took. For a company brain, you want a real Postgres for the runtime too. If your personal-brain install is already on Postgres or Supabase end-to-end, skip to Part 3.
 
-If you're on PGLite, migrate:
+If you're on PGLite, move the brain. Run from the agent host machine, same one you set up in the personal-brain tutorial, with the Supabase transaction-pooler URL in `GBRAIN_TARGET_URL`:
 
 ```bash
-gbrain migrate --to supabase
+gbrain migrate --to postgres --url-env GBRAIN_TARGET_URL --json
 ```
 
-This copies every page, chunk, embedding, link, and config over to your Supabase project. Run from the agent host machine, same one you set up in the personal-brain tutorial. Takes a few minutes per 10K pages.
+That prints the plan (what moves, what stays on this machine, estimated time) and exits 3 without changing anything. After you agree, run the command it prints:
+
+```bash
+gbrain migrate --to postgres --url-env GBRAIN_TARGET_URL --yes --expect <plan_hash>
+```
+
+Every page, fact, take, version, embedding, link, token and OAuth client moves with its history, and the run verifies every table before switching over. It ends with the target's `gbrain doctor` result. Full walkthrough and recovery: [Move a PGLite brain to Postgres](../guides/move-to-postgres.md).
+
+**Say to your agent:** *"Move my brain to Supabase so the team can share it. Show me the plan first."*
 
 Verify:
 
@@ -166,6 +184,8 @@ For development, tunnel the local server out via ngrok:
 ngrok http 3131 --domain your-brain.ngrok.app
 ```
 
+If the brain runs on your own computer rather than a server, `gbrain mcp expose` publishes it over HTTPS on your Tailscale tailnet (`--funnel` for agents that run in a vendor's cloud), keeps it running as a user service, and needs no `--bind 0.0.0.0`; see [use your brain from anywhere over MCP](../guides/remote-mcp.md).
+
 For production, put your server behind a real hostname with a real TLS certificate. Let's call your final URL `https://brain.acme-co.com` for the rest of this tutorial.
 
 Re-run the server with the public URL so the OAuth discovery metadata matches what clients hit:
@@ -257,7 +277,7 @@ Two presets cover the common shapes, with semantics worth knowing honestly:
 - **`daily-driver`** — a personal assistant agent: writes to one source, reads broadly. The read grant is a **snapshot** of all non-archived sources at registration time, excluding other agents' `*-workspace` scratch sources (name one explicitly in `--federated-read` to share it) — a source you add next month is NOT automatically readable; re-grant with `gbrain auth rescope-client <client_id> --federated-read <updated list>`.
 - **`coding-agent`** — a write-isolated project agent: its writes land in an auto-created, DB-only `<name>-workspace` source (so a misbehaving agent can't scribble on your wiki), and it reads only the project sources you name via `--federated-read` (required — a coding agent that can read nothing but its own scratch space is a misconfiguration).
 
-Both presets start the client on the **starter** tool surface (the ~27-op daily set, not the full brain-admin surface). Override at registration with `--surface`, or widen a specific client later with `gbrain auth rescope-client <client_id> --surface full`.
+Both presets start the client on the **full** tool surface; its grant (scopes, sources and write fence) still bounds what it can do. A harness that caps its tool count can register with `--surface starter`, or narrow a specific client later with `gbrain auth rescope-client <client_id> --surface starter`.
 
 A worked example — a coding agent for alice-example's widget project, wired into Claude Code:
 
@@ -536,9 +556,15 @@ OAuth source scoping only guards the HTTP MCP path. If the brain's Postgres and 
 
 ## Part 13: Cost and speed expectations
 
-Real numbers from the published benchmark snapshot (2026-05-23, v0.40.6.0, measured on the ZeroEntropy embedding stack, which is deprecated with its hosted API ending 2026-09-04; the default Voyage `voyage-4` + `rerank-2.5` stack is in the same price and latency class):
+Historical numbers from the published benchmark snapshot (2026-05-23,
+v0.40.6.0) were measured on a retired hosted embedding stack, not the current
+Voyage default. Provider identifiers are redacted; original attribution is
+preserved at Git revision `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29`
+(retained on 2026-09-23). The measurements below are unchanged and do not
+establish a supported replacement's latency or throughput. The later
+LongMemEval result is separately dated and labeled.
 
-- **Embedding cost:** the default (`voyage:voyage-4`) is $0.06 per million tokens; the snapshot's ZeroEntropy stack is $0.05. For comparison, GBrain configured with OpenAI is $0.13.
+- **Embedding cost:** the default (`voyage:voyage-4`) is $0.06 per million tokens; the snapshot's retired hosted stack is $0.05. For comparison, GBrain configured with OpenAI is $0.13.
 - **Ingest speed:** about 22 seconds for a small test corpus of 164 pages on the host machine. For a 10K-page corpus, expect about 20 minutes the first time, then most syncs are incremental and finish in seconds.
 - **Query latency:** about 122 ms median for a `gbrain search`. For comparison, the same query through GBrain with OpenAI takes about 282 ms.
 - **Synthesized-answer latency:** a few seconds, dominated by the Anthropic API.

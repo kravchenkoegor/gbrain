@@ -12,25 +12,18 @@
  * persisted: a probe-less write would clobber a probed verdict (reset
  * checked_at, mutate the nag fingerprint, silence a real warn).
  *
- * Probes are local READ subcommands only (`remote get-url`,
- * `status --porcelain`, `rev-list --count`) via execFile array args — never
- * fetch/push/network. Per-repo failures degrade that asset to 'unknown';
- * a failed compute never clobbers an existing cache (getBackupStatus).
  */
 
 import { existsSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
 
 import { VERSION } from '../../version.ts';
 import type { BrainEngine } from '../engine.ts';
-import { loadAllSources } from '../sources-load.ts';
+import { loadAllSources, parseSourceConfig, type SourceRow } from '../sources-load.ts';
+import { connectorAuthorities, type ConnectorAuthority } from '../persistence/connector-authority.ts';
 import { discoverGitRoot } from '../sync-git.ts';
-import { GIT_ENV, detectDefaultBranch, isWorkingTreeDirty } from '../git-remote.ts';
-import { aheadCount, readPushStatusForRoot } from '../workspace-push.ts';
-import { sanitizePushReason } from '../workspace-push.ts';
 import { realpathOrResolve } from '../path-confine.ts';
 import { resolveBrainId } from '../brain-resolver.ts';
-import { readManifest, readReceipt } from '../bootstrap/format.ts';
+import { readReceipt } from '../bootstrap/format.ts';
 import { resolveGbrainHome } from '../gbrain-home.ts';
 import { loadBridgeState } from '../skillpack/bridge-state.ts';
 import { loadStorageConfig } from '../storage-config.ts';
@@ -42,10 +35,16 @@ import {
   isBackupStatusStale,
   loadBackupStatus,
   saveBackupStatus,
+  currentBackupEvidence,
+  isVerifiedRecoverable,
+  assetBlocksRecovery,
+  BACKUP_VERIFICATION_MAX_AGE_MS,
+  BACKUP_RECOVERY_SCOPE,
   type BackupAssetVerdict,
   type BackupComputedBy,
   type BackupStatus,
 } from './status-file.ts';
+import { assessBackupRepository, BACKUP_REMOTE_PROBE_CAP, budgetAllowsProbe, type RemoteProbeBudget } from './repository.ts';
 
 /** No silent caps: at most this many deduped git roots are probed per run;
  * anything beyond is logged as skipped. */
@@ -58,74 +57,69 @@ export interface BackupCoverageOpts {
    * repos come back 'unknown' and the result is NEVER persisted.
    */
   localGitProbes: boolean;
+  verifyRemoteRefs?: boolean;
+  previousStatus?: BackupStatus;
   /** Provenance stamp for the status file (default 'cli'). */
   computedBy?: BackupComputedBy;
 }
-
-const RECIPE_DETAIL =
-  'fix: git remote add origin <url> && git push -u origin <branch>, then gbrain sources harden <id>';
 
 function pushAsset(assets: BackupAssetVerdict[], a: BackupAssetVerdict): void {
   assets.push(a);
 }
 
 /**
- * Event-loop yield between synchronous git probes. The probe helpers are
- * execFileSync (10-30s timeouts each); in the stdio-serve refresher this
- * compute runs on the MCP server's loop, so without yields a multi-repo brain
- * would freeze ALL tool dispatch for the duration of the sweep. A yield before
- * EACH probe bounds the stall to one subprocess (worst case one subprocess
- * timeout on a wedged repo — accepted residual; the compute is at most daily).
+ * #5505: an API connector's pages come from the provider, not from Git. A
+ * connector_database source (managed, unbound) has no canonical files at all;
+ * an unmanaged connector's non-Git (or missing) directory is a Markdown cache.
+ * Both are recovered by a full re-sync from the provider, so they are an info
+ * row and never an unrecoverable repository that keeps the check in warn.
+ * `gbrain export` is not offered: `gbrain sync --source <id>` on a Google or
+ * GitHub source runs the connector sync, which rebuilds pages from the provider
+ * and never reads a Markdown dump, so an export is an archive for that source,
+ * not a restore path.
  */
+function connectorAsset(id: string, connectorDatabase: boolean): BackupAssetVerdict {
+  return {
+    kind: 'connector',
+    id,
+    state: 'info',
+    detail: (connectorDatabase
+      ? 'API connector source (connector_database): pages are imported from the provider API straight into the database. '
+      : 'API connector source: its local directory only caches the provider API as Markdown and is not a git repository. ') +
+      "Recover by re-syncing from the provider (within the source's configured history window).",
+    fix_argv: ['gbrain', 'sync', '--source', id, '--full'],
+  };
+}
+
+/** A bound connector's root must be a canonical checkout, so it stays a repo verdict. */
+function notARepoAsset(row: SourceRow, authority: ConnectorAuthority | undefined): BackupAssetVerdict {
+  return authority === 'unmanaged'
+    ? connectorAsset(row.id, false)
+    : { kind: 'source_repo', id: row.id, state: 'unknown', detail: 'not_a_git_repo', fix_argv: null };
+}
+
 function yieldLoop(): Promise<void> {
   return new Promise((r) => setTimeout(r, 0));
 }
 
-/**
- * POSITIVE origin determination. `hasOriginRemote` (sync-git) collapses every
- * failure to `false`, which would turn a git timeout / wedged mount into a
- * false "no remote — a disk loss loses them" warn persisted for a month.
- * Exit code 2 is git's documented "no such remote"; anything else that throws
- * is a probe failure ('unknown').
- */
-function originRemoteState(root: string): 'present' | 'absent' | 'unknown' {
-  try {
-    execFileSync('git', ['-C', root, 'remote', 'get-url', 'origin'], {
-      encoding: 'utf-8',
-      timeout: 15_000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: GIT_ENV,
-    });
-    return 'present';
-  } catch (err) {
-    const status = (err as { status?: number }).status;
-    return status === 2 ? 'absent' : 'unknown';
-  }
-}
-
-/**
- * Does the remote-tracking ref origin/<branch> exist locally? false = the
- * remote has NOTHING pushed for this branch (the half-completed `git remote
- * add` state — zero recoverable history); null = probe failure.
- */
-function hasRemoteTrackingRef(root: string, branch: string): boolean | null {
-  try {
-    execFileSync('git', ['-C', root, 'rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`], {
-      encoding: 'utf-8',
-      timeout: 15_000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-      env: GIT_ENV,
-    });
-    return true;
-  } catch (err) {
-    const status = (err as { status?: number }).status;
-    // --quiet --verify exits 1 when the ref does not exist; other failures
-    // (timeout, spawn error) are indeterminate.
-    return status === 1 ? false : null;
-  }
-}
-
 /** null = the count could not be established (engine down / schema quirk). */
+/** E7: live pages + active facts, and the brain's first source/page timestamp. Null when unreadable. */
+async function brainMaturity(engine: BrainEngine): Promise<BackupStatus['maturity'] | undefined> {
+  try {
+    const [row] = await engine.executeRaw<{ pages: number; facts: number; since: string | Date | null }>(
+      `SELECT (SELECT COUNT(*)::int FROM pages WHERE deleted_at IS NULL) AS pages,
+              (SELECT COUNT(*)::int FROM facts WHERE expired_at IS NULL) AS facts,
+              LEAST((SELECT MIN(created_at) FROM sources), (SELECT MIN(created_at) FROM pages)) AS since`,
+    );
+    const items = Number(row?.pages) + Number(row?.facts);
+    if (!row || !Number.isFinite(items)) return undefined;
+    const sinceMs = row.since ? new Date(row.since).getTime() : NaN;
+    return { items, since: Number.isFinite(sinceMs) ? new Date(sinceMs).toISOString() : null };
+  } catch {
+    return undefined;
+  }
+}
+
 async function countLivePages(engine: BrainEngine): Promise<number | null> {
   try {
     const rows = await engine.executeRaw<{ n: number }>(
@@ -146,9 +140,16 @@ export async function computeBackupCoverage(
 ): Promise<BackupStatus> {
   const now = opts.now ?? new Date();
   const assets: BackupAssetVerdict[] = [];
+  const remoteBudget: RemoteProbeBudget | undefined = opts.localGitProbes === true && opts.verifyRemoteRefs === true
+    ? { remaining: BACKUP_REMOTE_PROBE_CAP } : undefined;
+  const previousAge = now.getTime() - Date.parse(opts.previousStatus?.checked_at ?? '');
+  const previous = opts.localGitProbes === true && opts.previousStatus && !opts.previousStatus.degraded
+    && Number.isFinite(previousAge) && previousAge >= 0 && !isBackupStatusStale(opts.previousStatus, now.getTime())
+    ? currentBackupEvidence(opts.previousStatus, now.getTime()) : undefined;
+  const previousAssets = new Map(previous?.assets.map(a => [`${a.kind}:${a.id}`, a]));
+  const repositories: { root: string; index: number }[] = [];
 
   // ── Bootstrap workspace (carries skills/, memory/, brain/, identity) ──────
-  // File plane only — no git subprocess needed here.
   let workspaceRoot: string | null = null;
   let receiptHasRepo = false;
   try {
@@ -177,20 +178,10 @@ export async function computeBackupCoverage(
           fix_argv: null,
         });
       } else {
-        // THIS workspace's own push status only — a failing entry from some
-        // other push-tracked repo must not be misattributed to the workspace.
-        const own = readPushStatusForRoot(receipt.workspace_dir);
-        if (own && own.ok === false) {
-          pushAsset(assets, {
-            kind: 'bootstrap_workspace',
-            id: receipt.workspace_dir,
-            state: 'failing',
-            detail: sanitizePushReason(own.reason),
-            fix_argv: ['gbrain', 'sources', 'push', '--path', receipt.workspace_dir],
-          });
-        } else {
-          pushAsset(assets, { kind: 'bootstrap_workspace', id: receipt.workspace_dir, state: 'ok' });
-        }
+        if (opts.localGitProbes === true) repositories.push({ root: workspaceRoot, index: assets.length });
+        pushAsset(assets, opts.localGitProbes === true
+          ? await assessBackupRepository(workspaceRoot, 'bootstrap_workspace', receipt.workspace_dir, now, undefined, previousAssets.get(`bootstrap_workspace:${receipt.workspace_dir}`))
+          : { kind: 'bootstrap_workspace', id: receipt.workspace_dir, state: 'unknown', configured_remote: true, detail: 'probes_skipped' });
       }
     }
   } catch {
@@ -202,6 +193,10 @@ export async function computeBackupCoverage(
   let degraded = false;
   try {
     const rows = await loadAllSources(engine);
+    const authorities = await connectorAuthorities(
+      engine,
+      rows.filter((r) => !r.archived).map((r) => ({ id: r.id, kind: parseSourceConfig(r.config).kind })),
+    );
     const byRoot = new Map<string, { ids: string[]; dbOnly: boolean }>();
     let skippedOverCap = 0;
     // Root discovery is itself a git subprocess — memoize per local_path, count
@@ -211,12 +206,17 @@ export async function computeBackupCoverage(
     let discoveries = 0;
     for (const row of rows) {
       if (row.archived) continue;
+      if (authorities.get(row.id) === 'connector_database') {
+        pushAsset(assets, connectorAsset(row.id, true)); // local_path, if any, is not canonical
+        continue;
+      }
       if (!row.local_path) continue;
       if (!existsSync(row.local_path)) {
         // The most disk-loss-adjacent state of all: a registered path that is
         // GONE. Surface it (unknown — it may live on another machine or have
-        // moved) instead of silently skipping.
-        pushAsset(assets, {
+        // moved) instead of silently skipping. An unmanaged connector's cache
+        // is rebuilt by its next sweep, so it takes the connector verdict.
+        pushAsset(assets, authorities.get(row.id) === 'unmanaged' ? connectorAsset(row.id, false) : {
           kind: 'source_repo',
           id: row.id,
           state: 'unknown',
@@ -232,7 +232,7 @@ export async function computeBackupCoverage(
         const memo = rootByPath.get(row.local_path)!;
         if (memo === null) {
           // Every source at a known non-repo path gets its own asset row.
-          pushAsset(assets, { kind: 'source_repo', id: row.id, state: 'unknown', detail: 'not_a_git_repo', fix_argv: null });
+          pushAsset(assets, notARepoAsset(row, authorities.get(row.id)));
           continue;
         }
         root = memo;
@@ -248,13 +248,7 @@ export async function computeBackupCoverage(
           rootByPath.set(row.local_path, root);
         } catch {
           rootByPath.set(row.local_path, null);
-          pushAsset(assets, {
-            kind: 'source_repo',
-            id: row.id,
-            state: 'unknown',
-            detail: 'not_a_git_repo',
-            fix_argv: null,
-          });
+          pushAsset(assets, notARepoAsset(row, authorities.get(row.id)));
           continue;
         }
       }
@@ -282,7 +276,11 @@ export async function computeBackupCoverage(
             'db_only dirs configured: those pages are not in git and the DB file is deliberately not backed up. ' +
             'Dump them somewhere OUTSIDE the gitignored dirs (--restore-only is the wrong direction for a backup); ' +
             'run gbrain doctor (undeclared_db_only_pages) for the page-level audit.',
-          fix_argv: ['gbrain', 'export', '--dir', '<backup-dir>'],
+          // One source per dump directory: an unscoped export refuses when two
+          // sources share a slug, and a second dump refuses an occupied dir.
+          // BACKUP_DIR is a placeholder with no shell metacharacters, so a
+          // verbatim paste cannot redirect (`<dir>/x` would truncate `/x`).
+          fix_argv: ['gbrain', 'export', '--source', row.id, '--dir', `BACKUP_DIR/${row.id}`],
         });
       }
     }
@@ -301,82 +299,9 @@ export async function computeBackupCoverage(
         continue;
       }
       probed++;
-      try {
-        // "No origin" must be a POSITIVE determination — a probe failure
-        // (timeout, wedged mount) is 'unknown', never a false "a disk loss
-        // loses them" warn persisted for a month.
-        await yieldLoop();
-        const origin = originRemoteState(root);
-        if (origin === 'unknown') {
-          pushAsset(assets, { kind: 'source_repo', id, state: 'unknown', detail: 'probe_failed', fix_argv: null });
-          continue;
-        }
-        if (origin === 'absent') {
-          // Bootstrap-initialized roots get the mechanical fix; plain repos
-          // get the recipe in detail (no single mechanical fix — argv null).
-          let initialized = false;
-          try {
-            initialized = readManifest(root).state === 'initialized';
-          } catch {
-            /* manifest unreadable — plain-repo recipe */
-          }
-          pushAsset(assets, {
-            kind: 'source_repo',
-            id,
-            state: 'no_remote',
-            detail: RECIPE_DETAIL,
-            fix_argv: initialized ? ['gbrain', 'bootstrap', 'repo'] : null,
-          });
-          continue;
-        }
-        await yieldLoop();
-        const branch = detectDefaultBranch(root);
-        // A remote with NOTHING pushed is not a backup: origin/<branch>
-        // unresolvable means zero recoverable history — that is the
-        // half-completed `git remote add` state and it must WARN, not read ok.
-        if (hasRemoteTrackingRef(root, branch) === false) {
-          pushAsset(assets, {
-            kind: 'source_repo',
-            id,
-            state: 'no_remote',
-            detail: `remote configured but nothing pushed (origin/${branch} not found) — run: git push -u origin ${branch}`,
-            fix_argv: null,
-          });
-          continue;
-        }
-        await yieldLoop();
-        const ahead = aheadCount(root, branch);
-        if (ahead === undefined) {
-          pushAsset(assets, { kind: 'source_repo', id, state: 'unknown', detail: 'probe_failed', fix_argv: null });
-          continue;
-        }
-        if (ahead > 0) {
-          pushAsset(assets, {
-            kind: 'source_repo',
-            id,
-            state: 'unpushed',
-            ahead,
-            detail: `${ahead} commit(s) ahead of origin/${branch}`,
-            fix_argv: null,
-          });
-          continue;
-        }
-        await yieldLoop();
-        let dirty = false;
-        try {
-          dirty = isWorkingTreeDirty(root);
-        } catch {
-          /* dirtiness probe failure is not worth degrading the asset */
-        }
-        pushAsset(
-          assets,
-          dirty
-            ? { kind: 'source_repo', id, state: 'dirty', detail: 'uncommitted changes', fix_argv: null }
-            : { kind: 'source_repo', id, state: 'ok' },
-        );
-      } catch {
-        pushAsset(assets, { kind: 'source_repo', id, state: 'unknown', detail: 'probe_failed', fix_argv: null });
-      }
+      await yieldLoop();
+      repositories.push({ root, index: assets.length });
+      pushAsset(assets, await assessBackupRepository(root, 'source_repo', id, now, undefined, previousAssets.get(`source_repo:${id}`)));
     }
     if (skippedOverCap > 0) {
       process.stderr.write(
@@ -387,6 +312,28 @@ export async function computeBackupCoverage(
     // Sources unreadable (engine down / legacy schema): the verdict is
     // DEGRADED — it must never overwrite a probed cache (getBackupStatus).
     degraded = true;
+  }
+
+  if (remoteBudget) {
+    const ordered = repositories.filter(({ index }) => assets[index].configured_remote === true).sort((a, b) => {
+      const left = assets[a.index].verification;
+      const right = assets[b.index].verification;
+      return Number(left?.state === 'verified') - Number(right?.state === 'verified')
+        || (Date.parse(left?.checked_at ?? '') || 0) - (Date.parse(right?.checked_at ?? '') || 0);
+    });
+    for (const { root, index } of ordered) {
+      const asset = assets[index];
+      if (!budgetAllowsProbe(remoteBudget)) {
+        if (asset.verification?.state !== 'verified') {
+          asset.verification = { ...asset.verification, state: 'budget_exhausted' };
+        }
+        continue;
+      }
+      await yieldLoop();
+      const probed = await assessBackupRepository(root, asset.kind as 'source_repo' | 'bootstrap_workspace', asset.id, now, remoteBudget);
+      // A deferred probe (the slot closed between the pre-check and the call) keeps first-pass verified evidence; a real transport failure still supersedes it.
+      assets[index] = probed.verification?.state === 'budget_exhausted' && asset.verification?.state === 'verified' ? asset : probed;
+    }
   }
 
   // ── Harness-native skill dirs (installed COPIES — info only) ──────────────
@@ -406,9 +353,6 @@ export async function computeBackupCoverage(
   }
 
   // ── DB-only brain (the worst-case user) ───────────────────────────────────
-  // Pages exist but nothing is git-backed: on PGLite that is total loss on a
-  // disk failure; on managed Postgres the DB survives by construction, but it
-  // still isn't the git system of record.
   const pageCountRaw = await countLivePages(engine);
   if (pageCountRaw === null) degraded = true;
   const pageCount = pageCountRaw ?? 0;
@@ -423,7 +367,7 @@ export async function computeBackupCoverage(
         id: 'brain database',
         state: 'info',
         detail:
-          `your DB is remote (${pageCount} pages survive a disk loss), but it isn't the git system of record — ` +
+          `Postgres contains ${pageCount} pages; database placement and external backups were not verified — ` +
           'add a source repo (gbrain sources add) or dump with gbrain export',
         fix_argv: ['gbrain', 'bootstrap', 'repo'],
       });
@@ -444,19 +388,13 @@ export async function computeBackupCoverage(
     no_remote: assets.filter((a) => a.state === 'no_remote').length,
     unpushed: assets.filter((a) => a.state === 'unpushed').length,
     failing: assets.filter((a) => a.state === 'failing').length,
-    recoverable_repos: assets.filter(
-      (a) =>
-        (a.kind === 'source_repo' || a.kind === 'bootstrap_workspace') &&
-        a.state !== 'no_remote' &&
-        a.state !== 'unknown' &&
-        // A failing push means the remote is BEHIND — counting it recoverable
-        // would overstate the recovery statement.
-        a.state !== 'failing',
-    ).length,
+    configured_repos: assets.filter(a => a.configured_remote === true).length,
+    recoverable_repos: assets.filter(isVerifiedRecoverable).length,
     pages_at_risk: pagesAtRisk,
   };
+  const maturity = assets.some(assetBlocksRecovery) ? await brainMaturity(engine) : undefined;
 
-  return {
+  return currentBackupEvidence({
     schema_version: BACKUP_STATUS_SCHEMA_VERSION,
     checked_at: now.toISOString(),
     gbrain_version: VERSION,
@@ -466,15 +404,12 @@ export async function computeBackupCoverage(
     totals,
     assets,
     ...(degraded ? { degraded: true } : {}),
-  };
+    ...(remoteBudget ? { remote_check_at: now.toISOString() } : {}),
+    recovery_scope: BACKUP_RECOVERY_SCOPE,
+    ...(maturity ? { maturity } : {}),
+  }, now.getTime());
 }
 
-/**
- * The single choke point every compute site routes through: a fresh cache is
- * returned as-is; a stale/absent one triggers a compute. Probed results are
- * persisted; probe-less results are NOT (see module header). A failed compute
- * never clobbers an existing cache — the prior verdict is returned instead.
- */
 /**
  * True when this process is operating on the HOST brain. The status cache is
  * host-scoped (~/.gbrain/backup-status.json has no brain dimension), so a
@@ -498,12 +433,13 @@ export async function getBackupStatus(
   const hostBrain = operatingOnHostBrain();
   const cached = hostBrain ? loadBackupStatus() : null;
   const nowMs = (opts.now ?? new Date()).getTime();
-  if (!opts.forceRefresh && cached && !isBackupStatusStale(cached, nowMs)) return cached;
+  const remoteAge = nowMs - Date.parse(cached?.remote_check_at ?? '');
+  const remoteDue = opts.localGitProbes === true && opts.verifyRemoteRefs === true
+    && (!Number.isFinite(remoteAge) || remoteAge < 0 || remoteAge > BACKUP_VERIFICATION_MAX_AGE_MS);
+  if (!opts.forceRefresh && cached && !isBackupStatusStale(cached, nowMs) && !remoteDue) return currentBackupEvidence(cached, nowMs);
   try {
-    const fresh = await computeBackupCoverage(engine, opts);
-    // A DEGRADED verdict (engine down mid-compute — sources/pages unreadable)
-    // must never replace a probed cache: prefer the prior verdict outright.
-    if (fresh.degraded && cached) return cached;
+    const fresh = await computeBackupCoverage(engine, { ...opts, previousStatus: cached ?? undefined });
+    if (fresh.degraded && cached) return currentBackupEvidence({ ...cached, degraded: true }, nowMs);
     if (opts.localGitProbes && !fresh.degraded && hostBrain) {
       // The save gets its own guard: a failed WRITE (disk full) must not
       // discard the fresh verdict the caller just probed for.
@@ -518,7 +454,7 @@ export async function getBackupStatus(
     }
     return fresh;
   } catch (err) {
-    if (cached) return cached;
+    if (cached) return currentBackupEvidence({ ...cached, degraded: true }, nowMs);
     throw err;
   }
 }

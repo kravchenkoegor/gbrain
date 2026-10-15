@@ -4,9 +4,14 @@
  * under its original name (tests and external callers import them from
  * doctor.ts) and buildChecks / doctorReportRemote consume them.
  */
-import { isZeroEntropyModel, NEW_INSTALL_DEFAULT_RERANKER_MODEL } from '../../../core/ai/defaults.ts';
+import { loadConfigFileOnly } from '../../../core/config.ts';
+import { DEFAULT_MAX_COST_USD, findUnpricedBrainstormChatModel } from '../../../core/brainstorm/cost-gate.ts';
+import { pricingSetCommand } from '../../../core/budget/no-pricing.ts';
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
+import { checkError } from '../check-fix.ts';
+import { isConnectorSourceKind } from '../../../core/persistence/connector-identity.ts';
+import { isCrossSourceLinksEnabled } from '../../../core/link-extraction.ts';
 
 /**
  * v0.40.4 graph_signals_coverage doctor check.
@@ -106,18 +111,14 @@ export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Ch
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return {
-      name: 'graph_signals_coverage',
-      status: 'warn',
-      message: `Could not check graph_signals_coverage: ${msg}`,
-    };
+    return checkError('graph_signals_coverage', 'check graph_signals_coverage', msg);
   }
 }
 
 /**
  * v0.37.0 brainstorm_health doctor check.
  *
- * Surfaces three readiness signals for `gbrain brainstorm` / `gbrain lsd`:
+ * Surfaces four readiness signals for `gbrain brainstorm` / `gbrain lsd`:
  *
  *   1. Migration v79 applied — the `pages.last_retrieved_at` column exists.
  *      If missing, LSD's stale-page signal degrades silently (corpus-sampling
@@ -128,14 +129,22 @@ export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Ch
  *      is fine; explicit-off is a warning so the user notices the setting.
  *      Fix: `gbrain config set search.track_retrieval true`.
  *
- *   3. Calibration cold-start — the latest calibration profile has empty
+ *   3. Chat model pricing (#5873): a cross or judge chat model nothing
+ *      prices runs under the default $5 cap with a warning (its calls go
+ *      unmetered), and a run with an explicit --max-usd refuses it. The
+ *      warning names the model, its role and the `gbrain pricing set`
+ *      command. Skipped when no gateway is configured: the chat model is
+ *      then unknown, not unpriced.
+ *
+ *   4. Calibration cold-start — the latest calibration profile has empty
  *      `active_bias_tags`. brainstorm + LSD judge fall back to no-anti-bias
  *      mode with a stderr warning at run time; this surfaces it earlier.
  *      Fix: `gbrain calibration --regenerate` once enough takes are resolved.
  *
  * Returns the FIRST non-ok signal as the status — column-missing dominates,
- * then disabled-tracking, then cold-start. All three are non-blocking warnings;
- * brainstorm + LSD still work, just with degraded signal.
+ * then disabled-tracking, then unpriced-chat-model, then cold-start. All four
+ * are non-blocking warnings; brainstorm + LSD still work, just with degraded
+ * signal.
  */
 export async function checkBrainstormHealth(engine: BrainEngine): Promise<Check> {
   // (1) Column probe — fast, single-query.
@@ -180,7 +189,26 @@ export async function checkBrainstormHealth(engine: BrainEngine): Promise<Check>
     // Config read miss is benign; default-on applies.
   }
 
-  // (3) Calibration cold-start — empty active_bias_tags.
+  // (3) Chat model pricing: the models runBrainstorm's cost gate checks.
+  try {
+    const unpriced = await findUnpricedBrainstormChatModel(engine);
+    if (unpriced) {
+      return {
+        name: 'brainstorm_health',
+        status: 'warn',
+        message: `brainstorm ${unpriced.role} model "${unpriced.model}" has no price: brainstorm/lsd run it under the default $${DEFAULT_MAX_COST_USD} cap with a warning (its calls go unmetered), and a run with an explicit --max-usd refuses it. Fix: look up its rate and register it: ${pricingSetCommand(unpriced.model, 'chat')}`,
+      };
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      name: 'brainstorm_health',
+      status: 'warn',
+      message: `Could not check brainstorm chat model pricing (${msg}); brainstorm/lsd may refuse to start under an explicit --max-usd.`,
+    };
+  }
+
+  // (4) Calibration cold-start — empty active_bias_tags.
   try {
     const calibRows = await engine.executeRaw<{ active_bias_tags: string[] | null }>(
       `SELECT active_bias_tags
@@ -220,243 +248,11 @@ export async function checkBrainstormHealth(engine: BrainEngine): Promise<Check>
   }
 }
 
-/**
- * v0.36.0.0 (A5): ze_embedding_health doctor check.
- *
- * When the configured embedding_model starts with `zeroentropyai:`, verify
- * the API key is set. Doesn't make a network call by default — the existing
- * `gbrain models doctor` probe covers that, and we don't want every
- * `gbrain doctor` run to spend tokens. Surfaces a paste-ready fix when the
- * key is missing.
- */
-export async function checkZeEmbeddingHealth(engine: BrainEngine): Promise<Check> {
-  try {
-    // v0.37 fix wave (Lane E.3 + CDX2-10): read from gateway, not DB.
-    // The file plane is canonical post-v0.37; the DB config table is
-    // schema-applied metadata. Reading DB here would skip the warning
-    // when the user has a fresh install with no DB config row yet.
-    const { getEmbeddingModel } = await import('../../../core/ai/gateway.ts');
-    const { loadConfigFileOnly } = await import('../../../core/config.ts');
-    let model = '';
-    try { model = getEmbeddingModel(); } catch { /* gateway unconfigured */ }
-    if (!isZeroEntropyModel(model)) {
-      return {
-        name: 'ze_embedding_health',
-        status: 'ok',
-        message: `Configured embedding model "${model || 'default'}" is not ZeroEntropy — skip.`,
-      };
-    }
-    const envKey = process.env.ZEROENTROPY_API_KEY;
-    // File plane: zeroentropy_api_key on GBrainConfig (added by C.3).
-    const fileKey = loadConfigFileOnly()?.zeroentropy_api_key;
-    if (!envKey && !fileKey) {
-      // Migration-first: when the provider has an announced shutdown, the fix
-      // for a missing key is to migrate OFF, not to sign up. The key path
-      // survives as the secondary note for someone who needs the remaining
-      // hosted window. (Generic on recipe.sunset so the copy self-corrects if
-      // the recipe ever changes; the whole check is deleted in v0.47.)
-      const { getRecipe } = await import('../../../core/ai/recipes/index.ts');
-      const sunset = getRecipe('zeroentropyai')?.sunset;
-      if (sunset) {
-        const { renderCanonicalMigrationCommands } = await import('../../../core/ai/defaults.ts');
-        return {
-          name: 'ze_embedding_health',
-          status: 'warn',
-          message:
-            `embedding_model="${model}" but ZEROENTROPY_API_KEY is not set — and the ` +
-            `hosted API shuts down on ${sunset.date}. Fix: migrate off it: ` +
-            `${renderCanonicalMigrationCommands().recommendedDryRun}. If you need hosted ` +
-            `ZeroEntropy for the remaining weeks, set the key via ` +
-            `\`export ZEROENTROPY_API_KEY=...\` or "zeroentropy_api_key" in ` +
-            `~/.gbrain/config.json (gbrain config set writes the DB plane, which the embed pipeline ignores).`,
-        };
-      }
-      return {
-        name: 'ze_embedding_health',
-        status: 'warn',
-        message:
-          `embedding_model="${model}" but ZEROENTROPY_API_KEY is not set. ` +
-          `Fix: \`export ZEROENTROPY_API_KEY=...\` or edit ~/.gbrain/config.json ` +
-          `to add "zeroentropy_api_key": "...". (gbrain config set writes the DB plane, which the embed pipeline ignores.)`,
-      };
-    }
-    return {
-      name: 'ze_embedding_health',
-      status: 'ok',
-      message: `embedding_model="${model}" with key configured`,
-    };
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return {
-      name: 'ze_embedding_health',
-      status: 'warn',
-      message: `Could not check ZE embedding health: ${msg}`,
-    };
-  }
-}
-
-/**
- * provider_sunset doctor check (#3390 follow-up).
- *
- * Detects a brain whose EFFECTIVE embedding model (gateway-resolved, which is
- * how default-config brains land on the shipped default) is on a provider
- * with an announced hosted-API shutdown, and prints a paste-ready migration
- * command with the brain's ACTUAL `content_chunks.embedding` column width
- * filled in — not the config value, which can drift. Keeping the current
- * width avoids a needless dimension transition + index rebuild when the
- * target supports it.
- *
- * Unlike the one-shot upgrade banner (`ze_sunset_notice_shown`), this fires
- * on every `gbrain doctor` run until the brain is off the provider —
- * warn before the shutdown date; fail after it ONLY when the brain is
- * actually exposed (embedded vectors exist in the affected column, so
- * retrieval is genuinely down). A zero-vector brain whose config merely
- * RESOLVES to the dead default stays warn — otherwise every stock fresh
- * install (and every doctor-as-CI-gate) starts exiting 1 on the date with
- * no code change. Suppress entirely (accepted-risk installs) via
- * `gbrain config set doctor.suppress_provider_sunset true`.
- * No network call; one catalog query for the column width.
- *
- * `now` is injectable so tests can pin BOTH sides of the date without
- * waiting for the calendar (the date itself is a compile-time constant).
- */
-export async function checkProviderSunset(engine: BrainEngine, now: number = Date.now()): Promise<Check> {
-  const name = 'provider_sunset';
-  try {
-    const suppressed = await engine.getConfig('doctor.suppress_provider_sunset').catch(() => null);
-    if (suppressed === 'true' || suppressed === '1') {
-      return {
-        name,
-        status: 'ok',
-        message: 'Check suppressed via doctor.suppress_provider_sunset (unset it to re-enable).',
-      };
-    }
-    const { DEFAULT_EMBEDDING_MODEL, ZEROENTROPY_SUNSET_DATE, sunsetDateHasPassed } = await import('../../../core/ai/defaults.ts');
-    // Effective model: gateway when configured (file/env plane, the runtime
-    // truth); the shipped default otherwise — an unset-config brain resolves
-    // to the default at runtime, so it is just as affected.
-    let model = DEFAULT_EMBEDDING_MODEL;
-    try {
-      const { getEmbeddingModel } = await import('../../../core/ai/gateway.ts');
-      model = getEmbeddingModel();
-    } catch {
-      // Gateway unconfigured — runtime resolves the shipped default.
-    }
-    // Effective reranker: resolve through the SAME plane search actually
-    // reranks with — resolveSearchMode (mode bundle + search.reranker.*
-    // config overrides; hybrid.ts passes `resolvedMode.reranker_model`).
-    // The gateway plane is unset by default while balanced/tokenmax rerank
-    // with the bundle's zeroentropyai model — reading the gateway here
-    // would false-ok the exact brains this check exists to protect.
-    let reranker: string | undefined;
-    try {
-      const { loadSearchModeConfig, resolveSearchMode } = await import('../../../core/search/mode.ts');
-      const knobs = resolveSearchMode(await loadSearchModeConfig(engine));
-      if (knobs.reranker_enabled) reranker = knobs.reranker_model;
-    } catch {
-      // Mode resolution failed — make no reranker-exposure claim.
-    }
-    const onSunsetEmbedding = isZeroEntropyModel(model);
-    const onSunsetReranker = isZeroEntropyModel(reranker);
-    // Custom embedding columns can route queries through a ZE-backed model
-    // even when the primary embedding + reranker are clear — without this arm
-    // the check reports ok while those columns die on the date.
-    let zeColumns: string[] = [];
-    try {
-      const { detectZeCustomColumns } = await import('../../../core/ze-exposure.ts');
-      zeColumns = (await detectZeCustomColumns(engine)).columns;
-    } catch {
-      // Probe failed — make no custom-column claim.
-    }
-    const onSunsetColumns = zeColumns.length > 0;
-    if (!onSunsetEmbedding && !onSunsetReranker && !onSunsetColumns) {
-      return {
-        name,
-        status: 'ok',
-        message: `No configured provider has an announced shutdown (embedding: ${model}).`,
-      };
-    }
-    // Shared date-itself-counts comparison with the gateway's rerank
-    // short-circuit (defaults.ts:sunsetDateHasPassed) — the two cannot drift.
-    const past = sunsetDateHasPassed(ZEROENTROPY_SUNSET_DATE, new Date(now));
-    const parts: string[] = [];
-    let hasVectors = false;
-    if (onSunsetEmbedding) {
-      let dims: number | null = null;
-      try {
-        const { readContentChunksEmbeddingDim } = await import('../../../core/embedding-dim-check.ts');
-        dims = (await readContentChunksEmbeddingDim(engine)).dims;
-      } catch {
-        // Column probe failed (fresh/odd brain) — omit --dim from the hint.
-      }
-      try {
-        const rows = await engine.executeRaw(
-          `SELECT 1 AS one FROM content_chunks WHERE embedding IS NOT NULL LIMIT 1`,
-        );
-        hasVectors = rows.length > 0;
-      } catch {
-        // Probe failed (fresh/odd brain) — no exposure claim, warn-only.
-      }
-      parts.push(
-        past
-          ? hasVectors
-            ? `embedding_model="${model}": the hosted API shut down on ${ZEROENTROPY_SUNSET_DATE} — semantic retrieval is offline (queries can no longer be embedded against your existing vectors).`
-            : `embedding_model="${model}": the hosted API shut down on ${ZEROENTROPY_SUNSET_DATE}. No embedded vectors exist yet, so retrieval is not impacted — but embedding will fail until the config points elsewhere.`
-          : `embedding_model="${model}": the hosted API shuts down on ${ZEROENTROPY_SUNSET_DATE}. On that date semantic retrieval stops entirely — existing vectors become unqueryable (query embedding uses the same endpoint), not just new content.`,
-      );
-      // v0.46.3: the paste-ready fix is TARGET-AWARE on dimensions via the
-      // canonical renderer (defaults.ts) — Voyage's valid widths are
-      // {256, 512, 1024, 2048}, so the recommended command always carries
-      // --dim 1024; the keep-width OpenAI form renders only when valid there.
-      const { renderCanonicalMigrationCommands } = await import('../../../core/ai/defaults.ts');
-      const cmds = renderCanonicalMigrationCommands({ colDims: dims ?? null });
-      parts.push(
-        `Two fixes, either works: ` +
-        `[1] self-host the same model — zembed-1 weights are Apache-2.0; keep the zeroentropyai:zembed-1 id and point provider_base_urls.zeroentropyai at a ZE-wire-compatible endpoint (NOT a generic OpenAI-compatible server — the id speaks ZE's /models/embed dialect). Keeps every existing vector, no re-embed (docs/guides/embedding-migration.md). ` +
-        `[2] migrate (resumable; preview cost first): ${cmds.recommendedDryRun}` +
-        (cmds.note ? ` ${cmds.note}` : '') +
-        (cmds.openaiAlternative ? ` Keep-width alternative: ${cmds.openaiAlternative}.` : ''),
-      );
-    }
-    if (onSunsetReranker) {
-      parts.push(
-        `The reranker (${reranker}) is on the same provider; after the shutdown search falls back to unreranked ordering. ` +
-        `Fix: gbrain config set search.reranker.model ${NEW_INSTALL_DEFAULT_RERANKER_MODEL} (needs VOYAGE_API_KEY), or disable: gbrain config set search.reranker.enabled false.`,
-      );
-    }
-    if (onSunsetColumns) {
-      parts.push(
-        `Custom embedding column(s) backed by the shutting-down provider: ${zeColumns.join(', ')}. ` +
-        `No automated off-ramp exists for custom columns yet (migrate embeddings covers the primary column only) — ` +
-        `re-declare them on a new provider and re-embed (skills/migrations/v0.46.3.0.md).`,
-      );
-    }
-    if (onSunsetEmbedding || onSunsetReranker || onSunsetColumns) {
-      parts.push('Accepted the risk? Silence this check: gbrain config set doctor.suppress_provider_sunset true');
-    }
-    // fail = retrieval is ACTUALLY down (past the date AND embedded vectors
-    // exist on the dead provider). Reranker-only exposure stays warn — search
-    // fails open to unreranked ordering (degraded, not down).
-    const failNow = past && onSunsetEmbedding && hasVectors;
-    return { name, status: failNow ? 'fail' : 'warn', message: parts.join(' ') };
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return { name, status: 'warn', message: `Could not check provider sunset status: ${msg}` };
-  }
-}
-
-/**
- * v0.36.0.0 (A5): embedding_width_consistency doctor check.
- *
- * Cross-checks that `config.embedding_dimensions` matches the actual
- * `vector(N)` width on `content_chunks.embedding`. Drift means a width
- * transition was interrupted mid-flight (schema changed but config write
- * crashed, or vice versa). Surfaces the engine-kind-branched recovery recipe
- * from embeddingMismatchMessage — NOT a ze-switch hint; that command is a
- * refusal shim now.
- */
 export async function checkEmbeddingWidthConsistency(engine: BrainEngine): Promise<Check> {
   try {
+    if (loadConfigFileOnly()?.embedding_disabled === true) {
+      return { name: 'embedding_width_consistency', status: 'ok', message: 'Embeddings disabled — no active embedding width to reconcile.' };
+    }
     // v0.37 fix wave (Lane E.1 + CDX-8): read from gateway, not DB. The
     // file plane is canonical post-v0.37; the DB config table is
     // schema-applied metadata. Reading DB here silently skipped the
@@ -529,31 +325,10 @@ export async function checkEmbeddingWidthConsistency(engine: BrainEngine): Promi
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return {
-      name: 'embedding_width_consistency',
-      status: 'warn',
-      message: `Could not check embedding width: ${msg}`,
-    };
+    return checkError('embedding_width_consistency', 'check embedding width', msg);
   }
 }
 
-/**
- * v0.41.15.0 (T6, codex #19/#20) — facts.embedding column drift check.
- *
- * Parallel surface to `checkEmbeddingWidthConsistency` but for the
- * facts table. Migration v40 creates `facts.embedding` from
- * `config.embedding_dimensions` AT MIGRATION TIME — if the user later
- * swaps embedding providers (e.g. OpenAI 1536 → zembed-1 1280) without
- * re-running migrations, the column width drifts. The first insert
- * dies with the opaque pgvector "expected vector(N), got vector(M)"
- * error.
- *
- * Covers BOTH vector(N) AND halfvec(N) shapes (codex #19 — v40 falls
- * back to vector on pgvector < 0.7). Surfaces the paste-ready DROP
- * INDEX → ALTER USING → CREATE INDEX recipe from
- * `buildFactsAlterRecipe` instead of the unsafe REINDEX-only path
- * codex #18 caught in the original plan.
- */
 export async function checkFactsEmbeddingWidthConsistency(engine: BrainEngine): Promise<Check> {
   // PGLite ships a single pgvector version; column + config wire
   // together at initSchema time. No possible drift.
@@ -631,14 +406,9 @@ export async function checkFactsEmbeddingWidthConsistency(engine: BrainEngine): 
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return {
-      name: 'facts_embedding_width_consistency',
-      status: 'warn',
-      message: `Could not check facts.embedding width: ${msg}`,
-    };
+    return checkError('facts_embedding_width_consistency', 'check facts.embedding width', msg);
   }
 }
-
 
 // ---------------------------------------------------------------------------
 // #4222 junk_entity_hubs — near-empty entity pages with huge edge counts
@@ -691,6 +461,9 @@ export async function checkJunkEntityHubs(
       source_id: string | null;
       edges: number;
       chunks: number;
+      connector_page: boolean;
+      source_kind: string | null;
+      canonical_twin_source: string | null;
     }>(
       `WITH edge_counts AS (
          SELECT page_id, COUNT(*)::int AS edges FROM (
@@ -706,9 +479,17 @@ export async function checkJunkEntityHubs(
          FROM content_chunks
          GROUP BY page_id
        )
-       SELECT p.slug, p.source_id, ec.edges, COALESCE(cc.chunks, 0)::int AS chunks
+       SELECT p.slug, p.source_id, ec.edges, COALESCE(cc.chunks, 0)::int AS chunks,
+              (p.frontmatter ->> 'google_contact_id') IS NOT NULL AS connector_page,
+              s.config ->> 'kind' AS source_kind,
+              (SELECT t.source_id FROM pages t LEFT JOIN sources ts ON ts.id = t.source_id
+                WHERE t.slug = p.slug AND t.source_id <> p.source_id AND t.deleted_at IS NULL
+                  AND (t.frontmatter ->> 'google_contact_id') IS NULL
+                  AND COALESCE(ts.config ->> 'kind', '') NOT IN ('google', 'github')
+                ORDER BY (t.source_id = 'default') DESC, t.source_id LIMIT 1) AS canonical_twin_source
        FROM edge_counts ec
        JOIN pages p ON p.id = ec.page_id AND p.deleted_at IS NULL
+       LEFT JOIN sources s ON s.id = p.source_id
        LEFT JOIN chunk_counts cc ON cc.page_id = ec.page_id
        WHERE COALESCE(cc.chunks, 0) <= $2
          AND COALESCE(p.frontmatter ->> 'junk_hub_exempt', 'false') <> 'true'
@@ -725,34 +506,74 @@ export async function checkJunkEntityHubs(
       };
     }
 
-    const list = rows
-      .map(r => `  ${r.slug}${(r.source_id ?? 'default') !== 'default' ? ` [${r.source_id}]` : ''} — ${r.edges} edges, ${r.chunks} chunk(s)`)
-      .join('\n');
-    return {
-      name: 'junk_entity_hubs',
-      status: 'warn',
-      message:
-        `${rows.length} near-empty page(s) with >${edgeThreshold} edges — likely generic-token entities ` +
-        `("Will", "Info") minted by an extractor and inflated by mention auto-links:\n${list}\n` +
+    const line = (r: typeof rows[number]) => `  ${r.slug}${(r.source_id ?? 'default') !== 'default' ? ` [${r.source_id}]` : ''} — ${r.edges} edges, ${r.chunks} chunk(s)`;
+    // #6158: a connector's own contact page (re-rendered by the connector) collects its source's
+    // mention links by design (the own-source twin wins); it is not an extractor-minted entity.
+    const isConnector = (r: typeof rows[number]) => r.connector_page || isConnectorSourceKind(r.source_kind);
+    const hubs = rows.filter(r => !isConnector(r));
+    const twins = rows.filter(isConnector);
+    const parts: string[] = [];
+    if (hubs.length > 0) {
+      parts.push(
+        `${hubs.length} near-empty page(s) with >${edgeThreshold} edges — likely generic-token entities ` +
+        `("Will", "Info") minted by an extractor and inflated by mention auto-links:\n${hubs.map(line).join('\n')}\n` +
         `Review each page and merge/delete deliberately (nothing is auto-deleted). ` +
         `New accretion is already gated: enrichEntity refuses generic single-token mints and ` +
         `buildGazetteer drops single-generic-token person titles. If a page is an intentional thin ` +
-        `hub/index page, opt it out with junk_hub_exempt: true in frontmatter.`,
+        `hub/index page, opt it out with junk_hub_exempt: true in frontmatter.`);
+    }
+    // #6158 / #4845 (W14 P4.5): the remedies are real now. With
+    // link_resolution.cross_source on, the mention pass binds a name in the
+    // connector's source to the canonical twin instead of the stub (the stub
+    // yields; by-mention.ts), and a Google source added with --contacts-dir
+    // keeps its contact pages out of people/ altogether.
+    const crossSource = twins.length > 0 ? await isCrossSourceLinksEnabled(engine) : false;
+    const withTwin = twins.filter(r => r.canonical_twin_source !== null).length;
+    if (twins.length > 0) {
+      parts.push(
+        `${twins.length} connector contact page(s) with >${edgeThreshold} edges:\n${twins.map(line).join('\n')}\n` +
+        `These are not junk: a connector renders each contact as its own page, and mentions in that source link to it ` +
+        `before a page of the same name elsewhere unless link_resolution.cross_source is on. ` +
+        `${withTwin} of them ${withTwin === 1 ? 'has' : 'have'} a canonical twin in another source. ` +
+        (crossSource
+          ? `cross_source is on, so the next mention pass (gbrain extract --stale, or autopilot) re-binds those mentions to the twin; ` +
+            `edges already on the stub move as the pass reaches each page.`
+          : `Run gbrain config set link_resolution.cross_source true, then gbrain extract --stale: mentions in the connector source ` +
+            `bind to the twin from then on. `) +
+        `To keep a Google source's contacts out of people/ entirely, add it with --contacts-dir contacts (g_contacts_dir). ` +
+        `Frontmatter edits do not stick (the connector re-renders the page) and gbrain has no merge command.`);
+    }
+    const verify = { argv: ['gbrain', 'doctor', '--only', 'junk_entity_hubs', '--json'] };
+    const twinFix = twins.length === 0 ? {} : crossSource
+      ? { fix: { argv: ['gbrain', 'extract', '--stale'], consent: [], actor: 'agent' as const, requires_exclusive: false,
+        why: 'Runs the mention pass, which binds names in the connector source to their canonical twin now that cross_source is on.', verify } }
+      : { fix: { argv: ['gbrain', 'config', 'set', 'link_resolution.cross_source', 'true'], consent: [], actor: 'agent' as const, requires_exclusive: false,
+        why: 'Lets a mention resolve to a same-name page in another source; a connector contact stub then yields to its canonical twin on the next mention pass (gbrain extract --stale).',
+        user_message: 'Mentions in your Gmail source bind to the connector\'s own contact stubs instead of your real person pages. Turn on cross-source link resolution so they bind to the real pages?', verify } };
+    return {
+      name: 'junk_entity_hubs',
+      status: 'warn',
+      message: parts.join('\n'),
+      ...twinFix,
       details: {
-        hubs: rows.map(r => ({
+        hubs: hubs.map(r => ({
           slug: r.slug,
           source_id: r.source_id ?? 'default',
           edges: r.edges,
           chunks: r.chunks,
         })),
+        connector_twins: twins.map(r => ({
+          slug: r.slug,
+          source_id: r.source_id ?? 'default',
+          edges: r.edges,
+          chunks: r.chunks,
+          canonical_twin: r.canonical_twin_source ? r.slug : null,
+          canonical_twin_source: r.canonical_twin_source,
+        })),
       },
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return {
-      name: 'junk_entity_hubs',
-      status: 'warn',
-      message: `Could not check for junk entity hubs: ${msg}`,
-    };
+    return checkError('junk_entity_hubs', 'check for junk entity hubs', msg);
   }
 }

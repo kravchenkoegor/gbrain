@@ -9,7 +9,8 @@
  */
 
 import type { Operation } from './contract.ts';
-import { OperationError } from './contract.ts';
+import { opError } from './contract.ts';
+import { hostFix, invalidParam, paramUse } from './op-fix.ts';
 
 // v0.41.18.0 (A7 + T16, codex finding #5): MCP op for federated / thin-client
 // brain installs to drive `gbrain onboard --auto` over MCP. Admin scope
@@ -38,6 +39,8 @@ import { OperationError } from './contract.ts';
 // what they would have gotten with the right grants.
 const run_onboard: Operation = {
   name: 'run_onboard',
+  idempotent: false,
+  outputRedaction: 'no_stored_text',
   description: 'Probe brain health + optionally submit onboard remediations. Admin scope required. Protected handlers (LLM-bearing) require run_protected_onboard scope ADDITIONALLY.',
   params: {
     mode: { type: 'string', description: "'check' (default), 'auto', or 'auto-with-prompt'" },
@@ -77,7 +80,8 @@ const run_onboard: Operation = {
     // 'auto' and 'auto-with-prompt' modes: require --max-usd per A12 + A20
     // safety posture (cron-safety; refuses surprise spend).
     if (maxUsd === undefined) {
-      throw new OperationError('invalid_params', `mode='${mode}' requires max_usd (cron-safety cap)`);
+      throw opError('invalid_params', `mode='${mode}' requires max_usd (cron-safety cap)`,
+        `Pass ${paramUse(ctx, 'max_usd', 1)} (a spend cap in USD) with mode '${mode}', or use mode 'check' for a free plan. Spending needs the user's OK: ask before choosing a cap.`);
     }
 
     // Critical T16 + codex #5 security gate: filter out PROTECTED_JOB_NAMES
@@ -125,18 +129,27 @@ const run_onboard: Operation = {
 // bundled-skill guard). NOT localOnly so admin HTTP MCP clients can invoke.
 const run_skillopt: Operation = {
   name: 'run_skillopt',
-  description: 'Run SkillOpt against a single skill. Admin scope; mutating; rate-limited per-skill via DB lock. See gbrain skillopt CLI for the full flag surface.',
+  idempotent: true,
+  outputRedaction: { exempt: 'skill catalog files are installed instructions read verbatim; redaction would corrupt approved revisions' },
+  description: 'Run SkillOpt against a single skill. Admin scope and remote skill allowlist required. shared_skill stages an exact catalog revision privately and requires explicit skill_editor and put_skill grants; only accepted body changes publish through the original revision CAS. Rate-limited per-skill via DB lock.',
   params: {
     skill_name: { type: 'string', required: true, description: 'Kebab-case skill name (resolves to skills/<name>/SKILL.md)' },
     benchmark_path: { type: 'string', description: 'Absolute path to benchmark JSONL; defaults to skills/<name>/skillopt-benchmark.jsonl' },
     epochs: { type: 'number', description: 'Default 4' },
     batch_size: { type: 'number', description: 'Default 8' },
     lr: { type: 'number', description: 'Default 4' },
-    max_cost_usd: { type: 'number', description: 'Default 5.00' },
+    max_cost_usd: { type: 'number', description: 'Default 5.00 (an unpriced model then warns and runs). When set, an unpriced model is refused with no_pricing. Remote callers must pass a positive value; 0 (uncapped) is host-only.' },
+    reflect_max_tokens: { type: 'number', description: 'Optimizer output cap (positive integer, clamped to 256..32000). Default: skillopt.reflect_max_tokens config, else 32000 for thinking optimizers and 4096 otherwise.' },
     no_mutate: { type: 'boolean', description: 'Write proposed.md without replacing SKILL.md' },
     allow_mutate_bundled: { type: 'boolean', description: 'Required to mutate bundled skills' },
     held_out_path: { type: 'string', description: 'Path to a held-out test set (JSONL). REQUIRED (>=5 rows) to mutate a bundled skill in place — otherwise the run hard-refuses. Remote callers: must resolve within the skills directory.' },
-    dry_run: { type: 'boolean', description: 'Cost preview, no LLM calls' },
+    dry_run: { type: 'boolean', description: 'Preview: models plan, strict verdict and cost estimate, no LLM calls' },
+    shared_skill: { type: 'boolean', description: 'Optimize an exact shared catalog revision in a private proposal workspace and publish the accepted body through put_skill.' },
+    source_id: { type: 'string', description: 'Required with shared_skill: canonical source.' },
+    source_incarnation: { type: 'string', description: 'Required with shared_skill: exact catalog source incarnation.' },
+    pack_id: { type: 'string', description: 'Required with shared_skill: exact catalog pack.' },
+    expected_revision: { type: 'string', description: 'Required with shared_skill: original revision CAS.' },
+    request_id: { type: 'string', description: 'Required with shared_skill: stable publication request UUID.' },
   },
   mutating: true,
   scope: 'admin',
@@ -149,7 +162,7 @@ const run_skillopt: Operation = {
     // every derived path is contained by construction. Applies to all callers.
     const skillNameRaw = (p.skill_name as string) ?? '';
     if (!/^[a-z0-9][a-z0-9-]*$/.test(skillNameRaw)) {
-      throw new OperationError('invalid_params', `run_skillopt: skill_name must be kebab-case (matching ^[a-z0-9][a-z0-9-]*$); got '${skillNameRaw}'`);
+      throw invalidParam(ctx, 'run_skillopt', 'skill_name', 'run_skillopt: skill_name must be kebab-case (matching ^[a-z0-9][a-z0-9-]*$)', { example: 'query' });
     }
     if (ctx.remote !== false) {
       // Remote: enforce per-skill allowlist read from config.
@@ -163,20 +176,49 @@ const run_skillopt: Operation = {
       } catch { /* fall through to deny */ }
       const skillName = (p.skill_name as string) ?? '';
       if (!allowed.includes(skillName)) {
-        throw new OperationError('permission_denied', `run_skillopt: skill '${skillName}' is not in skillopt.allowed_skills allowlist (default deny-all for remote callers)`);
+        throw opError('permission_denied', `run_skillopt: skill '${skillName}' is not in skillopt.allowed_skills allowlist (default deny-all for remote callers)`,
+          `Remote callers can optimize only skills the brain host's operator allow-lists (skillopt.allowed_skills, deny-all by default); ask them to add '${skillName}', or have the host run the optimizer itself.`,
+          { fix: hostFix(ctx, ['gbrain', 'skillopt', skillName], 'Runs the optimizer on the brain host, where no remote allowlist applies.', { consent: ['paid'] }) });
       }
+    }
+    const maxCostUsd = p.max_cost_usd;
+    if (ctx.remote !== false && maxCostUsd !== undefined && !(typeof maxCostUsd === 'number' && Number.isFinite(maxCostUsd) && maxCostUsd > 0)) {
+      throw invalidParam(ctx, 'run_skillopt', 'max_cost_usd',
+        'run_skillopt: max_cost_usd must be a positive number of USD for remote callers; 0 (uncapped) is a host-only setting',
+        { example: 5 });
+    }
+    const { clampRemoteReflectMaxTokens } = await import('../skillopt/output-cap.ts');
+    let reflectMaxTokens: number | undefined;
+    try {
+      reflectMaxTokens = clampRemoteReflectMaxTokens(p.reflect_max_tokens);
+    } catch (err) {
+      throw opError('invalid_params', `run_skillopt: ${err instanceof Error ? err.message : String(err)}`,
+        'Lower reflect_max_tokens to the stated cap, or omit it to use the default.');
     }
     const { runSkillOpt } = await import('../skillopt/orchestrator.ts');
     const { autoDetectSkillsDirReadOnly } = await import('../repo-root.ts');
-    const { resolveModel } = await import('../model-config.ts');
-    const detected = autoDetectSkillsDirReadOnly(process.cwd());
-    const skillsDir = detected.dir;
-    if (!skillsDir) {
-      throw new OperationError('config_error', 'run_skillopt: skills directory not found');
+    const { resolveSkillOptModels, skillOptModelOpts } = await import('../skillopt/models-plan.ts');
+    let sharedSkill: import('../skillopt/types.ts').SkillOptOpts['sharedSkill'];
+    if (p.shared_skill === true) {
+      for (const field of ['source_id', 'source_incarnation', 'pack_id', 'expected_revision', 'request_id']) {
+        if (typeof p[field] !== 'string' || !p[field]) {
+          throw opError('invalid_params', `shared_skill requires ${field}.`,
+            `With shared_skill: true pass source_id, source_incarnation, pack_id and expected_revision from get_skill, and a fresh request_id (UUID); ${field} is missing.`);
+        }
+      }
+      const { assertSkillCapability } = await import('../shared-skills/policy.ts');
+      assertSkillCapability(ctx, 'skill_editor', 'put_skill');
+      sharedSkill = { source_id: p.source_id as string, source_incarnation: p.source_incarnation as string, pack_id: p.pack_id as string,
+        expected_revision: p.expected_revision as string, request_id: p.request_id as string };
     }
-    const optimizerModel = await resolveModel(ctx.engine, { tier: 'deep', fallback: 'anthropic:claude-opus-4-7' });
-    const targetModel = await resolveModel(ctx.engine, { tier: 'subagent', fallback: 'anthropic:claude-sonnet-4-6' });
-    const judgeModel = await resolveModel(ctx.engine, { tier: 'reasoning', fallback: 'anthropic:claude-sonnet-4-6' });
+    const skillsDir = sharedSkill
+      ? await (await import('../shared-skills/optimizer.ts')).sharedOptimizerSkillsDir(ctx, sharedSkill.source_id, sharedSkill.source_incarnation)
+      : autoDetectSkillsDirReadOnly(process.cwd()).dir;
+    if (!skillsDir) {
+      throw opError('config_error', 'run_skillopt: skills directory not found',
+        'The brain host has no skills directory to optimize. Run `gbrain doctor --json` on the host; it reports where gbrain looks for skills.');
+    }
+    const models = await resolveSkillOptModels(ctx.engine);
     const skillName = p.skill_name as string;
     const benchmarkPath = (p.benchmark_path as string) ??
       `${skillsDir}/${skillName}/skillopt-benchmark.jsonl`;
@@ -185,7 +227,7 @@ const run_skillopt: Operation = {
     // arbitrary host files (loadBenchmark → fs.readFileSync would otherwise be an
     // arbitrary-read + existence oracle). Confine any caller-supplied path to the
     // skills directory. Local CLI callers (ctx.remote === false) are unconfined.
-    if (ctx.remote !== false) {
+    if (ctx.remote !== false && !sharedSkill) {
       const nodePath = await import('node:path');
       const nodeFs = await import('node:fs');
       const rootReal = (() => {
@@ -205,7 +247,8 @@ const run_skillopt: Operation = {
           catch { /* parent also missing; fall back to resolved form */ }
         }
         if (real !== rootReal && !real.startsWith(rootReal + nodePath.sep)) {
-          throw new OperationError('permission_denied', `run_skillopt: ${label} must resolve within the skills directory for remote callers`);
+          throw opError('permission_denied', `run_skillopt: ${label} must resolve within the skills directory for remote callers`,
+            `Omit ${label} to use the skill's default benchmark, or pass a path inside the skills directory.`);
         }
       };
       confine('benchmark_path', p.benchmark_path as string | undefined);
@@ -213,6 +256,8 @@ const run_skillopt: Operation = {
     }
     const result = await runSkillOpt({
       engine: ctx.engine,
+      operationContext: ctx,
+      ...(sharedSkill ? { sharedSkill } : {}),
       skillName,
       skillsDir,
       benchmarkPath,
@@ -221,9 +266,8 @@ const run_skillopt: Operation = {
       lr: (p.lr as number) ?? 4,
       lrSchedule: 'cosine',
       split: [4, 1, 5],
-      optimizerModel,
-      targetModel,
-      judgeModel,
+      ...skillOptModelOpts(models),
+      ...(reflectMaxTokens !== undefined ? { reflectMaxTokens } : {}),
       mode: 'patch',
       dryRun: (p.dry_run as boolean) === true,
       noMutate: (p.no_mutate as boolean) === true,
@@ -231,7 +275,8 @@ const run_skillopt: Operation = {
       bootstrapReviewed: false,
       ...(heldOutPath ? { heldOutPath } : {}),
       json: true,
-      maxCostUsd: (p.max_cost_usd as number) ?? 5.0,
+      maxCostUsd: (maxCostUsd as number | undefined) ?? 5.0,
+      maxCostSource: maxCostUsd === undefined ? 'default' : 'user',
       maxRuntimeMin: 30,
       force: false,
     });
@@ -240,6 +285,7 @@ const run_skillopt: Operation = {
       receipt: result.receipt,
       mutated_skill_file: result.mutatedSkillFile,
       proposed_path: result.proposedPath,
+      ...(result.sharedOptimization ? { shared_optimization: result.sharedOptimization } : {}),
     };
   },
 };

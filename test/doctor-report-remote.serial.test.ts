@@ -8,7 +8,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -216,5 +216,64 @@ describe('doctorReportRemote — source scope (#4592)', () => {
     const scopedBacklog = scoped.checks.find(c => c.name === 'extract_atoms_backlog')!;
     expect(Number((scopedBacklog.details as { backlog: number }).backlog)).toBe(0);
     expect(JSON.stringify(scoped)).not.toContain(SRCB);
+  });
+});
+
+describe('doctorReportRemote — managed drift advice (#5477)', () => {
+  test('a managed brain is told --no-pull without --include-gitignored; unmanaged wording is unchanged', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-doctor-drift-'));
+    const sourceId = 'doctor-drift-advice-test';
+    try {
+      mkdirSync(join(root, 'notes'), { recursive: true });
+      writeFileSync(join(root, 'notes', 'misrouted.md'), '# Misrouted\n');
+      await engine.executeRaw('INSERT INTO sources (id, name, local_path) VALUES ($1, $1, $2) ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path', [sourceId, root]);
+      await engine.putPage('notes/misrouted', { title: 'Misrouted', type: 'note', compiled_truth: '# Misrouted\n' });
+      const drift = async () => (await doctorReportRemote(engine)).checks.find(c => c.name === 'multi_source_drift')!;
+
+      const unmanaged = await drift();
+      expect(unmanaged.message).toBe(
+        "1 page slug(s) appear at 'default' but NOT at the intended source " +
+        '(e.g., notes/misrouted (intended=doctor-drift-advice-test)). Likely pre-v0.30.3 misroutes OR an incomplete initial sync. ' +
+        'Verify on the brain host: `gbrain sources status` then `gbrain sync --source <id> --full`.',
+      );
+
+      await engine.executeRaw('UPDATE persistence_brain SET enabled = true WHERE singleton = 1');
+      const managed = await drift();
+      expect(managed.message).toContain('then `gbrain sync --source <id> --no-pull --full`.');
+      expect(managed.message).not.toContain('--include-gitignored');
+    } finally {
+      await engine.executeRaw('UPDATE persistence_brain SET enabled = false WHERE singleton = 1');
+      await engine.executeRaw("DELETE FROM pages WHERE slug = 'notes/misrouted' AND source_id = 'default'");
+      await engine.executeRaw('DELETE FROM sources WHERE id = $1', [sourceId]);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('run_doctor canonical projection readiness', () => {
+  test('the real handler excludes private and ungranted pending pages while local callers can diagnose them', async () => {
+    await engine.executeRaw("INSERT INTO sources(id,name) VALUES ('readiness-visible','readiness-visible'),('readiness-hidden','readiness-hidden') ON CONFLICT DO NOTHING");
+    await engine.putPage('notes/current-example', { title: 'Example', type: 'note', compiled_truth: 'current' }, { sourceId: 'readiness-visible' });
+    await engine.putPage('notes/private-example', { title: 'Private example', type: 'note', compiled_truth: 'private', frontmatter: { visibility: 'private' } }, { sourceId: 'readiness-hidden' });
+    await engine.executeRaw("UPDATE pages SET text_projection_revision=knowledge_revision WHERE source_id='readiness-visible'");
+    const ctx = {
+      engine, remote: true, sourceId: 'readiness-hidden',
+      auth: { allowedSources: ['readiness-visible', 'readiness-hidden'] },
+    } as unknown as OperationContext;
+    const check = (report: DoctorReport) => report.checks.find(c => c.name === 'text_projection_readiness')!;
+    const remote = check(await operationsByName.run_doctor.handler(ctx, {}) as DoctorReport);
+    expect(remote.status).toBe('ok');
+    expect(remote.details).toEqual({ readiness: 'ready', ready: true });
+    const local = check(await operationsByName.run_doctor.handler({ ...ctx, remote: false }, {}) as DoctorReport);
+    expect(local.status).toBe('warn');
+    expect(local.details).toEqual({ readiness: 'projection_pending', ready: false });
+    const restricted = check(await operationsByName.run_doctor.handler({ ...ctx, auth: { ...ctx.auth!, allowedSources: ['readiness-visible'] } }, {}) as DoctorReport);
+    expect(restricted.status).toBe('ok');
+    expect(JSON.stringify(restricted)).not.toContain('readiness-hidden');
+    expect(JSON.stringify(local)).not.toContain('notes/private-example');
+    await engine.executeRaw("UPDATE pages SET text_projection_revision=NULL WHERE source_id='readiness-visible'");
+    const pending = check(await operationsByName.run_doctor.handler(ctx, {}) as DoctorReport);
+    expect(pending.status).toBe('warn');
+    expect(pending.details).toEqual({ readiness: 'projection_pending', ready: false });
   });
 });

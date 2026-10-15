@@ -20,10 +20,12 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { errorFor, serializeError } from '../core/errors.ts';
 import { resolveCodeReadiness, readinessHint } from '../core/code-graph-readiness.ts';
-import { resolveCliCodeScope, positionalArgs, parseFlag, pushSourcePredicate } from './code-scope.ts';
+import { resolveCliCodeScope, positionalArgs, parseFlag } from './code-scope.ts';
+import { codeReadFilter, type CodeReadScope } from '../core/code-intel/read-scope.ts';
 
 export interface CodeDefResult {
   slug: string;
+  source_id: string;
   file: string | null;
   language: string | null;
   symbol_type: string | null;
@@ -38,13 +40,14 @@ export interface CodeDefResult {
 // small-sibling merging). Re-exported here so existing importers keep their
 // surface.
 import { DEF_TYPES } from '../core/chunkers/def-types.ts';
+import { legacyNestedErrorDocument } from '../core/agent-output.ts';
 
 export { DEF_TYPES };
 
 export async function findCodeDef(
   engine: BrainEngine,
   symbol: string,
-  opts: { limit?: number; language?: string; sourceId?: string; allSources?: boolean } = {},
+  opts: { limit?: number; language?: string } & CodeReadScope = {},
 ): Promise<CodeDefResult[]> {
   const limit = opts.limit ?? 20;
   // Placeholders are numbered as params are appended: a fixed $2 broke the
@@ -55,16 +58,16 @@ export async function findCodeDef(
     params.push(opts.language);
     whereLang = `AND cc.language = $${params.length}`;
   }
-  const whereSource = pushSourcePredicate(params, opts);
+  const whereSource = `AND ${codeReadFilter(params, opts)}`;
   params.push(limit);
   // Deterministic ordering: exact type matches first (functions before
   // export_statement wrappers), then page slug, then line number.
   const rows = await engine.executeRaw<{
-    slug: string; file: string | null; language: string | null;
+    slug: string; source_id: string; file: string | null; language: string | null;
     symbol_type: string | null; start_line: number | null; end_line: number | null;
     chunk_text: string;
   }>(
-    `SELECT p.slug, (p.frontmatter->>'file') AS file, cc.language, cc.symbol_type,
+    `SELECT p.slug, p.source_id, (p.frontmatter->>'file') AS file, cc.language, cc.symbol_type,
             cc.start_line, cc.end_line, cc.chunk_text
      FROM content_chunks cc
      JOIN pages p ON p.id = cc.page_id
@@ -79,12 +82,13 @@ export async function findCodeDef(
          WHEN 'type' THEN 4 WHEN 'enum' THEN 5 WHEN 'struct' THEN 6
          ELSE 7
        END,
-       p.slug, cc.start_line
+       p.slug, cc.start_line, p.source_id
      LIMIT $${params.length}`,
     params,
   );
   return rows.map((r) => ({
     slug: r.slug,
+    source_id: r.source_id,
     file: r.file,
     language: r.language,
     symbol_type: r.symbol_type,
@@ -106,7 +110,7 @@ export async function findCodeDef(
 export async function probeFilteredSymbolTypes(
   engine: BrainEngine,
   symbol: string,
-  opts: { language?: string; sourceId?: string; allSources?: boolean } = {},
+  opts: { language?: string } & CodeReadScope = {},
 ): Promise<string[]> {
   const params: unknown[] = [symbol];
   let whereLang = '';
@@ -116,7 +120,7 @@ export async function probeFilteredSymbolTypes(
   }
   // Scoped with the main lookup: an unscoped probe would claim "the symbol IS
   // indexed, just filtered" on the strength of a different repo's chunks.
-  const whereSource = pushSourcePredicate(params, opts);
+  const whereSource = `AND ${codeReadFilter(params, opts)}`;
   const rows = await engine.executeRaw<{ symbol_type: string | null }>(
     `SELECT DISTINCT cc.symbol_type
      FROM content_chunks cc
@@ -153,7 +157,7 @@ export async function runCodeDef(engine: BrainEngine, args: string[]): Promise<v
       hint: 'gbrain code-def <symbol> [--source S | --all-sources] [--lang <language>] [--json]',
     });
     if (shouldEmitJson(args)) {
-      console.log(JSON.stringify({ error: err.envelope }));
+      console.log(JSON.stringify(legacyNestedErrorDocument(err.envelope, ['gbrain', 'code-def', '--help'])));
     } else {
       console.error(err.message);
     }
@@ -178,6 +182,7 @@ export async function runCodeDef(engine: BrainEngine, args: string[]): Promise<v
     const readiness = await resolveCodeReadiness(engine, {
       kind: 'symbol', count: results.length, sourceId, allSources, remote: false,
     });
+    const readinessMessage = readinessHint(readiness);
     // #3789: a count:0 that was filtered by the DEF_TYPES allowlist must not
     // read as a bare ready:true / "symbol does not exist". Probe the distinct
     // symbol types the name DOES have and surface the filtered ones.
@@ -202,20 +207,19 @@ export async function runCodeDef(engine: BrainEngine, args: string[]): Promise<v
         count: results.length,
         status: readiness.status,
         ready: readiness.ready,
+        ...(readinessMessage || filteredHint ? { hint: [readinessMessage, filteredHint].filter(Boolean).join(' ') } : {}),
         ...(readiness.scoped_source_id ? { scoped_source_id: readiness.scoped_source_id } : {}),
         ...(filteredTypes.length > 0
-          ? { filtered_symbol_types: filteredTypes, hint: filteredHint }
+          ? { filtered_symbol_types: filteredTypes }
           : {}),
         results,
       }, null, 2));
     } else {
       if (results.length === 0) {
         console.log(!allSources && sourceId
-          ? `No definitions found for "${sym}" in source '${sourceId}'. Try --all-sources to search every source.`
+          ? `No definitions found for "${sym}" in source '${sourceId}'.${!['projection_pending', 'unknown'].includes(readiness.status) ? ' Try --all-sources to search every source.' : ''}`
           : `No definitions found for "${sym}"`);
         if (filteredHint) console.log(filteredHint);
-        const hint = readinessHint(readiness);
-        if (hint) console.log(hint);
       } else {
         console.log(`Found ${results.length} definition(s) for "${sym}":`);
         for (const r of results) {
@@ -223,6 +227,7 @@ export async function runCodeDef(engine: BrainEngine, args: string[]): Promise<v
           console.log(`  ${r.file || r.slug}${loc}  (${r.symbol_type})`);
         }
       }
+      if (readinessMessage) console.log(readinessMessage);
     }
   } catch (e: unknown) {
     const env = serializeError(e);

@@ -8,17 +8,19 @@ interface ConsentRequest {
   allowedOperations: string[] | null; boundSlugPrefixes: string[] | null;
   delegatedTools: string[] | null; delegatedSlugPrefixes: string[] | null; delegatedNamespace: string | null;
   resource: string | null; expiresAt: number; csrf: string;
+  sourceChoice: { editable: boolean; options: Array<{ id: string; name: string }> };
 }
 
 export function OAuthConsentPage() {
   const [request, setRequest] = useState<ConsentRequest>();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [sourceId, setSourceId] = useState('');
   useEffect(() => {
     let active = true;
     const id = pendingOAuthRequest();
     if (!id) { setError('No pending authorization request. Restart the connection from your client.'); return; }
-    api.oauthRequest(id).then(value => { if (active) setRequest(value); })
+    api.oauthRequest(id).then((value: ConsentRequest) => { if (active) { setRequest(value); setSourceId(value.sourceId ?? ''); } })
       .catch(err => { if (active) setError(err.message); });
     return () => { active = false; };
   }, []);
@@ -27,7 +29,8 @@ export function OAuthConsentPage() {
     setBusy(true);
     setError('');
     try {
-      const result = await api.decideOAuthRequest(request.id, decision, request.csrf);
+      const chosen = decision === 'approve' && request.sourceChoice.editable && sourceId !== request.sourceId ? sourceId : undefined;
+      const result = await api.decideOAuthRequest(request.id, decision, request.csrf, chosen);
       clearOAuthRequest();
       window.location.assign(result.redirectUrl);
     } catch (err) {
@@ -47,15 +50,26 @@ export function OAuthConsentPage() {
         <dt>Client ID</dt><dd><code>{request.clientId}</code></dd>
         <dt>Redirect destination</dt><dd><code>{request.redirectUri}</code></dd>
         <dt>Permissions</dt><dd>{request.scopes.length ? request.scopes.map(scope => <span key={scope} className={`badge ${scope.includes('admin') ? 'badge-error' : ''}`} style={{ marginRight: 8 }}>{scope}</span>) : 'No permissions'}</dd>
-        <dt>Administrative access</dt><dd>{request.scopes.some(scope => scope === 'admin') ? 'Administration within the allowed operations shown below.' : request.scopes.some(scope => scope.endsWith('_admin')) ? 'Administrative capabilities are included in the permissions above.' : 'None'}</dd>
+        <dt>Administrative brain operations</dt><dd>{request.scopes.some(scope => scope === 'admin') ? 'Eligible operations within the grant below. This does not grant owner dashboard access.' : request.scopes.some(scope => scope.endsWith('_admin')) ? 'The named administrative brain operations. This does not grant owner dashboard access.' : 'None'}</dd>
         <dt>Allowed operations</dt><dd>{request.allowedOperations === null ? 'All operations permitted by these scopes and the server policy' : request.allowedOperations.join(', ') || 'None'}</dd>
         <dt>Write paths</dt><dd>{request.boundSlugPrefixes === null ? 'Within the granted source' : request.boundSlugPrefixes.join(', ') || 'None'}</dd>
         {request.scopes.includes('agent') && <>
           <dt>Delegated tools</dt><dd>{request.delegatedTools?.join(', ') || 'None'}</dd>
           <dt>Delegated write paths</dt><dd>{request.delegatedNamespace === 'job' ? 'A separate namespace for each job' : request.delegatedSlugPrefixes?.join(', ') || 'None'}</dd>
         </>}
-        <dt>Write source</dt><dd>{request.sourceId ?? 'Not configured'}</dd>
-        <dt>Read sources</dt><dd>{request.allowedSources.length ? request.allowedSources.join(', ') : request.sourceId ?? 'Not configured'}</dd>
+        {request.sourceChoice.editable ? <>
+          <dt><label htmlFor="consent-source">Write source</label></dt>
+          <dd>
+            <select id="consent-source" value={sourceId} disabled={busy} onChange={event => setSourceId(event.target.value)}>
+              {request.sourceChoice.options.map(option => <option key={option.id} value={option.id}>{option.name === option.id ? option.id : `${option.name} (${option.id})`}</option>)}
+            </select>
+            <div style={{ color: 'var(--text-secondary)', marginTop: 4 }}>This client reads and writes only this source. Change it later on the Agents page or with <code>gbrain auth rescope --client</code>.</div>
+          </dd>
+          <dt>Read sources</dt><dd>{sourceId}</dd>
+        </> : <>
+          <dt>Write source</dt><dd>{request.sourceId ?? 'Not configured'}</dd>
+          <dt>Read sources</dt><dd>{request.allowedSources.length ? request.allowedSources.join(', ') : request.sourceId ?? 'Not configured'}</dd>
+        </>}
         <dt>Resource</dt><dd><code>{request.resource ?? 'No resource binding requested'}</code></dd>
         <dt>Request expires</dt><dd>{new Date(request.expiresAt).toLocaleTimeString()}</dd>
       </dl>

@@ -247,6 +247,12 @@ export interface HarnessTarget {
   entry?: string;
   /** Hook marker value (hooks targets). */
   marker?: string;
+  /** Absolute gbrain launcher rendered into the hook commands (hooks targets;
+   * absent on receipts written before it was recorded). */
+  launcher?: string;
+  /** Seat label rendered into the hook commands, '' for none (hooks targets;
+   * absent on older receipts). */
+  seat?: string;
   /** Write mechanism note, e.g. 'toml-block' vs 'claude-cli'. */
   mechanism?: string;
   /** One-line failure reason when state === 'failed'. */
@@ -268,6 +274,18 @@ export interface HarnessReceipt {
    * which source it resolves, the --token lane proceeded unpinned and `source_id`
    * records the federated floor `default`). Absent = pinned to `source_id`. */
   source_pinned?: false;
+  skills_policy?: 'follow' | 'memory-only';
+  harness_tokens?: Partial<Record<HarnessTarget['host'], { id?: string; minted: boolean; name: string }>>;
+  shared_skills?: Array<{
+    host: HarnessTarget['host'];
+    root: string;
+    name: string;
+    url: string;
+    token_id?: string;
+    status: string;
+    reason?: string;
+    retained_files?: string[];
+  }>;
   token: {
     name: string;
     /** Row id — the only safe revocation key. */
@@ -309,7 +327,15 @@ export function readHarnessReceiptState(gbrainHomeDir: string): HarnessReceiptRe
         typeof parsed.token === 'object' &&
         parsed.token !== null &&
         typeof parsed.token.name === 'string' &&
-        typeof parsed.url === 'string';
+        typeof parsed.url === 'string' &&
+        (parsed.skills_policy === undefined || parsed.skills_policy === 'follow' || parsed.skills_policy === 'memory-only') &&
+        (parsed.harness_tokens === undefined || (parsed.harness_tokens !== null && typeof parsed.harness_tokens === 'object' &&
+          !Array.isArray(parsed.harness_tokens) && Object.entries(parsed.harness_tokens).every(([host, token]) =>
+            ['claude-code', 'codex', 'opencode'].includes(host) && token && typeof token.name === 'string' &&
+            typeof token.minted === 'boolean' && (token.id === undefined || typeof token.id === 'string')))) &&
+        (parsed.shared_skills === undefined || (Array.isArray(parsed.shared_skills) && parsed.shared_skills.every(entry =>
+          entry && ['claude-code', 'codex', 'opencode'].includes(entry.host) && typeof entry.root === 'string' &&
+          typeof entry.url === 'string' && typeof entry.name === 'string' && typeof entry.status === 'string')));
       return shapeOk ? { state: 'ok', receipt: parsed } : { state: 'invalid' };
     }
     if (typeof parsed.harness_receipt_version === 'number' && parsed.harness_receipt_version > 1) {

@@ -105,6 +105,7 @@ const MATRIX: Row[] = [
   { name: 'entity', mode: 'skip', reason: 'MEMORY_VERBS conformance suite owns it; LLM-shaped output' },
   { name: 'synthesize', mode: 'skip', reason: 'LLM-dependent; keyless envs cannot run it — verbs conformance owns the error path' },
   { name: 'think', mode: 'skip', reason: 'LLM-dependent; think-source-isolation-pglite e2e owns its scoping' },
+  { name: 'list_write_conflicts', mode: 'skip', reason: 'needs source_changed conflict receipts from a bound canonical checkout; test/maintenance-file-drift-6643.test.ts owns its out-of-grant refusal, source-scoped window and slug-fence filtering' },
   { name: 'search_by_image', mode: 'skip', reason: 'needs image-embedding infra; cross-modal suites own it' },
   { name: 'volunteer_context', mode: 'skip', reason: 'session/reflex machinery; volunteer-context suites own scoping' },
   { name: 'context_pack', mode: 'skip', reason: 'verbs conformance owns it; budget-packed composite of scoped reads' },
@@ -112,14 +113,21 @@ const MATRIX: Row[] = [
   { name: 'find_trajectory', mode: 'skip', reason: 'typed-claim/event rows come from the extraction pipeline; eval-trajectory + facts suites own it (probe: hand-seeded claim rows do not surface)' },
   { name: 'ontology_conflicts', mode: 'skip', reason: 'conflict rows need the ontology merge pipeline cross-observation shape; D7 ontology-merge parity suite owns conflicts' },
   { name: 'get_skill', mode: 'skip', reason: 'skills catalog + brain-resident packs; skill-catalog confinement suites own it' },
+  { name: 'get_skill_asset', mode: 'skip', reason: 'Exact-revision approved asset isolation is exercised over real authenticated HTTP in test/shared-skills-transports.test.ts and test/e2e/shared-skills-transports.test.ts.' },
+  { name: 'join_brain', mode: 'skip', reason: 'Own-principal source/policy-bound enrollment requires an explicit member grant; test/shared-skills-membership.test.ts and real shared-skills transport suites prove isolation.' },
+  { name: 'sync_brain_skills', mode: 'skip', reason: 'Issued delivery batches and narrowed grants are tested against real PGLite/Postgres in test/shared-skills-membership.test.ts and the authenticated shared-skills transport suites.' },
+  { name: 'leave_brain', mode: 'skip', reason: 'Principal-bound leave/epoch races and foreign installation denial are tested in test/shared-skills-membership.test.ts.' },
   { name: 'list_brain_skillpack', mode: 'skip', reason: 'brain-resident skillpack surface; skillpack suites own it' },
   { name: 'advisor', mode: 'skip', reason: 'aggregate advisory over full stack; advisor suites own it' },
+  { name: 'questions_list', mode: 'skip', reason: 'owner-private (C4): a caller that cannot read private pages is refused question_owner_only; test/helpers/pinned-questions-scenarios.ts owns source confinement and the leakage matrix' },
+  { name: 'questions_status', mode: 'skip', reason: 'owner-private (C4): refused question_owner_only for restricted grants; ids outside the read scope answer question_not_found (test/helpers/pinned-questions-scenarios.ts)' },
   { name: 'open_loops', mode: 'skip', reason: 'loop rows need the Gmail detector pipeline; test/ops-loops.test.ts owns its remote posture (no-scope denial, grant confinement, redacted evidence)' },
   { name: 'list_skills', mode: 'skip', reason: 'bundled skills catalog from the install tree; skills suites own it (throws outside an installed skills dir)' },
 
   // Deliberately brain-wide (config / registry / identity — not source data).
   { name: 'search_modes', mode: 'brainwide', args: {}, rationale: 'reports search config knobs, no page data' },
   { name: 'get_brain_identity', mode: 'brainwide', args: {}, rationale: 'brain-level identity document by design' },
+  { name: 'get_brain_health', mode: 'skip', reason: 'returns count bands with no slug or source identity, so the beta-marker scan here would pass vacuously; test/doctor-ops-remote-6696.test.ts seeds per-source write failures and pins the handler to the scalar and federated grant' },
   { name: 'whoami', mode: 'brainwide', args: {}, rationale: 'caller identity/transport echo, no page data' },
   { name: 'sources_list', mode: 'brainwide', args: {}, rationale: 'listing sources is its purpose; exposes ids/names only' },
   { name: 'request_tools', mode: 'brainwide', args: { tools: ['get_page'] }, rationale: 'tool registry surface, no page data' },
@@ -147,6 +155,7 @@ const MATRIX: Row[] = [
   { name: 'list_pages', mode: 'isolated', args: { limit: 100 } },
   { name: 'search', mode: 'isolated', args: { query: 'BETAMARKER', limit: 20 } },
   { name: 'query', mode: 'isolated', args: { query: 'BETAMARKER', limit: 20 } },
+  { name: 'assemble_evidence', mode: 'isolated', args: { hits: [{ source_id: 'srcbeta', slug: 'notes/beta-note', chunk_id: 0 }], return_unit: 'page' } },
   { name: 'get_tags', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'get_links', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'get_backlinks', mode: 'isolated', args: { slug: 'people/beta-person' } },
@@ -158,6 +167,7 @@ const MATRIX: Row[] = [
   { name: 'get_chunks', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'get_ingest_log', mode: 'isolated', args: { limit: 50 } },
   { name: 'find_orphans', mode: 'isolated', args: {} },
+  { name: 'wanted_pages', mode: 'isolated', args: {} },
   { name: 'takes_list', mode: 'isolated', args: { limit: 50 } },
   { name: 'takes_search', mode: 'isolated', args: { query: 'BETAMARKER', limit: 20 } },
   { name: 'get_recent_salience', mode: 'isolated', args: { limit: 50 } },
@@ -246,6 +256,10 @@ beforeAll(async () => {
     await engine.addTag(`notes/${name}-note`, `${name}-topic`, { sourceId: src });
     await engine.addTag(`people/${name}-person`, `${name}-topic`, { sourceId: src });
     await engine.addLink(`notes/${name}-note`, `people/${name}-person`, `${MARK} ctx`, 'mentions', 'markdown', undefined, undefined, { fromSourceId: src, toSourceId: src });
+    // Wanted page: an unresolved link from the note to a missing marker-named target.
+    await engine.executeRaw(`INSERT INTO wanted_links (origin_page_id, source_id, producer, ref_kind, target_source_id, target_ref, checked_at)
+      SELECT id, $1, 'body', 'slug', $1, $2, now() FROM pages WHERE slug = $3 AND source_id = $1`,
+    [src, `people/${name}-missing-${MARK.toLowerCase()}`, `notes/${name}-note`]);
     await engine.createVersion(`notes/${name}-note`, { sourceId: src });
     await engine.putRawData(`notes/${name}-note`, 'crm', { owner: MARK }, { sourceId: src });
     await engine.logIngest({

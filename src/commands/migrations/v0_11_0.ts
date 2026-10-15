@@ -24,7 +24,11 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, lst
 import { join, resolve, dirname } from 'path';
 import { execSync } from 'child_process';
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
+import { gbrainChildCommand } from './in-process.ts';
+import { releaseRunEngine } from './run-engine.ts';
+import { cliChildStdio } from '../../core/cli-force-exit.ts';
 import { savePreferences, loadPreferences } from '../../core/preferences.ts';
+import { loadConfig, configPath, gbrainPath } from '../../core/config.ts';
 // Bug 3 — appendCompletedMigration moved to the runner (apply-migrations.ts).
 import { promptLine } from '../../core/cli-util.ts';
 import { VERSION } from '../../version.ts';
@@ -34,9 +38,10 @@ const AGENTS_MD_MARKER = '<!-- gbrain:subagent-routing v0.11.0 -->';
 const CRON_MIGRATED_PROPERTY = '_gbrain_migrated_by';
 const MAX_HOST_FILE_BYTES = 1_000_000;
 
+// home() locates host-agent config ($HOME/.claude, $HOME/.openclaw); gbrain's
+// own state follows GBRAIN_HOME via gbrainPath() (#5549).
 function home(): string { return process.env.HOME || ''; }
-function gbrainDir(): string { return join(home(), '.gbrain'); }
-function pendingHostWorkPath(): string { return join(gbrainDir(), 'migrations', 'pending-host-work.jsonl'); }
+function pendingHostWorkPath(): string { return gbrainPath('migrations', 'pending-host-work.jsonl'); }
 
 export interface PendingHostWorkEntry {
   type: 'cron-handler-needs-host-registration' | 'agents-md-dispatcher-needs-host-review';
@@ -82,7 +87,7 @@ async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseRe
 function phaseBSmoke(opts: OrchestratorOpts): OrchestratorPhaseResult {
   if (opts.dryRun) return { name: 'smoke', status: 'skipped', detail: 'dry-run' };
   try {
-    execSync('gbrain jobs smoke', { stdio: 'inherit', timeout: 30_000, env: process.env });
+    execSync(gbrainChildCommand('gbrain jobs smoke'), { stdio: cliChildStdio(), timeout: 30_000, env: process.env });
     return { name: 'smoke', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -231,6 +236,12 @@ function findCronManifests(opts: OrchestratorOpts): string[] {
   return found;
 }
 
+/** Host files Phase E would edit (an AGENTS.md marker, cron manifests); `gbrain setup` leaves this migration to the explicit command when any exist. */
+export function hostRewriteTargets(): string[] {
+  const opts = {} as OrchestratorOpts;
+  return [...findAgentsMdFiles(opts), ...findCronManifests(opts)];
+}
+
 function rewriteCronManifest(
   path: string,
   opts: OrchestratorOpts,
@@ -258,7 +269,7 @@ function rewriteCronManifest(
   // We load config lazily to avoid a hard dep.
   let enginePglite = false;
   try {
-    const cfg = JSON.parse(readFileSync(join(gbrainDir(), 'config.json'), 'utf-8'));
+    const cfg = JSON.parse(readFileSync(configPath(), 'utf-8'));
     enginePglite = cfg?.engine === 'pglite';
   } catch { /* best-effort */ }
 
@@ -403,11 +414,12 @@ function phaseFInstall(opts: OrchestratorOpts): OrchestratorPhaseResult {
   if (opts.dryRun) return { name: 'install', status: 'skipped', detail: 'dry-run' };
   if (opts.noAutopilotInstall) return { name: 'install', status: 'skipped', detail: '--no-autopilot-install' };
   try {
-    execSync('gbrain autopilot --install --yes', { stdio: 'inherit', timeout: 60_000, env: process.env });
+    if (loadConfig()?.engine === 'pglite') {
+      return { name: 'install', status: 'skipped', detail: 'PGLite is single-writer; use gbrain serve for background maintenance' };
+    }
+    execSync(gbrainChildCommand('gbrain autopilot --install --yes'), { stdio: cliChildStdio(), timeout: 60_000, env: process.env });
     return { name: 'install', status: 'complete' };
   } catch (e) {
-    // Install is best-effort — log but don't fail the whole migration. User
-    // can re-run `gbrain autopilot --install` manually.
     return { name: 'install', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
   }
 }
@@ -426,6 +438,7 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
     return { version: '0.11.0', status: 'failed', phases };
   }
 
+  await releaseRunEngine();
   const b = phaseBSmoke(opts);
   phases.push(b);
   if (b.status === 'failed') {
@@ -452,7 +465,7 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
   // Bug 3 — Phase G (record in completed.jsonl) moved to the runner. The
   // runner in apply-migrations.ts persists the result after orchestrator
   // returns, so we just decide the status here.
-  const status: 'complete' | 'partial' = (pending_host_work > 0) ? 'partial' : 'complete';
+  const status: 'complete' | 'partial' = pending_host_work > 0 || phases.some(p => p.status === 'failed') ? 'partial' : 'complete';
   phases.push({ name: 'record', status: opts.dryRun ? 'skipped' : 'complete', detail: `status=${status} (ledger write in runner)` });
 
   // Post-run: print pending-host-work summary if anything needs host action.
@@ -465,8 +478,8 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
     console.log(`  skills/migrations/v0.11.0.md`);
     console.log('');
     console.log('The skill walks the host through each item using GBrain\'s plugin contract.');
-    console.log('Re-run `gbrain apply-migrations --yes` after each batch to auto-rewrite newly-');
-    console.log('registerable crons and mark items done.');
+    console.log('After each batch, `gbrain apply-migrations --yes` (this upgrade\'s own command) rewrites newly-');
+    console.log('registerable crons and marks items done.');
   }
 
   return {
@@ -491,6 +504,8 @@ export const v0_11_0: Migration = {
       'user might ask about later.',
   },
   orchestrator,
+  sharesRunEngine: true,
+  effects: ['persistent_install'],
 };
 
 /** Exported for unit tests. */

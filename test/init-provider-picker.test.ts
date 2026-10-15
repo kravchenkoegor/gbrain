@@ -2,7 +2,7 @@
  * Picker unit tests — exercise the pure paths (env filtering, caveat
  * messaging, null returns on bad input). The real TTY-input flow (menu
  * rendering, typed selection, persistence) is covered by the real-PTY
- * serial test at test/init-picker-pty.serial.test.ts; mocking readLineSafe
+ * serial test at test/init-picker-pty.test.ts; mocking readLineSafe
  * at the unit boundary would leak across files in the shard process per
  * CLAUDE.md test-isolation rules.
  */
@@ -164,24 +164,7 @@ describe('pickProvider — defensive paths', () => {
   });
 });
 
-describe('pickProvider — v0.46.3 sunset filter + canonical default_model', () => {
-  test('a sunset-only key offers NO provider rows (ZE filtered out)', async () => {
-    // Only ZEROENTROPY_API_KEY set: the sunset filter drops ZE from the
-    // offered list, keyless becomes the default choice, and readLineSafe's
-    // non-TTY-stdin default ('0' when no keyed provider is ready) returns
-    // null → the caller continues keyless.
-    let stderr = '';
-    const got = await pickProvider({
-      touchpoint: 'embedding',
-      env: { ZEROENTROPY_API_KEY: 'ze-test' },
-      isTTY: true,
-      writeStderr: (s) => { stderr += s; },
-      probeLocal: async () => ({ reachable: false }),
-    });
-    expect(got).toBeNull();
-    // The dying provider must not be offered as a numbered choice.
-    expect(stderr).not.toMatch(/\d\) zeroentropyai/);
-  });
+describe('pickProvider — canonical default_model', () => {
 
   test('voyage pick resolves the canonical default_model (voyage-4, not models[0])', async () => {
     let stderr = '';
