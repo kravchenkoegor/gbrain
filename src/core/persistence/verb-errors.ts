@@ -5,6 +5,10 @@ import { UNBOUND_COLLISION_MESSAGE, UNBOUND_PUBLICATION_MESSAGE } from './unboun
 import { isFrontmatterHoldMessage } from '../markdown.ts';
 import { fenceLocationFromMessage, fenceWhere } from '../fence-repair/refusal.ts';
 import { FACT_WITHDRAWN_SUGGESTION } from '../facts/withdrawal.ts';
+import { CHECKPOINT_MOVED_MESSAGE } from './sync-slug-mode.ts';
+
+/** The refusal of a fact-batch completion request whose per-entity requests did not all commit (facts-prepare.ts). */
+export const FACTS_BATCH_INCOMPLETE_MESSAGE = 'Some extracted facts have not committed.';
 
 const FRONTMATTER_SLUG_CONFLICT = /^The frontmatter slug "[^"\n]{1,300}" in [^/"\n][^"\n]{0,1000} conflicts with its path, which expects slug "[^"\n]{1,300}"\. Remove `slug:` or make it match the path\.$/;
 
@@ -15,6 +19,11 @@ export function frontmatterSlugConflictMessage(path: string, found: string, expe
 
 /** #5988: the page's canonical file is held by sync; the code says why gbrain cannot import it. Location-free, so receipts may keep it. */
 const HELD_FILE = /^(?:The canonical file is held by sync|A file held by sync) \(([a-z_]+)\) (and differs from the page|occupies the canonical page path); the page is read-only for put_page until the file is repaired\.$/;
+
+/** #6693: the refusal of a page write whose file holds a committed Git change sync has not imported yet (pending-import.ts). */
+/** #6858: the receipt prefix of a write `gbrain repair stuck-recovery --keep disk` abandoned: its canonical file was kept as edited on disk. */
+export const KEEP_DISK_ABANDONED_PREFIX = 'Publication abandoned by gbrain repair stuck-recovery --keep disk';
+export const PENDING_IMPORT_MESSAGE = 'The canonical file holds a committed Git change that sync has not imported yet.';
 
 export function heldFileMessage(kind: 'drift' | 'occupied', code: string): string {
   return kind === 'drift'
@@ -48,13 +57,17 @@ export function writeFailureDiagnostic(code: string, message?: string | null): {
       reason: 'file_database_drift', message: 'The canonical file and database disagree. Neither copy was overwritten.',
       suggestion: 'On the source host, run gbrain sources reconcile <source> <slug> --brain <brain> --preview. Review and apply the resolved preview before retrying the original write with a new request_id. This is data repair, not an ownership or permission change.',
     };
+    if (message === PENDING_IMPORT_MESSAGE) return {
+      reason: 'pending_import', message: 'A committed Git change to the page\'s file has not been imported yet; neither copy was overwritten.',
+      suggestion: 'A refused remember is replayed once by the first managed sync that imports the file; do not save it again. Any other write: after the next gbrain sync --source <source> --no-pull, read the page again and resubmit with a new request_id.',
+    };
     if (['Newer working-tree bytes and the current page disagree with this pinned Git import.',
       'Newer code file bytes disagree with the pinned import.', 'Canonical sanitization cannot overwrite newer working-tree bytes.'].includes(message ?? '')) return {
       reason: 'pinned_git_worktree_conflict', message: 'The pinned Git content conflicts with working-tree bytes; sync did not overwrite them.',
       suggestion: 'Inspect the exact working-tree bytes and pinned Git version, including CRLF/LF differences. Preserve local edits; do not normalize or discard them automatically. If the file and database disagree, preview gbrain sources reconcile <source> <slug> --brain <brain> --preview on the source host.',
     };
     if (['The imported file changed after sync admission.', 'The canonical file changed after preparation.',
-      'The canonical file changed during preparation.'].includes(message ?? '')) return {
+      'The canonical file changed during preparation.'].includes(message ?? '') || (message ?? '').startsWith(KEEP_DISK_ABANDONED_PREFIX)) return {
       reason: 'raw_file_changed', message: 'The source file bytes changed after this request was accepted.',
       suggestion: 'Review the changed file before starting a corrected attempt. Exact byte checks remain required even when Git reports a clean file.',
     };
@@ -91,6 +104,11 @@ export function writeFailureDiagnostic(code: string, message?: string | null): {
     suggestion: 'Check the existing owner and its availability. Do not claim, transfer, or activate a source to repair content.' };
   if (code === 'permission_denied' || code === 'scope_denied') return { reason: code, message: 'The caller is not authorized for this write.',
     suggestion: 'Check the current caller grant for this source and operation. Content reconciliation does not grant permissions.' };
+  // #6834: the checkpoint and fact-batch completion requests name bookkeeping slugs, not pages; there is nothing to read.
+  if (code === 'revision_conflict' && message === CHECKPOINT_MOVED_MESSAGE) return { reason: 'sync_checkpoint_moved', message: 'The source\'s sync checkpoint moved while this run published; no page is in conflict.',
+    suggestion: '__managed_sync_checkpoint__ is sync bookkeeping, not a page, so there is nothing to read or edit. gbrain sync status --source <source> --json names the next step: when the source already stands at this run\'s target the next sync finishes the run; otherwise preview gbrain repair managed-sync-orphans --source <source> and apply it with the hash it prints, and the next sync discovers from the commit the source records.' };
+  if (code === 'revision_conflict' && message === FACTS_BATCH_INCOMPLETE_MESSAGE) return { reason: 'facts_batch_incomplete', message: 'Not every per-entity fact request of this extraction batch committed, so the batch was not recorded complete.',
+    suggestion: '__managed_facts_complete__ is the batch\'s completion record, not a page, so there is nothing to read or edit. The facts that did commit stay; inspect the batch\'s entity requests with gbrain write-request <request_id>, and run the extraction again with a new request_id only if facts are still missing.' };
   if (code === 'revision_conflict' || code === 'page_identity_changed') return { reason: code, message: 'The accepted page identity or revision no longer matches.',
     suggestion: 'Read the current page and review the intended change before submitting a corrected write.' };
   if (code === 'invalid_params' && message && FRONTMATTER_SLUG_CONFLICT.test(message)) return { reason: code, message,
@@ -113,7 +131,7 @@ export function writeFailureDiagnostic(code: string, message?: string | null): {
   if (code === 'purged_content') return { reason: code, message: 'This content was purged from this source and cannot be saved again.',
     suggestion: PURGED_SUGGESTION };
   const memory = code === 'invalid_params' ? MEMORY_REFUSAL.exec(message ?? '') : null;
-  if (memory) return { reason: code, message: message!, suggestion: MEMORY_REFUSAL_SUGGESTION[memory[1]!]! };
+  if (memory) return { reason: code, message: message!, suggestion: MEMORY_REFUSAL_SUGGESTION[/, extracted from that conversation page\.$/.test(message!) ? 'replaces_cross_page_derived' : memory[1]!]! };
   const reason = isWriteErrorCode(code) ? code : 'storage_error';
   return { reason, message: `The write did not commit: it ended with ${reason}, and nothing was saved.`,
     suggestion: 'Resolve the reported write failure before starting a corrected attempt.' };
@@ -130,6 +148,7 @@ const MEMORY_REFUSAL_SUGGESTION: Record<string, string> = {
   target_expired: 'Remember the new claim without replaces.',
   replaces_entity_mismatch: 'Pass the same entity as the fact being replaced, or forget the old fact and remember the new one separately.',
   replaces_cross_page: 'Forget the old fact, then remember the new one.',
+  replaces_cross_page_derived: 'Re-extract the conversation page named here to change its facts: preview with gbrain extract-conversation-facts --slugs <page> --force --dry-run, then run it with --max-cost-usd <n> (paid).',
   replaces_duplicate: 'Forget the replaced fact if it is no longer true; the existing fact named here already says the new claim.',
 };
 
@@ -158,6 +177,8 @@ export async function runMemoryWrite<T>(run: () => Promise<T>): Promise<T> {
     const frozen = verbError(code,diagnostic?.message ?? error.message,diagnostic?.suggestion ?? error.suggestion ?? 'Inspect writer status before retrying.');
     if (diagnostic) frozen.detail = diagnostic.reason;
     if (error.code === 'idempotency_conflict' && error.fix) frozen.fix = error.fix;
+    // #6608: an unbound-source refusal keeps its detail, docs and ask-the-user fix additively; the frozen code stays.
+    if (error.detail === 'unbound_source') Object.assign(frozen, { detail: error.detail, docs: error.docs, fix: error.fix, retryable: error.retryable });
     if (isWriteErrorCode(error.code)) frozen.writeError=error.code;
     throw frozen;
   }

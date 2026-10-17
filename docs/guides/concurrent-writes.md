@@ -531,19 +531,19 @@ If its recorded file bytes no longer match, preserve the file and receipt and
 resolve the conflict on the owner; do not delete recovery records.
 
 If a sync cursor was already invalidated, keep its failure visible until the
-owner has checked the canonical content. Then explicitly re-enumerate with the
-same source and processing options:
+owner has checked the canonical content. Then rerun the plain sync with the
+same source and processing options; it retries what the previous run recorded:
 
 ```bash
-gbrain sync --source example-source --no-pull --no-embed --no-extract --retry-failed
+gbrain sync --source example-source --no-pull --no-embed --no-extract
 ```
 
 Use `--no-embed` and `--no-extract` here only if they were the original sync
 options; retain the original `--no-schema-pack` choice as well. An unfinished
-cursor keeps its processing options: a run that omits these flags (including
-autopilot and `sync` jobs) adopts them, and an explicit conflicting flag refuses
-with `cursor_processing_options_conflict`, naming the stored options and the
-exact resume command. Explicit retry
+cursor keeps its processing opt-outs: every run that resumes it (including
+autopilot and `sync` jobs) inherits them, a flag that asks for more processing
+than the cursor stored is reported as inherited instead of refused, and the
+result names it in `inherited_options` (since 0.60.255.0, #6712). Explicit retry
 retains old terminal receipts, refuses while work is still active and creates
 fresh guarded requests. It does not ignore revision conflicts. Inspect the
 result and the original withdrawal receipt, then verify that the fact is inactive
@@ -671,6 +671,25 @@ expired lease needs explicit inspection and removal; elapsed time does not prove
 its writer stopped. A failed activation leaves managed mode disabled. Status
 reports `enabled: false` until activation commits. Run an ordinary write and
 read its receipt and revision before resuming writers on the upgraded hosts.
+
+### Git durability at activation
+
+Activation does not turn on Git durability. A filesystem source whose owner
+will not commit or push page writes (durability off, or not recorded with no
+harden post-commit hook) gets one `git_durability_not_enabled` entry in the
+report's `warnings[]` (on stderr as well without `--json`), in the dry run and
+in the real run. Activation still proceeds; the source's Git effects complete
+as skipped (`durability_not_enabled`) until it is enabled. `sources harden` is
+refused once the brain is managed, so enable it with the recorded setting:
+
+```bash
+gbrain sources writer git-durability <source> --enable --dry-run --json
+gbrain sources writer git-durability <source> --enable \
+  --admin-intent writer_git_durability --expected-state <reviewed-admin-state> --json
+```
+
+The preview lists the skipped Git effects; enabling re-queues them, one per
+file, so the pages written while durability was off get committed and pushed.
 
 CLI and stdio registrations are durable, separate principals. The CLI lane is
 trusted local administration; stdio remains an untrusted memory caller.
@@ -936,8 +955,15 @@ Two read-only doctor checks watch the receipt-bytes accounting:
   (brain and every principal) with what the receipts hold
   (`terminal_reservation` per request plus lifecycle receipts) in one
   statement, and reports `persistence.true_up.clamped`, the number of
-  settle-time decrements that were clamped at zero. A positive delta charges
-  capacity no receipt holds; a negative one under-counts. It changes nothing.
+  settle-time decrements that were clamped at zero. Each drifting scope in
+  `details.drift` names its `direction`: `overcharge` (a positive delta) is a
+  bounded charge against write capacity that no receipt holds, so writes are
+  refused a little early and no data is lost; `undercount` (a negative delta)
+  lets writes use capacity the receipts already reserve. `receipts_by_kind`
+  splits the receipt side into `requests` and `topology_changes` (rows and
+  bytes), and `details.incident` is `current` because the comparison is
+  live. It changes nothing, and there is no reconcile repair yet: report a
+  persistent drift with `gbrain doctor --only persistence_counter_drift --json`.
 - `persistence_compaction` reads `persistence.maintenance.last_compaction`,
   the record each resident consumer's compaction pass writes (`at`,
   `host_id`, `compacted`, `freed_bytes`, `skipped_by_reason`), and warns when

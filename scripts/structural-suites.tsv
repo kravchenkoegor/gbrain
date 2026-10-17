@@ -194,8 +194,9 @@ test/fts-cjk-boundary.test.ts	one copy of the DDL	2	readFileSync
 test/gbrain-owned-page-types.test.ts	#5881 gbrain-owned page types are declared by gbrain-base-v2	3	readFileSync
 test/get-page-federated-scope.test.ts	#2555 get_chunks federated scope	5	source-surface-helper
 test/get-page-federated-scope.test.ts	#4275 alias hop scope: archived sources, include_deleted, fuzzy precedence, grant precedence	5	source-surface-helper
+test/grant-execution-prerequisites.test.ts	execution prerequisite table	1	readFileSync
 test/harness-onboarding.test.ts	harness identity and private handoff	6	readFileSync
-test/hook-command.serial.test.ts	user-prompt	17	source-surface-helper
+test/hook-command.serial.test.ts	user-prompt	18	source-surface-helper
 test/hook-push-spawn-env.test.ts	spawnDetachedPush env handoff	2	readFileSync
 test/hook-push-spawn-env.test.ts	tryExecAsync env handoff	1	readFileSync
 test/init-mode-picker.test.ts	cost matrix: newest models, priced from model-pricing	6	readFileSync
@@ -281,16 +282,18 @@ test/schema-pack/suggest.test.ts	runSuggest — source-text contract (structural
 test/scripts/build-schema-migrations.test.ts	generator diagnostics (FAIL/Why/Fix/See)	9	exec-scan
 test/scripts/build-schema-migrations.test.ts	out-of-order landing check	2	exec-scan
 test/scripts/check-function-size.test.ts	check-function-size.ts rules	11	readFileSync
+test/scripts/chunk-visibility-ratchet.test.ts	check-chunk-visibility.ts	6	readFileSync
 test/scripts/ci-bounded-run.test.ts	(file-level)	7	readFileSync
 test/scripts/ci-executed-counts.test.ts	CLI	2	readFileSync
 test/scripts/ci-gates.test.ts	CI execution evidence	6	readFileSync
 test/scripts/ci-gates.test.ts	test:full exit status	0	readFileSync
+test/scripts/ci-hydrate-admin-dist.test.ts	#6756 ci:local hydrates the admin/dist volume from the worktree	7	readFileSync
 test/scripts/ci-local-rendering.test.ts	ci-local command rendering	1	readFileSync
-test/scripts/ci-local-rendering.test.ts	ci-local execution coverage	5	readFileSync
+test/scripts/ci-local-rendering.test.ts	ci-local execution coverage	7	readFileSync
 test/scripts/ci-local-rendering.test.ts	local test configuration through run-e2e	2	readFileSync
 test/scripts/ci-local-rendering.test.ts	required PgBouncer execution through run-e2e	1	readFileSync
 test/scripts/ci-manifest-diff.test.ts	test.yml dependency-audit scope	2	readFileSync
-test/scripts/ci-pr-scope.test.ts	pull-request CI scope	11	readFileSync
+test/scripts/ci-pr-scope.test.ts	pull-request CI scope	14	readFileSync
 test/scripts/ci-runner-routing.test.ts	CI runner routing	7	readFileSync
 test/scripts/classify-tests.test.ts	classify-tests detectors	23	bun-file,doctor-source-helper,exec-scan,readFileSync,source-surface-helper
 test/scripts/classify-tests.test.ts	structural-suites manifest	1	readFileSync
@@ -309,7 +312,7 @@ test/scripts/native-setup-toolchain.test.ts	scripts/native/setup-toolchain.ts do
 test/scripts/nightly-e2e.test.ts	full E2E shard classification (#6040)	2	readFileSync
 test/scripts/nightly-e2e.test.ts	nightly E2E scheduling	4	readFileSync
 test/scripts/nightly-issue.test.ts	.github/nightly-known-red.tsv	2	readFileSync
-test/scripts/nightly-issue.test.ts	master-red: push-to-master runs	19	readFileSync
+test/scripts/nightly-issue.test.ts	master-red: push-to-master runs	21	readFileSync
 test/scripts/nightly-issue.test.ts	nightly-watch coverage ratchet	1	readFileSync
 test/scripts/nightly-issue.test.ts	nightly-watch incidents	9	readFileSync
 test/scripts/nightly-issue.test.ts	nightly-watch routing and guard	9	readFileSync
@@ -370,7 +373,9 @@ test/supervisor.test.ts	recovery hook timeout bound (structural)	1	source-surfac
 test/sync-failures.test.ts	#4543 blocked output names failing files	4	doctor-source-helper,source-surface-helper
 test/sync-failures.test.ts	Bug 9 — doctor surfaces sync failures	2	doctor-source-helper
 test/sync-failures.test.ts	Bug 9 — sync.ts CLI flag wiring	6	bun-file,doctor-source-helper,source-surface-helper
+test/sync-flag-table-6712.test.ts	(file-level)	5	readFileSync
 test/sync-include-hidden.test.ts	sync.ts delta path threads includeHidden (#4027 merge guard)	1	source-surface-helper
+test/sync-legacy-slug-adoption-6727.test.ts	(file-level)	8	readFileSync
 test/sync.test.ts	buildSyncManifest	9	source-surface-helper
 test/sync.test.ts	isSyncable	8	source-surface-helper
 test/sync.test.ts	resolveSlugByPathOrSourcePath (CJK wave v0.32.7, codex F4)	3	source-surface-helper
@@ -385,6 +390,7 @@ test/timing-safe.test.ts	extraction contract	1	source-surface-helper
 test/title-fuzzy-index.test.ts	findByTitleFuzzy indexed threshold	2	source-surface-helper
 test/transcription-injection.test.ts	transcription — command injection (#245)	2	readFileSync
 test/trust-write-gate-drift.test.ts	(file-level)	1	readFileSync
+test/upgrade-post-swap-imports.test.ts	#6604 upgrade post-swap tail	3	readFileSync
 test/upgrade.serial.test.ts	detectInstallMethod — package-install classification (in-process)	4	readFileSync
 test/upgrade.serial.test.ts	runUpgrade target verification (#4366)	8	readFileSync
 test/v0_37_fix_wave.serial.test.ts	v0.37 Lane A — defaults sweep	8	source-surface-helper

@@ -358,6 +358,8 @@ export interface TakeHit {
 }
 
 import type { StaleTakeOpts, StaleTakeRow, TakeEmbeddingInput } from './takes-row-types.ts';
+import type { BodyFlipInput, BodyFlipResult, BodyRegion, BodyStagingInput, BodyStagingState, ManifestRow, ManifestRowInput, SegmentChunkInput,
+  SegmentedPageMeta, SegmentSweepOptions, SegmentSweepResult, SegmentTextInput } from './page-body/types.ts';
 export type { StaleTakeOpts, StaleTakeRow, TakeEmbeddingInput } from './takes-row-types.ts';
 
 /** Resolution metadata for resolveTake. */
@@ -1636,6 +1638,7 @@ export interface BrainEngine {
    *   feature.
    * - `link_source='mentions'` edges are EXCLUDED by default (noisy + the
    *   densest fan-out source); opt in via `includeMentions`.
+   * - Non-ranking link types (src/core/link-ranking-policy.ts) are never walked.
    * - `deleted_at IS NULL` at seed, every neighbor, and every returned node.
    * - Deterministic ordering: hop ASC, edge_count DESC, source_id, slug.
    * Must move in lockstep with the PGLite implementation
@@ -1651,13 +1654,13 @@ export interface BrainEngine {
    * the relation's subject (`toward: 'object'`) or object (`toward:
    * 'subject'`), with every endpoint and origin authorized by the read policy
    * BEFORE the caller scores anything, at most `neighborCap` edges per frontier
-   * node, same-source edges only, mentions excluded. Deterministic order:
-   * frontier id, lowest link id. Pinned by test/e2e/engine-parity.test.ts.
+   * node, same-source edges only, mentions and non-ranking link types
+   * excluded (hops and degree). Deterministic order: frontier id, lowest link id. Pinned by test/e2e/engine-parity.test.ts.
    */
   relationalChainHop(frontierPageIds: number[], opts: ChainHopOpts): Promise<ChainHopEdge[]>;
   /**
-   * For a list of page ids, return how many inbound links each has.
-   * Used by hybrid search backlink boost. Single SQL query, not N+1.
+   * For a list of page ids, return how many pages link to each (mentions
+   * and non-ranking link types excluded). Used by hybrid search backlink boost. Single SQL query, not N+1.
    * Keyed by page id — NOT slug — so namesake slugs across sources never
    * share or sum counts (#4380). Ids with zero links map to 0.
    */
@@ -1669,7 +1672,8 @@ export interface BrainEngine {
    * Map, no SQL.
    *
    * Returned shape per page (AdjacencyRow):
-   *   - `hits`: distinct from_page_id count, in-set
+   *   - `hits`: distinct from_page_id count, in-set (non-ranking link
+   *     types excluded, src/core/link-ranking-policy.ts)
    *   - `cross_source_hits`: distinct OTHER source_ids count (excluding
    *     target's own source), in-set
    *
@@ -1909,8 +1913,8 @@ export interface BrainEngine {
    * `jsonb_to_recordset(($1::jsonb)->'rows')` through `executeRawJsonb` (#1861;
    * free-text-safe, replaced the prior `unnest(::text[])` path). Idempotency:
    * ON CONFLICT (page_id, row_num) DO UPDATE — re-extract on a changed
-   * claim/weight updates the row in place. Returns the number of rows inserted
-   * OR updated. Row construction + weight clamp/round + NUL-strip live in
+   * claim/weight updates the row in place; an identical row stays unwritten. Returns
+   * the rows inserted, updated or already current. Row construction + weight clamp/round + NUL-strip live in
    * `src/core/batch-rows.ts:buildTakeRows` (shared across both engines).
    *
    * Wrapped in `batchRetry` like the other batch primitives, so `opts` (auditSite,
@@ -2369,6 +2373,30 @@ export interface BrainEngine {
   /** Per-source operational metrics for `gbrain doctor` facts_health check. */
   getFactsHealth(source_id: string): Promise<FactsHealth>;
 
+  // Segmented page storage (Wave B; SQL in engine-sql/page-body.ts). Called only when pages.segmented_storage is on.
+  /** `count` fresh manifest occurrence ids from one sequence; never reused. */
+  allocateBodyOccurrenceIds(count: number): Promise<number[]>;
+  /** Insert segment texts for one source, `ON CONFLICT DO NOTHING`, in statements bounded by STAGE_BATCH_BYTES. */
+  stageSegmentTexts(sourceId: string, texts: readonly SegmentTextInput[]): Promise<{ inserted: number }>;
+  /** Segment texts by sha256 for one source, keyed by lowercase hex; missing shas are absent. */
+  readSegmentTexts(sourceId: string, sha256s: readonly Uint8Array[]): Promise<Map<string, Uint8Array>>;
+  /** Insert manifest rows (staged rows carry `stagingId`), in bounded statements. */
+  stageManifestRows(rows: readonly ManifestRowInput[]): Promise<void>;
+  /** Manifest metadata (never text) of generation `generation` (default: the page's live body_generation), or of a staging, in seq order; `lastN` returns the tail rows of `region` (or the page). */
+  readManifest(pageId: number, opts?: { generation?: number; stagingId?: string; region?: BodyRegion; lastN?: number }): Promise<ManifestRow[]>;
+  /** Insert chunk rows of new occurrences under `generation` (invisible until the flip); chunk_index continues past the page's maximum under a per-page transaction advisory lock. Returns the assigned chunk indexes in input order. */
+  stageSegmentChunks(pageId: number, generation: number, chunks: readonly SegmentChunkInput[], opts?: { embeddingColumn?: ResolvedColumn }): Promise<number[]>;
+  /** Insert the row of a new segmented page at body_generation 0 (never visible outside the transaction that flips it to 1). */
+  createSegmentedPageShell(slug: string, meta: SegmentedPageMeta, opts: { sourceId: string }): Promise<{ id: number }>;
+  /** The generation flip, inside the publication transaction: closes and publishes manifest rows, retires chunk rows (bounded), updates the page row. Refuses `revision_changed` when the page's body_generation is not `expectedGeneration`. */
+  flipBodyGeneration(input: BodyFlipInput): Promise<BodyFlipResult>;
+  /** Record a body staging (GC root while open/sealed/prepared). */
+  openBodyStaging(input: BodyStagingInput): Promise<void>;
+  /** Move a staging to a new state; `commitRequestId` with `committed`. */
+  setBodyStagingState(id: string, state: BodyStagingState, opts?: { commitRequestId?: string | null }): Promise<void>;
+  /** Garbage collection: retired chunks and dead manifest rows (versions are roots), unreferenced texts past the grace window, expired stagings. */
+  sweepSegments(opts?: SegmentSweepOptions): Promise<SegmentSweepResult>;
+
   // Versions
   /**
    * Snapshot a page row into page_versions. Source-scoped via `opts.sourceId`;
@@ -2623,11 +2651,12 @@ export interface BrainEngine {
    * transaction the option is ignored (a `SET LOCAL` there would change the
    * enclosing transaction). PGLite ignores it: one in-process connection has
    * no other session to wait on. `deadlineAt` (#6696, epoch ms) recomputes the bound after the pool wait.
+   * `jitOff` runs it with `jit = off` when the server has JIT on (postgres-engine/jit-off-statement.ts; PGLite ignores it); `prepare: false` plans it for its actual parameters on every call.
    */
   executeRaw<T = Record<string, unknown>>(
     sql: string,
     params?: unknown[],
-    opts?: { signal?: AbortSignal; timeoutMs?: number; deadlineAt?: number },
+    opts?: { signal?: AbortSignal; timeoutMs?: number; deadlineAt?: number; jitOff?: boolean; prepare?: boolean },
   ): Promise<T[]>;
 
   /**

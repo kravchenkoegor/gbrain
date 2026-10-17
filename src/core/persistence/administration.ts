@@ -171,13 +171,16 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
       ...(waitDrainMs !== undefined ? { waitDrainMs } : {}), ...(fetchTimeoutMs !== undefined ? { fetchTimeoutMs } : {}) }) };
   }
   if (operation === 'writer_extract_stale') {
-    keys(params, ['source_id', 'dry_run']);
+    keys(params, ['source_id', 'dry_run', 'catch_up', 'source_mode']);
     const writer = currentVerifiedLocalWriter();
     if (!writer || writer.remote || writer.principal.kind !== 'local_cli') throw trustedCliRequired('Stale extraction requires a trusted CLI registration.');
     const { managedPersistenceEnabled } = await import('./ownership.ts');
     if (!await managedPersistenceEnabled(engine)) throw new OperationError('writer_coordinator_required', 'Owner-delegated stale extraction requires activated managed persistence.', WRITER_INSPECTION_HINT);
+    const sourceId = params.source_id === undefined ? undefined : source(params.source_id);
+    // #6803 (D2): the CLI validated --source before the hand-off; only the owner can see whether a source is named db.
+    if (params.source_mode === 'db') await (await import('../../commands/extract-stale-options.ts')).assertStaleSourceModeUnambiguous(engine, ['--stale', '--source', 'db', ...(sourceId ? ['--source-id', sourceId] : [])]);
     return { ...await (await import('./links-maintenance.ts')).runManagedStaleExtraction(engine,
-      { sourceId: params.source_id === undefined ? undefined : source(params.source_id), dryRun: params.dry_run === true }) };
+      { sourceId, dryRun: params.dry_run === true, catchUp: params.catch_up === true }) };
   }
   if (operation === 'writer_reindex_code') return (await import('./reindex-administration.ts')).runAuthenticatedCodeReindex(engine, params);
   if (operation === 'writer_embed_facts') return (await import('./embed-facts-administration.ts')).runAuthenticatedFactEmbedding(engine, params, config);
@@ -188,13 +191,16 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
     return runGitDurabilityAdministration(engine, params);
   }
   if (operation === 'writer_retry_effects') {
-    keys(params, ['source_id', 'request_id', 'dry_run']);
+    keys(params, ['source_id', 'request_id', 'dry_run', 'admin_intent', 'expected_state']);
     if (!isWriteRequestId(params.request_id)) throw invalid('A valid original write request UUID is required.',
       'Pass --request-id with the original write\'s request id (a UUID); gbrain sources writer status for that source lists blocked effects with their request ids.',
       typeof params.source_id === 'string' && isValidSourceId(params.source_id)
         ? readFix(`Lists source ${params.source_id}'s blocked effects with their request ids, read-only.`, { argv: ['gbrain', 'sources', 'writer', 'status', params.source_id, '--json'] })
         : undefined);
-    return (await import('./effect-retry.ts')).retryRequestEffects(engine, source(params.source_id), params.request_id, params.dry_run === true, config, embeddingRetryPolicy);
+    // #6697 (D6): the admin-intent handshake is the owner's approval to retry a revoked writer's parked Git effect under owner authority.
+    const ownerHost = params.admin_intent !== undefined || params.expected_state !== undefined;
+    if (ownerHost) await requireWriterAdminIntent(engine, 'writer_retry_effects', params);
+    return (await import('./effect-retry.ts')).retryRequestEffects(engine, source(params.source_id), params.request_id, params.dry_run === true, config, embeddingRetryPolicy, ownerHost);
   }
   if (operation === 'source_add' || operation === 'source_lifecycle') {
     const { managedPersistenceEnabled } = await import('./ownership.ts');

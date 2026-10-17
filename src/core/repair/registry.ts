@@ -43,6 +43,7 @@ import { connectorCheckpointsRepair } from './connector-checkpoints.ts';
 import { requestIndexesRepair } from './request-indexes.ts';
 import { connectorFencesRepair } from './connector-fences.ts';
 import { takeSupersessionRepair } from './take-supersession.ts';
+import { acceptedTakesRepair } from './accepted-takes.ts';
 import { orphanBindingsRepair } from './orphan-bindings.ts';
 import { managedSyncOrphansRepair } from './managed-sync-orphans.ts';
 import { embeddingEffectsRepair } from './embedding-effects.ts';
@@ -59,12 +60,15 @@ import { frontmatterRepair } from './frontmatter.ts';
 import { attributionBackfillRepair } from './attribution-backfill.ts';
 import { plannerStatsRepair } from './planner-stats.ts';
 import { fencesRepair } from './fences.ts';
+import { splitFactsRepair } from './split-facts.ts';
 import { slugConflictsRepair } from './slug-conflicts.ts';
 import { frontmatterKeysRepair } from './frontmatter-keys.ts';
 import { fileDriftRepair } from './file-drift.ts';
 import { stuckRecoveryRepair } from './stuck-recovery.ts';
 import { ghostPagesRepair, GHOST_CONSENT_TEXT, GHOST_CONSEQUENCES, GHOST_PURGE_FUSE_HOURS } from './ghost-pages.ts';
 import { receiptCompactionRepair } from './receipt-compaction.ts';
+import { aliasesRepair } from './aliases.ts';
+import { renameIdentityRepair, RENAME_IDENTITY_CONSENT_TEXT } from './rename-identity.ts';
 import { ERROR_CATALOGUE, catalogueError } from '../error-catalogue.ts';
 import type { OperationError } from '../ops/contract.ts';
 
@@ -87,6 +91,12 @@ export interface RepairKindSpec {
   consentText?: { what: string; why: string; risk: string; user_message: string };
   /** `llm`: the kind may call a paid chat model; its spend is metered by the daily USD ledger and reported in `cost.llm_usd`. */
   spends?: 'llm';
+  /**
+   * `unbound`: the remediation approval (`--expect <plan_hash>`) leaves this kind out. Its plan follows live server
+   * statistics that autovacuum changes between preview and run, and its apply changes no stored record; the run
+   * still applies what is pending then.
+   */
+  approval?: 'unbound';
 }
 
 const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
@@ -131,6 +141,14 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + '`superseded by #<own row>` pointer with exactly one possible predecessor. The pointer is written onto the old row and stale self-pointers are '
       + 'dropped through a revision-bound put_page; a page whose fence is right but whose stored pointers differ is reprojected. Ambiguous pages are '
       + 'listed with the manual edit and never changed.',
+  },
+  'accepted-takes': {
+    handler: acceptedTakesRepair, embeds: 'effect', checks: [], explicit_only: true, preview_bound: true,
+    summary: 'Restore takes that accepting a held strike-through or kind change removed on v0.60.253.0 (gbrain trust confirm tp<id> ran a takes_remove '
+      + 'instead of applying the change). Only what the records prove: the accepted proposal, the takes_remove receipt bound to it, the page version that '
+      + 'receipt archived (the fence row the accept should have applied) and the reservation row still holding its number. --apply --expect <hash> '
+      + 'republishes each page with that row (a revision-bound put_page) at the tier of the write the owner accepted. A grade or resolution only the '
+      + 'database held is not in any record and is not restored. Runs only when named.',
   },
   'orphan-bindings': {
     handler: orphanBindingsRepair, embeds: 'none', checks: ['orphan_persistence_bindings'],
@@ -219,6 +237,14 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'reconcile, relink, maintenance) are counted with the command that produces them again. Preview-bound: --apply --expect <hash> replays exactly '
       + 'the previewed set under new request ids, after re-checking each write\'s original authority; the failed receipts stay as history.',
   },
+  'split-facts': {
+    handler: splitFactsRepair, embeds: 'effect', checks: [], explicit_only: true,
+    summary: 'Merge the two ## Facts fences of a page whose fence lived below the timeline sentinel and to which a managed writer before this release '
+      + 'added a second fence above it (#6686). The merged fence stays below the sentinel and keeps every row of both fences under its own row number; '
+      + 'the body fence goes, with its ## Facts heading when that holds nothing else. A page is kept when a fence does not parse (unparsed), a row '
+      + 'number is in both fences (row_collision: a person chooses), or the merged page would not read back exactly (not_conserved). Preview-bound: '
+      + '--apply --expect <hash> merges exactly the previewed pages through revision-bound put_page (changed_since_preview when a page moved). Runs only when named.',
+  },
   frontmatter: {
     handler: frontmatterRepair, embeds: 'effect', checks: ['git_held_files', 'frontmatter_repairable'], explicit_only: true, consent: 'destructive',
     summary: 'Fix files whose YAML frontmatter gbrain holds or reads only by guessing (#5988), and pages an older import stored wrong: per file the minimal '
@@ -252,7 +278,7 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'Preview-bound: --apply --expect <hash> applies exactly the previewed set. gbrain repair content runs fences, then this kind.',
   },
   'planner-stats': {
-    handler: plannerStatsRepair, embeds: 'none', checks: ['planner_stats_stale'],
+    handler: plannerStatsRepair, embeds: 'none', checks: ['planner_stats_stale'], approval: 'unbound',
     summary: 'ANALYZE the hot tables (pages, links, facts, takes, content_chunks, timeline_entries) whose planner statistics are stale (F4b), '
       + 'so search and graph reads stop planning as slow nested loops. PGLite also resets each table\'s pending row count; Postgres runs each '
       + 'ANALYZE with a 60 s statement and 2 s lock timeout. No journal admission and no user data changes. Brain-wide.',
@@ -279,7 +305,9 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + '<conflict request id> or --all-drifted (refused across mixed drift classes unless --class <name> keeps one), narrowed by --only/--skip '
       + 'canonical file path globs (* within a segment, ** across; bound into the hash and the apply command). Needs --source. The preview '
       + 'writes each resolved result to a private artifact; --apply --expect <hash> applies exactly that set with request ids derived from the hash, '
-      + 'resumable, per page repaired, refused or changed_since_preview. Backups are reconcile\'s own. Trusted local CLI only; runs only when named.',
+      + 'resumable, per page repaired, refused or changed_since_preview. Backups are reconcile\'s own. A selected page whose canonical file is gone from the '
+      + 'last commit: --prefer database recreates the file from the page, --prefer file soft-deletes exactly that page (mass-delete valve applies); a file '
+      + 'deleted only in the worktree is listed deletion_uncommitted and routed to committing the deletion or repair ghost-pages. Trusted local CLI only; runs only when named.',
   },
   'stuck-recovery': {
     handler: stuckRecoveryRepair, embeds: 'none', checks: [], explicit_only: true, preview_bound: true, consent: 'destructive',
@@ -319,6 +347,23 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + '(persistence.receipt_retention_days) unless --force; committed receipts only unless --include-failures. Receipts of a run whose sync cursor is '
       + 'open, and the newest sync receipt per worktree, are kept. Preview-bound and destructive: --apply --expect <hash> --yes compacts only the '
       + 'previewed set. No admission, so it runs at a full cap. Brain-wide. Runs only when named.',
+  },
+  aliases: {
+    handler: aliasesRepair, embeds: 'none', checks: ['dangling_aliases'], explicit_only: true,
+    summary: 'Delete free-text page aliases and slug redirects whose target page has no row at all (purged or hard-deleted, #6619), which doctor '
+      + 'dangling_aliases reports as orphaned. Aliases of a soft-deleted page are kept for gbrain restore and counted; a redirect from an old name '
+      + 'of a page that still exists is never touched. Each target slug is rechecked under its page lock; coordinated maintenance write on a managed '
+      + 'brain, no journal admission. Runs only when named.',
+  },
+  'rename-identity': {
+    handler: renameIdentityRepair, embeds: 'none', checks: ['rename_identity_downgrades'], explicit_only: true, preview_bound: true, consent: 'destructive',
+    consentText: RENAME_IDENTITY_CONSENT_TEXT,
+    summary: 'Carry the page identity across an inexact Git rename that sync split into a delete plus an add (#6729): the operator picks the pair '
+      + '(--source <id> --slug <new-slug>, --from <old-slug> when two pairs share it); without --slug the preview lists the open pairs and their '
+      + 'preview commands. --apply --expect <hash> --yes moves the old page id to the new slug (version history, timeline, links and facts stay on it), '
+      + 'imports the new file onto it as an edit, retires the provisional page purge-style (soft-deleted, nothing hard-deleted) and records the '
+      + 'old -> new redirect; fence rows that would collide refuse fact_rows_collide before anything is written. --close releases the purge hold and '
+      + 'moves nothing. Carry is classic-only: on a managed source the preview states managed_remedy_unavailable, an apply refuses with it, and --close is the remedy. Runs only when named.',
   },
 };
 
@@ -403,16 +448,16 @@ export async function repairRunner(engine: BrainEngine, opts: { apply: boolean; 
      */
     async run(kind: RepairKind, scope: RepairScope, run: { limit?: number; sourceFlag?: string; explicit?: boolean; expect?: string; includeAmbiguous?: boolean; only?: string[]; skip?: string[];
       slugs?: string[]; noLlm?: boolean; maxLlmUsd?: number; deadline?: number;
-      prefer?: 'file' | 'database'; requests?: string[]; allDrifted?: boolean; driftClass?: string;
-      keep?: 'prior' | 'disk'; requestId?: string; olderThan?: string; includeFailures?: boolean; force?: boolean } = {}): Promise<RepairResult> {
+      prefer?: 'file' | 'database'; requests?: string[]; allDrifted?: boolean; driftClass?: string; since?: string;
+      keep?: 'prior' | 'disk'; requestId?: string; olderThan?: string; includeFailures?: boolean; force?: boolean; from?: string; close?: boolean } = {}): Promise<RepairResult> {
       const ctx = { engine, config, logger, dryRun: !opts.apply, remote: false, sourceId: scope.source_ids[0], writeWaitMs } as OperationContext;
       const spec = repairSpec(kind, opts.registry);
       return runRepair(ctx, spec.handler, scope, { apply: opts.apply, limit: run.limit, embeddingModel, sourceFlag: run.sourceFlag, spec,
         embed: !opts.noEmbed && embeddingModel !== undefined, applyArgs: [...(opts.noEmbed && spec.embeds === 'inline' ? ['--no-embed'] : []),
           ...(run.olderThan ? ['--older-than', run.olderThan] : []), ...(run.includeFailures ? ['--include-failures'] : []), ...(run.force ? ['--force'] : [])],
         explicit: run.explicit, expect: run.expect, includeAmbiguous: run.includeAmbiguous, only: run.only, skip: run.skip, slugs: run.slugs, noLlm: run.noLlm,
-        maxLlmUsd: run.maxLlmUsd, deadline: run.deadline, prefer: run.prefer, requests: run.requests, allDrifted: run.allDrifted, driftClass: run.driftClass,
-        keep: run.keep, requestId: run.requestId, olderThan: run.olderThan, includeFailures: run.includeFailures, force: run.force });
+        maxLlmUsd: run.maxLlmUsd, deadline: run.deadline, prefer: run.prefer, requests: run.requests, allDrifted: run.allDrifted, driftClass: run.driftClass, since: run.since,
+        keep: run.keep, requestId: run.requestId, olderThan: run.olderThan, includeFailures: run.includeFailures, force: run.force, from: run.from, close: run.close });
     },
   };
 }

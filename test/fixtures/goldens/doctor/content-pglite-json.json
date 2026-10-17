@@ -9,6 +9,7 @@
     "exit_code": 1,
     "report": {
       "brain_checks_score": 60,
+      "budget_ms": "<volatile>",
       "capped_by": [
         "embeddings_disabled"
       ],
@@ -510,10 +511,10 @@
                   "days_to_exhaustion": null,
                   "exhaustion_date": null,
                   "limit": 68719476736,
-                  "max_day_7d": 113645,
+                  "max_day_7d": 114245,
                   "net_per_day_7d": 22378,
                   "pct": 0,
-                  "per_day_7d": 113645,
+                  "per_day_7d": 114245,
                   "reclaimable_bytes": 16318,
                   "recommended_limit": 137438953472,
                   "resource": "terminal_bytes",
@@ -521,7 +522,7 @@
                   "spike_day": null,
                   "status": "ok",
                   "under_reserved_receipts": 0,
-                  "used": 113645,
+                  "used": 114245,
                   "window_days": 1
                 },
                 {
@@ -547,10 +548,10 @@
                   "days_to_exhaustion": null,
                   "exhaustion_date": null,
                   "limit": 17179869184,
-                  "max_day_7d": 113645,
+                  "max_day_7d": 114245,
                   "net_per_day_7d": 22378,
                   "pct": 0,
-                  "per_day_7d": 113645,
+                  "per_day_7d": 114245,
                   "reclaimable_bytes": 16318,
                   "recommended_limit": 34359738368,
                   "resource": "terminal_bytes",
@@ -558,7 +559,7 @@
                   "spike_day": null,
                   "status": "ok",
                   "under_reserved_receipts": 0,
-                  "used": 113645,
+                  "used": 114245,
                   "window_days": 1
                 }
               ],
@@ -625,7 +626,7 @@
             "unresolved": {
               "distinct_intents": 0,
               "distinct_slugs": 0,
-              "oldest_age_seconds": null,
+              "oldest_age_seconds": "<volatile>",
               "rows": 0
             },
             "window_days": 7
@@ -641,11 +642,19 @@
             "count": 0,
             "docs": "docs/guides/troubleshooting.md#managed-sync-not-moving",
             "parked": 0,
-            "sources": []
+            "sources": [],
+            "stranded": 0
           },
           "elapsed_ms": "<volatile>",
           "message": "No managed sync is pending.",
           "name": "managed_sync_not_moving",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "elapsed_ms": "<volatile>",
+          "message": "No managed sync run is blocked.",
+          "name": "managed_sync_blocked",
           "status": "ok"
         },
         {
@@ -666,6 +675,33 @@
           "elapsed_ms": "<volatile>",
           "message": "Receipt compaction last ran 0 hour(s) ago (compacted 0, freed 0 bytes).",
           "name": "persistence_compaction",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "by_day": [],
+            "content_decisions": {
+              "file_drift_apply": 0,
+              "file_drift_hold": 0,
+              "total": 0
+            },
+            "docs": "docs/guides/sync-unblock-runbook.md#soak-counters",
+            "interventions": {
+              "needs_human": 0,
+              "repair_apply": 0,
+              "retry_held": 0,
+              "sync_non_plain": 0,
+              "total": 0,
+              "unblock_apply": 0
+            },
+            "since": "<ts>",
+            "window_days": 7
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "Last 7 days: 0 managed-sync intervention(s), 0 content decision(s).",
+          "name": "sync_soak_counters",
+          "severity": "info",
           "status": "ok"
         },
         {
@@ -796,6 +832,20 @@
           "status": "ok"
         },
         {
+          "category": "brain",
+          "elapsed_ms": "<volatile>",
+          "message": "Extraction lag not applicable (5 pages — too few to assess)",
+          "name": "links_extraction_lag",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "elapsed_ms": "<volatile>",
+          "message": "No large page has chunks waiting for embedding approval (held or capped by embed.max_usd_per_page).",
+          "name": "partial_embedding",
+          "status": "ok"
+        },
+        {
           "category": "ops",
           "elapsed_ms": "<volatile>",
           "message": "Extension installed",
@@ -812,8 +862,18 @@
         {
           "category": "brain",
           "details": {
+            "archived": 0,
+            "as_of": "<ts>+00",
+            "failed": 0,
+            "ocr_required": 0,
+            "oldest_age_seconds": "<volatile>",
+            "pending": 0,
+            "protected": 0,
             "readiness": "ready",
-            "ready": true
+            "ready": true,
+            "reimport": 0,
+            "sealable": 0,
+            "sealable_with_visual": 0
           },
           "elapsed_ms": "<volatile>",
           "message": "Visible text projections match their canonical revisions.",
@@ -914,7 +974,7 @@
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "1132 column(s) verified against live schema",
+          "message": "1243 column(s) verified against live schema",
           "name": "schema_columns",
           "status": "ok"
         },
@@ -1049,8 +1109,24 @@
         {
           "category": "brain",
           "elapsed_ms": "<volatile>",
+          "message": "The brain records its embedding model with its provider (voyage:voyage-4).",
+          "name": "embedding_identity_unqualified",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "elapsed_ms": "<volatile>",
           "message": "Embeddings are off on this brain, so facts are only deduplicated by exact text; no supersession threshold applies.",
           "name": "supersession_calibration",
+          "readiness_state": "not_applicable",
+          "severity": "info",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "elapsed_ms": "<volatile>",
+          "message": "Embeddings are off on this brain, so facts are admitted by keyword and named entity only; no cosine floor applies.",
+          "name": "fact_admission_floors",
           "readiness_state": "not_applicable",
           "severity": "info",
           "status": "ok"
@@ -1230,12 +1306,16 @@
               {
                 "name": "persistence_requests_slug_intent",
                 "state": "valid"
+              },
+              {
+                "name": "persistence_requests_request_id",
+                "state": "valid"
               }
             ],
             "repair": "request-indexes"
           },
           "elapsed_ms": "<volatile>",
-          "message": "Managed sync request indexes are valid.",
+          "message": "Request-table indexes are valid.",
           "name": "persistence_request_indexes",
           "status": "ok"
         },
@@ -1391,6 +1471,18 @@
         {
           "category": "brain",
           "details": {
+            "checkouts": [],
+            "count": 0,
+            "docs": "docs/architecture/topologies.md#coordination-lock"
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "Every checkout's recorded coordination lock agrees with GBRAIN_COORDINATION_HOME, or the variable does not apply.",
+          "name": "coordination_lock_location",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
             "sources": [],
             "total": 0
           },
@@ -1494,6 +1586,18 @@
           "elapsed_ms": "<volatile>",
           "message": "No group- or world-readable gbrain files under Google source directories outside ~/.gbrain.",
           "name": "google_file_modes",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/google-connect.md#unreadable-calendar",
+            "sources": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No Google source recorded an unreadable calendar at its last sync.",
+          "name": "google_calendar_readable",
           "status": "ok"
         },
         {
@@ -1692,13 +1796,6 @@
           "elapsed_ms": "<volatile>",
           "message": "No pages exceed 25165824 bytes (excluding embed_skip pages, which already took the accepted non-embeddable remediation)",
           "name": "oversized_pages",
-          "status": "ok"
-        },
-        {
-          "category": "brain",
-          "elapsed_ms": "<volatile>",
-          "message": "No large page is held or capped by embed.max_usd_per_page.",
-          "name": "partial_embedding",
           "status": "ok"
         },
         {
@@ -1907,6 +2004,20 @@
         },
         {
           "category": "ops",
+          "elapsed_ms": "<volatile>",
+          "message": "No automatic embed-backfill is repeating the same failure.",
+          "name": "embed_backfill_stalled",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "elapsed_ms": "<volatile>",
+          "message": "No connector source is waiting for its account to be repinned.",
+          "name": "connector_account_mismatch",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
           "details": {
             "active_ids": [],
             "authorizable": {},
@@ -2009,14 +2120,77 @@
         {
           "category": "brain",
           "details": {
+            "code": "sync_no_successful_sync",
+            "no_successful_sync": [
+              {
+                "code": "sync_no_successful_sync",
+                "fix": {
+                  "actor": "agent",
+                  "argv": [
+                    "gbrain",
+                    "sync",
+                    "--source",
+                    "notes",
+                    "--no-pull"
+                  ],
+                  "consent": [],
+                  "docs": "docs/guides/troubleshooting.md#sync-freshness-no-successful-sync",
+                  "requires_exclusive": false,
+                  "verify": {
+                    "argv": [
+                      "gbrain",
+                      "doctor",
+                      "--only",
+                      "sync_freshness",
+                      "--json"
+                    ]
+                  },
+                  "why": "No successful sync of notes is recorded; this runs one and stamps last_sync_at when it succeeds."
+                },
+                "held": 0,
+                "job_id": null,
+                "last_attempt_at": null,
+                "reason": "no_attempt",
+                "result": null,
+                "source_id": "notes"
+              }
+            ],
             "stale_count": 1,
             "synced_recently_count": 0,
             "unchanged_count": 0,
             "writer_owned_count": 1
           },
           "elapsed_ms": "<volatile>",
-          "fix_unavailable_reason": "unstructured",
-          "message": "Source 'notes' has never been synced. Run `gbrain sync --source <id> --no-pull` for each stale source. 1 writer-owned canonical content source(s): upstream sync is not applicable; see canonical_content_writes for publication status",
+          "fix": {
+            "actor": "agent",
+            "argv": [
+              "gbrain",
+              "sync",
+              "--source",
+              "notes",
+              "--no-pull",
+              "--brain",
+              "host"
+            ],
+            "command": "gbrain sync --source notes --no-pull --brain host",
+            "consent": [],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#sync-freshness-no-successful-sync",
+            "next": "run",
+            "requires_exclusive": false,
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "sync_freshness",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "No successful sync of notes is recorded; this runs one and stamps last_sync_at when it succeeds."
+          },
+          "message": "Source 'notes': no successful sync recorded; no attempt recorded; run `gbrain sync --source notes --no-pull`. 1 writer-owned canonical content source(s): upstream sync is not applicable; see canonical_content_writes for publication status",
           "name": "sync_freshness",
           "status": "fail"
         },
@@ -2103,13 +2277,6 @@
         {
           "category": "brain",
           "elapsed_ms": "<volatile>",
-          "message": "Extraction lag not applicable (5 pages — too few to assess)",
-          "name": "links_extraction_lag",
-          "status": "ok"
-        },
-        {
-          "category": "brain",
-          "elapsed_ms": "<volatile>",
           "message": "No full cycle yet for 'default', 'notes': they hold no pages or only pages from the last 24h, so there is nothing to consolidate yet.",
           "name": "cycle_freshness",
           "readiness_state": "not_applicable",
@@ -2147,6 +2314,56 @@
         {
           "category": "brain",
           "details": {
+            "docs": "docs/guides/on-commit-sync.md",
+            "fail_seconds": 3600,
+            "graded": false,
+            "on_commit": false,
+            "sources": [
+              {
+                "commit_to_embedded": {
+                  "p50_seconds": null,
+                  "p95_seconds": null,
+                  "pending": 0,
+                  "samples": 0
+                },
+                "commit_to_searchable": {
+                  "p50_seconds": null,
+                  "p95_seconds": null,
+                  "samples": 0
+                },
+                "commits": 0,
+                "source_id": "default",
+                "unresolved_commits": 0,
+                "window_hours": 24
+              },
+              {
+                "commit_to_embedded": {
+                  "p50_seconds": null,
+                  "p95_seconds": null,
+                  "pending": 0,
+                  "samples": 0
+                },
+                "commit_to_searchable": {
+                  "p50_seconds": null,
+                  "p95_seconds": null,
+                  "samples": 0
+                },
+                "commits": 0,
+                "source_id": "notes",
+                "unresolved_commits": 0,
+                "window_hours": 24
+              }
+            ],
+            "target_seconds": 300
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No commit→searchable samples in the last 24 h (no managed sync imported a new commit).",
+          "name": "managed_sync_latency",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
             "checkouts": 1,
             "tracked": []
           },
@@ -2165,12 +2382,14 @@
         {
           "category": "brain",
           "details": {
+            "conversation": null,
             "fix": "preview links: gbrain facts relink --dry-run",
             "inferred_7d": {
               "mention": 0,
               "page": 0
             },
             "new_7d": {
+              "conversation_unresolved": 0,
               "facts": 0,
               "no_subject": 0,
               "unlinked": 0
@@ -2182,6 +2401,7 @@
             "window": {
               "active": 0,
               "capped": false,
+              "conversation": 0,
               "fence_owned": 0,
               "unlinked": 0
             }
@@ -2450,6 +2670,7 @@
               "timeline_entries"
             ],
             "engine": "pglite",
+            "expression_indexes_without_statistics": [],
             "fix": "gbrain repair planner-stats --apply",
             "missing_search_statistics": [],
             "stale": []
@@ -2490,6 +2711,45 @@
           "elapsed_ms": "<volatile>",
           "message": "Every page has its revision; the page revision backfill is complete.",
           "name": "revision_backfill",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "elapsed_ms": "<volatile>",
+          "fix": {
+            "actor": "agent",
+            "argv": [
+              "gbrain",
+              "beliefs",
+              "enable",
+              "--source",
+              "default",
+              "--brain",
+              "host"
+            ],
+            "command": "gbrain beliefs enable --source default --brain host",
+            "consent": [],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/designs/BELIEF_LEDGER.md#73-the-doctor-coverage-check",
+            "next": "ask_user",
+            "requires_exclusive": false,
+            "user_message": "Do you want gbrain to keep a belief ledger (a recorded history of facts, takes and links) for this source?",
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "belief_ledger_coverage",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "Enabling baselines every page of the source and records each later change; only a managed source is certified."
+          },
+          "message": "The belief ledger is off: no source records what this brain had recorded, and when.",
+          "name": "belief_ledger_coverage",
+          "readiness_state": "disabled_by_choice",
+          "severity": "info",
           "status": "ok"
         },
         {
@@ -2706,6 +2966,134 @@
         {
           "category": "brain",
           "details": {
+            "by_source": [],
+            "count": 0,
+            "docs": "docs/guides/live-sync.md#renaming-a-page",
+            "samples": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No rename that lost its page identity is waiting for a disposition.",
+          "name": "rename_identity_downgrades",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "parked": 0
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No soft-deleted page is parked by the managed purge.",
+          "name": "purge_parked_pages",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "count": 0,
+            "docs": "docs/storage-tiering.md#restoring-a-page-whose-file-is-gone",
+            "sources": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "Not applicable: no source is a classic checkout on this host (managed sources are checked by ghost_pages).",
+          "name": "missing_recorded_files",
+          "readiness_state": "not_applicable",
+          "severity": "info",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "docs": "docs/guides/repair.md#unindexed-files",
+            "sources": [
+              {
+                "source_id": "default",
+                "state": "missing"
+              },
+              {
+                "source_id": "notes",
+                "state": "missing"
+              }
+            ]
+          },
+          "elapsed_ms": "<volatile>",
+          "fix": {
+            "actor": "agent",
+            "argv": [
+              "gbrain",
+              "sources",
+              "retry-held",
+              "default",
+              "--unindexed",
+              "--brain",
+              "host"
+            ],
+            "command": "gbrain sources retry-held default --unindexed --brain host",
+            "consent": [],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#unindexed-files",
+            "next": "run",
+            "requires_exclusive": false,
+            "then": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "sync",
+                "--source",
+                "default",
+                "--no-pull",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain sync --source default --no-pull --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#unindexed-files",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "unindexed_files",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "The sync re-screens the scheduled files of default: each one that passes imports, each one that refuses is recorded as a hold that gbrain sources status default lists."
+            },
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "unindexed_files",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "Finds the committed files of default with no page and no hold (bounded; it continues an incomplete scan), schedules them for a re-screen and stores the result this check reads."
+          },
+          "message": "Unindexed files are not known for default (not computed yet), notes (not computed yet). The maintenance phase unindexed_files computes them on each run and continues an incomplete scan; to compute them now, run gbrain sources retry-held <id> --unindexed.",
+          "name": "unindexed_files",
+          "readiness_state": "unknown",
+          "severity": "info",
+          "status": "ok"
+        },
+        {
+          "category": "meta",
+          "details": {
+            "rollback": [],
+            "unapplied": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No retired sync config key is stored on this brain.",
+          "name": "sync_config_keys",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
             "docs": "docs/guides/write-refusals.md#invalid_fence",
             "model_repair": {
               "max_usd_per_day": 1,
@@ -2815,6 +3203,10 @@
                 "top_writers": []
               }
             ],
+            "unbound_legacy_facts": {
+              "pages": [],
+              "total": 0
+            },
             "uncommitted_repairs": 0,
             "unrenderable_legacy_facts": {
               "complete": true,
@@ -2981,7 +3373,7 @@
           "category": "meta",
           "details": {
             "counts": {
-              "global": 15,
+              "global": 16,
               "mixed": 2,
               "source": 12
             },
@@ -3014,11 +3406,12 @@
               "standing_questions": "global",
               "sync": "source",
               "synthesize": "mixed",
-              "synthesize_concepts": "global"
+              "synthesize_concepts": "global",
+              "unindexed_files": "global"
             }
           },
           "elapsed_ms": "<volatile>",
-          "message": "Phase taxonomy: 12 source-scoped, 15 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, content_repair, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
+          "message": "Phase taxonomy: 12 source-scoped, 16 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, content_repair, unindexed_files, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
           "name": "cycle_phase_scope",
           "status": "ok"
         },
@@ -3129,14 +3522,14 @@
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "Active pack gbrain-base-v2@1.3.0+a50a67b9 is current (no successor declared)",
+          "message": "Active pack gbrain-base-v2@1.4.0+1c5ba903 is current (no successor declared)",
           "name": "pack_upgrade_available",
           "status": "ok"
         },
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "3 distinct typed values (pack gbrain-base-v2 declares 20)",
+          "message": "3 distinct typed values (pack gbrain-base-v2 declares 21)",
           "name": "type_proliferation",
           "status": "ok"
         },
@@ -3148,14 +3541,46 @@
           "status": "ok"
         }
       ],
+      "complete": true,
       "db_url_source": null,
+      "elapsed_ms": "<volatile>",
       "engine": "pglite",
       "health_score": 55,
       "schema_version": 2,
       "status": "unhealthy",
+      "tier": "standard",
       "top_issues": [
         {
-          "fix": "Source 'notes' has never been synced. Run `gbrain sync --source <id> --no-pull` for each stale source. 1 writer-owned canonical content source(s): upstream sync is not applicable; see canonical_content_writes for publication status",
+          "action": {
+            "actor": "agent",
+            "argv": [
+              "gbrain",
+              "sync",
+              "--source",
+              "notes",
+              "--no-pull",
+              "--brain",
+              "host"
+            ],
+            "command": "gbrain sync --source notes --no-pull --brain host",
+            "consent": [],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#sync-freshness-no-successful-sync",
+            "next": "run",
+            "requires_exclusive": false,
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "sync_freshness",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "No successful sync of notes is recorded; this runs one and stamps last_sync_at when it succeeds."
+          },
+          "fix": "Source 'notes': no successful sync recorded; no attempt recorded; run `gbrain sync --source notes --no-pull`. 1 writer-owned canonical content source(s): upstream sync is not applicable; see canonical_content_writes for publication status",
           "name": "sync_freshness",
           "status": "fail",
           "tier": "root"
@@ -3275,9 +3700,11 @@
           "status": "warn",
           "tier": "symptom"
         }
-      ]
+      ],
+      "unknown_sections": []
     },
     "stderr": [
+      "[gbrain doctor] non-interactive run: the check run (not connect or migrations) is capped at 90000 ms (doctor.default_budget_ms); checks past it report health unknown. Off for one run: --budget-ms 0; off for good: gbrain config set doctor.default_budget_ms 0. On PGLite a statement already running cannot be stopped, so a check can finish late.",
       "[backup] checked 2 asset(s): 1 without a git remote (computed_by=doctor)"
     ],
     "stdout": "<json>"

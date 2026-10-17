@@ -32,7 +32,7 @@ import { CAPABILITIES_URI } from './capabilities.ts';
 import { resolveAuthCapabilities } from '../core/harness/capabilities.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { buildToolDefs } from './tool-defs.ts';
-import { resolveMcpInstructions } from './instructions.ts';
+import { readInstructionContent, resolveMcpInstructions } from './instructions.ts';
 import { httpInstructionTools } from './initialize-context.ts';
 import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
 import { operations, operationsByName, opAllowedForBoundClient } from '../core/operations.ts';
@@ -45,7 +45,7 @@ import { GBRAIN_CLIENT_HEADER, isGbrainThinClient, resolveResultRowsMode, result
 import { parseStrictParamsMode } from './validate-params.ts';
 import { filterOpsForSurface, clampSurface, advertisedOps, resolveAdvertisedSurface, type McpSurface } from './surface.ts';
 import { disabledOpsForPublishGates } from './publish-gates.ts';
-import { loadConfig } from '../core/config.ts';
+import { loadServeConfigs } from './serve-config.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
 import { sqlQueryForEngine } from '../core/sql-query.ts';
 import { degradedLastError, isEngineDegraded } from '../core/degraded-marker.ts';
@@ -219,7 +219,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
   // `mcp.strict_params` flip needs a restart here (deliberate; the OAuth
   // serve-http path re-reads dual-plane per request). Dispatch-side
   // enforcement still resolves per call. mcp.advertised_surface (file plane) narrows the tool list only.
-  const fileConfig = loadConfig();
+  const { fileConfig, operationConfig } = await loadServeConfigs(engine); // #6589: operations see file + env over the DB plane
   const strictParams = parseStrictParamsMode(fileConfig?.mcp?.strict_params) === 'reject';
   const tools = buildToolDefs(advertisedOps(surfacedOps, surface, await resolveAdvertisedSurface(null, fileConfig)), { strictParams });
 
@@ -448,6 +448,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
               instructions: resolveMcpInstructions(fileConfig, process.env, {
                 writeback: ambientOptsFrom(writeback, { remember: canWriteOp('remember'), extractFacts: canWriteOp('extract_facts') }),
                 tools: await httpInstructionTools(engine, fileConfig, { ops: surfacedOps, surface, auth: auth.auth!, allowedOps: surfaceAllowedOps }), // F1
+                ...await readInstructionContent(engine),
               }),
             },
             jsonrpc: '2.0',
@@ -464,7 +465,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
 
       if (method === 'resources/list' || method === 'resources/read') {
         const resources = createSkillResources(engine, async () => ({ remote: true, transport: 'http',
-          auth: auth.auth!, sourceId: auth.sourceId ?? 'default', allowedOps: surfaceAllowedOps, surface, config: fileConfig ?? undefined }));
+          auth: auth.auth!, sourceId: auth.sourceId ?? 'default', allowedOps: surfaceAllowedOps, surface, config: operationConfig }));
         try {
           const result = method === 'resources/list'
             ? { resources: [{ uri: CAPABILITIES_URI, name: 'GBrain capabilities', mimeType: 'application/json' }, ...await resources.list()] }
@@ -535,7 +536,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         }
         const result = await dispatchToolCall(engine, toolName, args, {
           remote: true,
-          admissionOrigin: 'interactive',
+          admissionOrigin: 'interactive', config: operationConfig,
           // WP1/D7: network transport — the dispatch-layer localOnly
           // backstop keys off this marker.
           transport: 'http',

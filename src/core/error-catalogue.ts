@@ -32,6 +32,11 @@ export interface CatalogueEntry {
 }
 
 export const ERROR_CATALOGUE = {
+  // W2 page-at-time: recorded-time reads (`known_as_of`).
+  coverage_from: { code: 'coverage_from', docs: 'docs/guides/repair.md#coverage-from' },
+  coverage_gap: { code: 'coverage_gap', docs: 'docs/guides/repair.md#coverage-gap' },
+  clock_mismatch: { code: 'clock_mismatch', docs: 'docs/guides/repair.md#clock-mismatch' },
+  known_as_of_unproven: { code: 'known_as_of_unproven', docs: 'docs/guides/repair.md#known-as-of-unproven' },
   legacy_jobs_active: { code: 'legacy_jobs_active', docs: 'docs/guides/repair.md#legacy-jobs-active' },
   // D4 / D2 notice codes (agent-output Notice through the notice ledger).
   grant_blocked_operations: { code: 'grant_blocked_operations', docs: 'docs/guides/repair.md#grant-blocked-operations' },
@@ -94,6 +99,7 @@ export const ERROR_CATALOGUE = {
   sync_drain_connection_lost: { code: 'connection_lost', docs: 'docs/guides/write-refusals.md#drain-connection-lost' },
   sync_drain_capacity_paused: { code: 'capacity_paused', docs: 'docs/guides/write-refusals.md#drain-capacity-paused' },
   sync_drain_head_blocked: { code: 'drain_stalled', docs: 'docs/guides/write-refusals.md#head-blocked' },
+  sync_drain_lease_held: { code: 'sync_drain_lease_held', docs: 'docs/guides/write-refusals.md#sync_drain_lease_held' },
   // D8 `gbrain setup <harness>` (src/commands/setup.ts).
   setup_harness_unsupported: { code: 'setup_harness_unsupported', docs: 'docs/guides/repair.md#setup-harness-unsupported' },
   setup_owner_conflict: { code: 'setup_owner_conflict', docs: 'docs/guides/repair.md#setup-owner-conflict' },

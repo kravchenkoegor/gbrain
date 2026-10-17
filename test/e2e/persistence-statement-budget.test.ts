@@ -28,8 +28,8 @@ import { claimWorktree } from '../../src/core/persistence/ownership.ts';
 import { registerLocalWriter, withVerifiedLocalRegistration, type LocalRegistration } from '../../src/core/persistence/identity.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
 import { _resetWriteThroughCacheForTest } from '../../src/core/write-through.ts';
-import { readWriteSwitchSnapshot } from '../../src/core/persistence/switches.ts';
-import { readPublicationCeilingMs } from '../../src/core/persistence/publication-deadline.ts';
+import { readWriteSwitchSnapshot, resetWriteSwitches } from '../../src/core/persistence/switches.ts';
+import { _resetPublicationCeilingForTest, readPublicationCeilingMs } from '../../src/core/persistence/publication-deadline.ts';
 
 interface TraceRecord { t: number; ms: number; conn: number; kind: string; sql: string }
 type Phase = 'admission' | 'claim' | 'prepare' | 'recovery_record' | 'publication' | 'completion' | 'consumer_scan' | 'wait_poll' | 'effects' | 'other';
@@ -55,6 +55,8 @@ const SCAN = [
   /FROM persistence_effects e JOIN persistence_worktrees w ON w\.id=e\.worktree_id WHERE e\.recovery IS NOT NULL/,
   /FROM persistence_topology_changes c/, /FROM persistence_worktree_refreshes f JOIN/, /^WITH expired AS/, /page_projection_jobs/,
   /^WITH purged AS \( DELETE FROM persistence_consumers/,
+  // #6650: the consumer's dead-owner claim scan, at most every 5 s on any tick (an idle tick can land inside a slow preparation).
+  /^SELECT DISTINCT concat_ws\(':',r\.claim_phase->'owner'->>'pid'/,
   /^SELECT 1 FROM persistence_effects e WHERE e\.id>\$1::bigint AND e\.kind='embedding' AND e\.state='queued' AND e\.attempts=0/,
 ];
 /**
@@ -137,6 +139,21 @@ function classify(records: TraceRecord[]) {
   return result;
 }
 
+test('the consumer\'s dead-owner claim scan landing inside preparation is a consumer scan, not preparation', () => {
+  const at = (t: number, conn: number, kind: string, sql: string): TraceRecord => ({ t, ms: 0, conn, kind, sql });
+  const records = [
+    at(1, 1, 'simple', 'begin'), at(2, 1, 'execute', 'INSERT INTO persistence_requests (id) VALUES ($1)'), at(3, 1, 'simple', 'commit'),
+    at(10, 2, 'execute', "UPDATE persistence_requests SET state='running', execution_token=$2::uuid WHERE id=$1"),
+    at(11, 4, 'execute', "SELECT config->>'slug_root_mode' AS mode FROM sources WHERE id = $1"),
+    at(12, 3, 'execute', "SELECT DISTINCT\n concat_ws(':',r.claim_phase->'owner'->>'pid',r.claim_phase->'owner'->>'nonce',r.claim_phase->'owner'->>'start') AS key,(r.claim_phase->'owner')::text AS owner\n FROM persistence_requests r WHERE r.state='running' LIMIT 100"),
+    at(13, 4, 'execute', "SELECT key,value FROM config WHERE key LIKE 'persistence.limits.%'"),
+    at(20, 5, 'simple', 'begin'), at(21, 5, 'execute', 'UPDATE persistence_requests SET publication_started=true WHERE id=$1'), at(22, 5, 'simple', 'commit'),
+  ];
+  const phases = classify(records);
+  expect(phases.consumer_scan).toEqual({ statements: 1, describes: 0 });
+  expect(phases.prepare).toEqual({ statements: 2, describes: 0 });
+});
+
 test('the consumer\'s no-op embedding settle pass landing after the claim commit is a consumer scan, not preparation', () => {
   const at = (t: number, conn: number, kind: string, sql: string): TraceRecord => ({ t, ms: 0, conn, kind, sql });
   const records = [
@@ -194,7 +211,11 @@ d('#6007 put_page statement budget (Postgres)', () => {
         for (let i = 0; i < 5; i++) {
           await settle();
           // The 5 s config snapshots (write switches, publication ceiling) are refreshed outside the measured window, so a
-          // slow host whose writes run more than 5 s after the warm-up still measures one write with warm caches.
+          // slow host whose writes run more than 5 s after the warm-up still measures one write with warm caches. A read
+          // of a snapshot still inside its TTL returns it as is, so both are dropped first: one read 4.9 s earlier would
+          // otherwise expire inside the measured write.
+          resetWriteSwitches();
+          _resetPublicationCeilingForTest();
           await Promise.all([readWriteSwitchSnapshot(engine), readPublicationCeilingMs(engine)]);
           const requestId = randomUUID();
           const started = now();

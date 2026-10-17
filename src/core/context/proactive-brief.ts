@@ -19,11 +19,15 @@ import { isConfigTruthy } from '../config.ts';
 import { HALFLIFE_DAYS } from '../facts/decay.ts';
 import { listOpenLoops, type OpenLoopRow } from '../loops/loops-store.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
-import { privatePagesFilterFragment, privateProvenanceFilterFragment } from '../search/private-visibility.ts';
+import { privatePagesFilterFragment, privateProvenanceFilterFragment, privateTimelineEventFilterFragment } from '../search/private-visibility.ts';
 import { pageEligibleSql, projectionEligibleSql } from '../eligibility/sql.ts';
 import type { ReadEligibility } from '../eligibility/policy.ts';
 import { renderTrustedInline, trustFields } from '../eligibility/labels.ts';
 import { redactFindings } from '../secret-scan.ts';
+import { FACTS_FENCE_BEGIN, FACTS_FENCE_END } from '../facts-fence.ts';
+import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../takes-fence.ts';
+import { protectedRegions } from '../fence-scan.ts';
+import { stripMaterializedMarkers } from '../timeline-marker.ts';
 import { MIN_ALIAS_LENGTH, isCommonAliasWord } from '../mentions/aliases.ts';
 import { extractCandidatesFromWindow, isCommonCapitalizedWord, isStopword } from './entity-salience.ts';
 import { resolveEntitiesToPointers, type ReflexPointer } from './retrieval-reflex.ts';
@@ -39,6 +43,8 @@ export const BRIEF_CALENDAR_WINDOW_HOURS = 12;
 export const BRIEF_MIN_CONFIDENCE = 0.8;
 export const BRIEF_MAX_COUNTERPARTIES = 2;
 export const BRIEF_SOURCE_STALE_MS = 24 * 60 * 60 * 1000;
+/** A page edit or timeline entry older than this (recorded, or dated) is not a recent change. */
+export const BRIEF_EDIT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 export const BRIEF_HEADER = '## Before you start';
 export const BRIEF_PULL_HEADER = '## Before you start (pulled on request)';
 /** Brief work stops this long into a turn_context request (of its 400ms server budget; the legacy block runs first). */
@@ -52,10 +58,15 @@ const ENTITY_PREFIXES = ['people/', 'companies/'];
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ENABLED_TTL_MS = 5_000;
 const ENABLED_READ_TIMEOUT_MS = 50;
+/** The edit arm diffs entity-sized pages only: a revision over this many bytes ends the walk. */
+const EDIT_MAX_PAGE_BYTES = 64 * 1024;
+const EDIT_MAX_VERSIONS = 4;
+/** An edit whose words are this much contained in a fact or loop of the same brief repeats it. */
+const SAME_CONTENT_RATIO = 0.8;
 
 /** How the brief was triggered; `brief-<trigger>` is its telemetry match_arm. */
 export type BriefTrigger = 'calendar' | 'lexicon' | 'session' | 'pull';
-export type BriefItemKind = 'loop' | 'change';
+export type BriefItemKind = 'loop' | 'change' | 'edit';
 export type BriefIntent = 'meeting' | 'reply';
 export const BRIEF_INTENTS: readonly BriefIntent[] = ['meeting', 'reply'];
 
@@ -67,7 +78,7 @@ export interface BriefCounterparty {
 }
 
 export interface BriefItem {
-  /** Short id: L<loop id> or F<fact id>. */
+  /** Short id: L<loop id>, F<fact id>, Ev<page version id> (a page edit) or Et<timeline entry id>. */
   id: string;
   kind: BriefItemKind;
   /** YYYY-MM-DD, or null when the item has no date (rendered `undated`). */
@@ -454,6 +465,104 @@ async function changeItem(engine: BrainEngine, cp: BriefCounterparty, skipFactId
 }
 
 /**
+ * The counterparty page's newest dated change, for brains that record a
+ * change by editing the page instead of saving a fact: its newest timeline
+ * entry or its newest revision, whichever was recorded last (a tie goes to
+ * the timeline entry). A revision renders the narrative lines it added that
+ * the page still has; facts and takes fences are dropped from both sides
+ * whole (their rows reach the brief only through the fact arm), as are
+ * headings. The page passes the same world-only and eligibility filters as
+ * the other arms (a timeline entry's event page too); the walk reads at most
+ * EDIT_MAX_VERSIONS revisions of an entity-sized page and skips anything
+ * recorded or dated more than BRIEF_EDIT_MAX_AGE_MS ago.
+ */
+async function editItem(engine: BrainEngine, cp: BriefCounterparty, clock: BriefClock, opts: ArmOpts): Promise<BriefItem | null> {
+  const [pg] = await engine.executeRaw<{ id: number; compiled_truth: string | null; timeline: string | null; trust_tier: unknown; write_origin: unknown }>(
+    `SELECT p.id, CASE WHEN octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')) <= $3 THEN p.compiled_truth END AS compiled_truth,
+            p.timeline, p.trust_tier, p.write_origin
+       FROM pages p
+      WHERE p.source_id = $1 AND p.slug = $2 AND p.deleted_at IS NULL
+        AND ${opts.includePrivate ? 'TRUE' : privatePagesFilterFragment('p')}
+        AND ${pageEligibleSql('p', opts.eligibility)}`,
+    [cp.source_id, cp.slug, EDIT_MAX_PAGE_BYTES],
+  );
+  if (!pg || !live(clock)) return null;
+  const since = new Date(clock.now - BRIEF_EDIT_MAX_AGE_MS).toISOString();
+  const [entries, versions] = await Promise.all([
+    engine.executeRaw<{ id: number; date: string; summary: string; detail: string; created_at: string | Date }>(
+      `SELECT te.id, te.date::text AS date, te.summary, te.detail, te.created_at FROM timeline_entries te
+        WHERE te.page_id = $1 AND te.created_at >= $2::timestamptz AND te.date >= $2::timestamptz::date
+          AND ${opts.includePrivate ? 'TRUE' : privateTimelineEventFilterFragment('te')}
+          AND ${projectionEligibleSql('timeline_entries', 'te', opts.eligibility)}
+        ORDER BY te.created_at DESC, te.date DESC, te.id DESC LIMIT 1`,
+      [pg.id, since],
+    ),
+    pg.compiled_truth === null ? Promise.resolve([]) : engine.executeRaw<{ id: number; compiled_truth: string | null; timeline: string | null; snapshot_at: string | Date; is_deleted: boolean }>(
+      `SELECT v.id, CASE WHEN octet_length(v.compiled_truth) + octet_length(COALESCE(v.timeline, '')) <= $3 THEN v.compiled_truth END AS compiled_truth,
+              v.timeline, v.snapshot_at, v.is_deleted
+         FROM page_versions v WHERE v.page_id = $1 AND v.snapshot_at >= $2::timestamptz
+        ORDER BY v.id DESC LIMIT ${EDIT_MAX_VERSIONS}`,
+      [pg.id, since, EDIT_MAX_PAGE_BYTES],
+    ),
+  ]);
+  const current = pg.compiled_truth === null ? [] : narrativeLines(pg.compiled_truth, pg.timeline);
+  const still = new Set(current);
+  let revision: { id: string; at: number; added: string[] } | null = null;
+  let newer = current;
+  for (const v of versions) {
+    if (v.compiled_truth === null || v.is_deleted) break;
+    const older = narrativeLines(v.compiled_truth, v.timeline);
+    const pool = new Map<string, number>();
+    for (const l of older) pool.set(l, (pool.get(l) ?? 0) + 1);
+    const added = newer.filter((l) => {
+      const n = pool.get(l) ?? 0;
+      if (n > 0) { pool.set(l, n - 1); return false; }
+      return still.has(l);
+    });
+    if (added.length) { revision = { id: `Ev${Number(v.id)}`, at: new Date(v.snapshot_at).getTime(), added }; break; }
+    newer = older;
+  }
+  const entry = entries[0];
+  const entryAt = entry ? new Date(entry.created_at).getTime() : Number.NEGATIVE_INFINITY;
+  const base = { kind: 'edit' as const, slug: cp.slug, source_id: cp.source_id, counterparty: cp.slug, confidence: cp.confidence };
+  if (entry && (!revision || entryAt >= revision.at)) {
+    const body = entry.detail ? `${entry.summary} — ${entry.detail}` : entry.summary;
+    return { ...base, id: `Et${Number(entry.id)}`, date: ymd(entry.date), text: `timeline: ${renderStored(body, pg.trust_tier, pg.write_origin)}` };
+  }
+  if (!revision) return null;
+  return { ...base, id: revision.id, date: ymd(new Date(revision.at)), text: `edit: ${renderStored(revision.added.join(' '), pg.trust_tier, pg.write_origin)}` };
+}
+
+const FENCE_PAIRS = [{ begin: FACTS_FENCE_BEGIN, end: FACTS_FENCE_END }, { begin: TAKES_FENCE_BEGIN, end: TAKES_FENCE_END }] as const;
+
+/** A page's narrative lines: protected fences (and an unterminated tail) dropped whole, materialized markers and headings dropped, trimmed, non-empty. */
+function narrativeLines(compiled: string, timeline: string | null): string[] {
+  return [compiled, timeline ?? ''].flatMap((part) => {
+    const { regions, truncatedAt } = protectedRegions(part, FENCE_PAIRS);
+    let kept = '';
+    let cursor = 0;
+    for (const r of regions) { kept += part.slice(cursor, r.start); cursor = r.end; }
+    kept += truncatedAt === -1 ? part.slice(cursor) : part.slice(cursor, truncatedAt);
+    return stripMaterializedMarkers(kept).split('\n').map((l) => l.trim()).filter((l) => l && !/^#{1,6}\s/.test(l));
+  });
+}
+
+/** Two items carry the same content when the smaller one's words are SAME_CONTENT_RATIO contained in the other's (quoted body only). */
+function sameContent(a: BriefItem, b: BriefItem): boolean {
+  const words = (i: BriefItem) => {
+    const t = i.text.slice(i.text.indexOf('“') + 1, i.text.lastIndexOf('”'));
+    return new Set(t.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 1 && !isStopword(w)));
+  };
+  const [x, y] = [words(a), words(b)];
+  const small = x.size <= y.size ? x : y;
+  const large = small === x ? y : x;
+  if (!small.size) return false;
+  let shared = 0;
+  for (const w of small) if (large.has(w)) shared++;
+  return shared / small.size >= SAME_CONTENT_RATIO;
+}
+
+/**
  * Stored text as data: secret-redacted BEFORE collapsing and clipping (so a
  * cut can't split a credential past the scanner), one line, no comment or
  * code delimiters, quoted, with the existing trust label where the row has a
@@ -487,8 +596,9 @@ export interface AssembleBriefOpts {
 }
 
 /**
- * Rank and cap: per counterparty the top loop, the newest change, then
- * further loops; at most BRIEF_MAX_ITEMS in total, each line <=
+ * Rank and cap: per counterparty the top loop, the newest change, the newest
+ * page edit (dropped when it repeats the content of one of the counterparty's
+ * facts or loops), then further loops; at most BRIEF_MAX_ITEMS in total, each line <=
  * BRIEF_ITEM_MAX_CHARS, the block <= BRIEF_MAX_CHARS and BRIEF_MAX_BYTES.
  * Stops issuing queries once the clock passes. Null when nothing survives.
  */
@@ -501,8 +611,10 @@ export async function assembleBrief(engine: BrainEngine, opts: AssembleBriefOpts
     const loops = opts.local ? await loopItems(engine, cp, opts.clock, arm).catch(() => []) : [];
     const loopFacts = new Set(loops.map((l) => l.factId).filter((n): n is number => n !== null));
     const change = live(opts.clock) ? await changeItem(engine, cp, loopFacts, arm).catch(() => null) : null;
+    const found = await (live(opts.clock) ? editItem(engine, cp, opts.clock, arm).catch(() => null) : null);
+    const edit = found && ![change, ...loops].some((x) => x && sameContent(found, x)) ? found : null;
     const fresh = loops.filter((l) => !seen(l.id)).map(({ factId, ...item }) => { void factId; return item; });
-    for (const i of [fresh[0], change, ...fresh.slice(1)]) {
+    for (const i of [fresh[0], change, edit, ...fresh.slice(1)]) {
       if (!i || seen(i.id) || items.some((x) => x.id === i.id)) continue;
       if (items.length >= BRIEF_MAX_ITEMS) break;
       items.push(i);

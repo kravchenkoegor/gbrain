@@ -29,11 +29,11 @@ import type { SearchResult, PageType, RelationalFanoutRow, PageReadPolicy } from
 import { createAuditWriter } from '../audit/audit-writer.ts';
 import { listSources } from '../sources-ops.ts';
 import { ALL_SOURCES } from '../source-id.ts';
-import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
+import { resolveEntitySlugWithSource, retiredPageSql } from '../entities/resolve.ts';
 import { buildVisibilityClause } from './sql-ranking.ts';
 import { hasReadPolicy, pageReadFilter } from './read-policy-sql.ts';
 import { boundedProjectedPrefix } from '../page-window/document.ts';
-import { boundedPrefixSql, overlaidBoundedRows } from '../page-window/bounded-lead.ts';
+import { boundedBodyPrefixSql, overlaidBoundedRows } from '../page-window/bounded-lead.ts';
 import { parseRelationalQuery, type RelationalQuery, type RelationVocab } from './relational-intent.ts';
 import { edgeValidityEnabled, type EdgeTemporalOpts } from '../link-validity.ts';
 import { stampEvidence, type EvidenceOpts } from './evidence.ts';
@@ -151,7 +151,7 @@ async function resolveSeedScoped(
     if (r?.source === 'fallback_slugify' && titleTypes.length) {
       const titled = await engine.executeRaw<{ slug: string }>(
         `SELECT slug FROM pages WHERE source_id = $1 AND deleted_at IS NULL AND type = ANY($2::text[])
-           AND lower(title) = lower($3) LIMIT 2`, [sid, titleTypes, phrase.trim()]);
+           AND lower(title) = lower($3) AND NOT ${retiredPageSql('pages')} LIMIT 2`, [sid, titleTypes, phrase.trim()]);
       if (titled.length === 1) r = { slug: titled[0].slug, source: 'exact_page' };
     }
     if (!r || r.source === 'fallback_slugify') continue;
@@ -190,7 +190,7 @@ async function hydrate(
     page_id: number; slug: string; source_id: string; title: string; type: string; synopsis: string | null;
   }>(
     `SELECT p.id AS page_id, p.slug, p.source_id, p.title, p.type,
-            ${boundedPrefixSql('p.compiled_truth')} AS synopsis
+            ${boundedBodyPrefixSql('p')} AS synopsis
      FROM pages p
      JOIN sources s ON s.id = p.source_id
      JOIN unnest($1::text[], $2::text[]) AS refs(source_id, slug)

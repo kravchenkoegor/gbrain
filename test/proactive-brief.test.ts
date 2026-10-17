@@ -12,6 +12,7 @@ import { upsertOpenLoop } from '../src/core/loops/loops-store.ts';
 import {
   __resetBriefStateForTests,
   BRIEF_CALENDAR_WINDOW_HOURS,
+  BRIEF_EDIT_MAX_AGE_MS,
   BRIEF_HEADER,
   BRIEF_INTENTS,
   BRIEF_ITEM_MAX_CHARS,
@@ -24,6 +25,7 @@ import {
   recordBriefDelivered,
   renderBriefLine,
   resetBriefLedger,
+  assembleBrief,
   sessionStartBrief,
   turnBrief,
   withBriefDeadline,
@@ -38,6 +40,8 @@ import { operationsByName, type OperationContext } from '../src/core/operations.
 import { BRIEF_INTENTS as OP_BRIEF_INTENTS } from '../src/core/ops/facts.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { __resetHotMemoryCacheForTests } from '../src/core/facts/meta-hook.ts';
+import { importFromContent } from '../src/core/import-file.ts';
+import { FACTS_FENCE_BEGIN, FACTS_FENCE_END } from '../src/core/facts-fence.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 
 let engine: PGLiteEngine;
@@ -95,6 +99,14 @@ async function loop(summary: string, opts: { factId?: number | null; dueAt?: str
   await engine.executeRaw(`UPDATE open_loops SET fact_id = $1, last_activity_at = $2 WHERE id = $3`,
     [opts.factId ?? null, new Date(Date.now() - (opts.lastActivityAgoMs ?? HOUR)).toISOString(), id]);
   return Number(id);
+}
+
+/** Rewrite a page through the import write path: the preimage becomes a page_versions row, as an agent's put_page or edit_page leaves it. */
+async function rewrite(slug: string, title: string, body: string, opts: { type?: string; frontmatter?: Record<string, unknown>; timeline?: string } = {}) {
+  const fm = Object.entries({ type: opts.type ?? 'person', title, ...opts.frontmatter }).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join('\n');
+  const md = `---\n${fm}\n---\n\n# ${title}\n\n${body}\n${opts.timeline ? `\n## Timeline\n\n${opts.timeline}\n` : ''}`;
+  const r = await importFromContent(engine, slug, md, { noEmbed: true });
+  expect(r.status).toBe('imported');
 }
 
 async function seedAlice() {
@@ -259,6 +271,181 @@ describe('items, ranking and limits', () => {
   });
 });
 
+describe('page edits (brains that record a change by editing pages)', () => {
+  const BEFORE = '- Next meeting: pricing review on Friday, October 16 (2026-10-16) at 13:30.';
+  const AFTER = '- Next meeting: pricing review on Tuesday, October 20 (2026-10-20) at 13:30 (moved from Friday, October 16).';
+
+  test('a brain whose only record of the change is a page edit gets a dated edit item', async () => {
+    await rewrite('people/alice-example', 'Alice Example', `Alice Example is DevOps Manager.\n\n## Current\n\n${BEFORE}`);
+    await rewrite('people/alice-example', 'Alice Example', `Alice Example is DevOps Manager.\n\n## Current\n\n${AFTER}`);
+    const [{ id }] = await engine.executeRaw<{ id: number }>(`SELECT max(id) AS id FROM page_versions`);
+    const brief = await prompt('Prep for my meeting with Alice Example');
+    expect(brief!.items.map((i) => [i.id, i.kind])).toEqual([[`Ev${id}`, 'edit']]);
+    expect(brief!.text).toContain(`- [Ev${id}] ${new Date().toISOString().slice(0, 10)} · edit: [unverified origin · legacy] “${AFTER}” → \`people/alice-example\``);
+  });
+
+  test('a change recorded only in the Timeline section, or as a timeline entry, gets an item', async () => {
+    await rewrite('people/alice-example', 'Alice Example', 'Alice Example is DevOps Manager.');
+    const line = '- **2026-10-14** | Call: pricing review moved to 2026-10-20';
+    await rewrite('people/alice-example', 'Alice Example', 'Alice Example is DevOps Manager.', { timeline: line });
+    const viaSection = await prompt('Draft a reply to Alice Example', 'te1');
+    expect(viaSection!.items).toHaveLength(1);
+    expect(viaSection!.items[0]!.text).toContain(line);
+    const day = new Date().toISOString().slice(0, 10);
+    expect(await engine.addTimelineEntry('people/alice-example', { date: day, source: 'test', summary: 'Pricing review moved to Tuesday', detail: 'same time' } as never, { sourceId: 'default' })).toBe(true);
+    const [{ id }] = await engine.executeRaw<{ id: number }>(`SELECT max(id) AS id FROM timeline_entries`);
+    const viaEntry = await prompt('Draft a reply to Alice Example', 'te2');
+    expect(viaEntry!.items.map((i) => i.id)).toEqual([`Et${id}`]);
+    expect(viaEntry!.text).toContain(`- [Et${id}] ${day} · timeline: [unverified origin · legacy] “Pricing review moved to Tuesday — same time” → \`people/alice-example\``);
+  });
+
+  test('an edit and a fact with the same content dedupe to the fact; different content keeps both', async () => {
+    await rewrite('people/alice-example', 'Alice Example', BEFORE);
+    await rewrite('people/alice-example', 'Alice Example', AFTER);
+    const same = await fact('Next meeting: pricing review moved to Tuesday, October 20 (2026-10-20) at 13:30, from Friday, October 16.', 'people/alice-example');
+    expect((await prompt('Prep for my meeting with Alice Example', 'd1'))!.items.map((i) => i.id)).toEqual([`F${same}`]);
+    await rewrite('people/alice-example', 'Alice Example', `${AFTER}\n- Champion for the security review.`);
+    const items = (await prompt('Prep for my meeting with Alice Example', 'd2'))!.items;
+    expect(items.map((i) => i.kind)).toEqual(['change', 'edit']);
+    expect(items[1]!.text).toContain('Champion for the security review.');
+    expect(items[1]!.text).not.toContain('October 20');
+  });
+
+  test('fence rows, headings and removed lines are not an edit; an edit is delivered once per session', async () => {
+    await rewrite('people/alice-example', 'Alice Example', 'Alice Example.\n- Old line.');
+    await rewrite('people/alice-example', 'Alice Example', `Alice Example.\n\n## Facts\n\n${FACTS_FENCE_BEGIN}\n| 1 | Some fact | fact | 1.0 | world |\n${FACTS_FENCE_END}`);
+    expect(await prompt('Draft a reply to Alice Example', 'f1')).toBeNull();
+    await rewrite('people/alice-example', 'Alice Example', `Alice Example.\n- New line.\n\n## Facts\n\n${FACTS_FENCE_BEGIN}\n| 1 | Some fact | fact | 1.0 | world |\n${FACTS_FENCE_END}`);
+    const brief = await prompt('Draft a reply to Alice Example', 'f2');
+    expect(brief!.items.map((i) => i.text)).toEqual(['edit: [unverified origin · legacy] “- New line.”']);
+    recordBriefDelivered('default', 'f2', brief!.items.map((i) => i.id));
+    expect(await prompt('Draft another reply to Alice Example', 'f2')).toBeNull();
+  });
+
+  test('edits recorded or dated past the window are skipped', async () => {
+    await rewrite('people/alice-example', 'Alice Example', BEFORE);
+    await rewrite('people/alice-example', 'Alice Example', AFTER);
+    await engine.executeRaw(`UPDATE page_versions SET snapshot_at = $1`, [new Date(Date.now() - BRIEF_EDIT_MAX_AGE_MS - DAY).toISOString()]);
+    expect(await prompt('Draft a reply to Alice Example', 'w1')).toBeNull();
+    const old = new Date(Date.now() - BRIEF_EDIT_MAX_AGE_MS - DAY).toISOString().slice(0, 10);
+    await engine.addTimelineEntry('people/alice-example', { date: old, source: 'test', summary: 'Long ago' } as never, { sourceId: 'default' });
+    expect(await prompt('Draft a reply to Alice Example', 'w2')).toBeNull();
+  });
+
+  test('a delivered edit logs its own rationale kind', async () => {
+    await rewrite('people/alice-example', 'Alice Example', BEFORE);
+    await rewrite('people/alice-example', 'Alice Example', AFTER);
+    const [{ id }] = await engine.executeRaw<{ id: number }>(`SELECT max(id) AS id FROM page_versions`);
+    const base = await turnContextWithBrief(engine, 'default', { kind: 'turn_context', protocol: 2, secret: 'x', sessionId: 'se', window: [{ role: 'user', text: 'Draft a reply to Alice Example' }] });
+    briefDelivered(engine, 'default', base, 'se');
+    await awaitPendingVolunteerEventWrites();
+    const rows = await engine.executeRaw<{ match_arm: string; rationale: string }>(`SELECT match_arm, rationale FROM context_volunteer_events WHERE channel = 'brief'`);
+    expect(rows).toEqual([{ match_arm: 'brief-lexicon', rationale: `edit:Ev${id}` }]);
+  });
+
+  test('the remote pull carries a world page edit (world-only, like the fact arm)', async () => {
+    await rewrite('people/alice-example', 'Alice Example', BEFORE);
+    await rewrite('people/alice-example', 'Alice Example', AFTER);
+    const res = await dispatchToolCall(engine as never, 'context_pack', { counterparty: 'Alice Example', intent: 'meeting' }, { remote: true, transport: 'stdio', sourceId: 'default' });
+    const body = JSON.parse((res.content[0] as { text: string }).text) as { brief: { items: Array<{ kind: string; text: string }> } };
+    expect(body.brief.items.map((i) => i.kind)).toEqual(['edit']);
+    expect(body.brief.items[0]!.text).toContain('Tuesday, October 20');
+  });
+
+  test('the edit arm filters a private page itself, even for a counterparty the resolver never produced', async () => {
+    const CANARY = ['EDITPAGECANARY', 'Q7'].join('');
+    const shapes: Array<[string, Record<string, unknown>]> = [
+      ['people/secret-direct', { visibility: 'private' }],
+      ['people/derived-direct', { derived_from: 'notes/private-src-direct' }],
+    ];
+    await page('notes/private-src-direct', 'note', 'Private source', { frontmatter: { visibility: 'private' } });
+    for (const [slug, frontmatter] of shapes) {
+      await rewrite(slug, 'Hidden Example', 'Hidden.', { frontmatter });
+      await rewrite(slug, 'Hidden Example', `Hidden.\n- ${CANARY} moved the call.`, { frontmatter });
+      const counterparties = [{ slug, source_id: 'default', display: 'Hidden Example', confidence: 1 }];
+      for (const local of [true, false]) {
+        expect(await assembleBrief(engine, { trigger: 'lexicon', counterparties, local, clock: clock() })).toBeNull();
+      }
+      const widened = await assembleBrief(engine, { trigger: 'pull', counterparties, local: true, includePrivate: true, clock: clock() });
+      expect(widened!.items.map((i) => i.kind)).toEqual(['edit']);
+      expect(widened!.text).toContain(CANARY);
+    }
+  });
+
+  test('a remote caller never gets an edit from a private page or event, or from a page outside its source', async () => {
+    const CANARY = ['REMOTEEDITCANARY', 'W3'].join('');
+    await engine.executeRaw(`INSERT INTO sources (id, name, config) VALUES ('aa-other', 'aa-other', '{}'::jsonb) ON CONFLICT (id) DO NOTHING`);
+    // The same slug in a source the caller is not bound to, written first and sorting first, so an unscoped page read would find it first.
+    await engine.executeRaw(`DELETE FROM pages WHERE source_id = 'default' AND slug = 'people/alice-example'`);
+    for (const body of ['Alice Example.', `Alice Example.\n- ${CANARY} other-source edit.`]) {
+      expect((await importFromContent(engine, 'people/alice-example', `---\ntype: person\ntitle: Alice Example\n---\n\n${body}\n`, { noEmbed: true, sourceId: 'aa-other' })).status).toBe('imported');
+    }
+    await seedAlice();
+    await rewrite('people/secret-remote', 'Secret Remote Example', 'Secret.', { frontmatter: { visibility: 'private' } });
+    await rewrite('people/secret-remote', 'Secret Remote Example', `Secret.\n- ${CANARY} private edit.`, { frontmatter: { visibility: 'private' } });
+    await page('events/private-remote', 'event', 'Private event', { frontmatter: { visibility: 'private' } });
+    const [{ id: pid }] = await engine.executeRaw<{ id: number }>(`SELECT id FROM pages WHERE source_id = 'default' AND slug = 'people/alice-example'`);
+    const [{ id: eid }] = await engine.executeRaw<{ id: number }>(`SELECT id FROM pages WHERE slug = 'events/private-remote'`);
+    await engine.executeRaw(`INSERT INTO timeline_entries (page_id, date, source, summary, event_page_id) VALUES ($1, CURRENT_DATE, 'test', $2, $3)`, [pid, `${CANARY} private event`, eid]);
+    for (const counterparty of ['Alice Example', 'people/alice-example', 'people/secret-remote', 'Secret Remote Example']) {
+      const res = await dispatchToolCall(engine as never, 'context_pack', { counterparty, intent: 'meeting' }, { remote: true, transport: 'stdio', sourceId: 'default' });
+      const text = res.content.map((c) => (c as { text?: string }).text ?? '').join('\n');
+      expect(text).not.toContain(CANARY);
+    }
+  });
+
+  test('canary fuzz: an edit on a private page, in a fence, or on a private event never surfaces', async () => {
+    let seed = 0x5eed;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed; };
+    const canary = (n: number) => `EDITCANARY${n}x${rnd().toString(36)}`;
+    const canaries: string[] = [];
+    const shapes: Array<(c: string, n: number) => Promise<void>> = [
+      async (c, n) => { // explicitly private counterparty page
+        const slug = `people/secret-${n}`;
+        await rewrite(slug, `Secret ${n} Example`, 'Secret person.', { frontmatter: { visibility: 'private' } });
+        await engine.setPageAliases(slug, 'default', [normalizeAlias(`Secret ${n} Example`)]);
+        await rewrite(slug, `Secret ${n} Example`, `Secret person.\n- ${c} moved the call.`, { frontmatter: { visibility: 'private' }, timeline: `- **2026-10-14** | ${c} timeline` });
+        await engine.addTimelineEntry(slug, { date: new Date().toISOString().slice(0, 10), source: 'test', summary: `${c} entry` } as never, { sourceId: 'default' });
+      },
+      async (c) => { // a private fact row added inside the facts fence of the world page
+        const rows = `| 1 | ${c} salary | fact | 1.0 | private |`;
+        await rewrite('people/alice-example', 'Alice Example', `Alice Example.\n\n## Facts\n\n${FACTS_FENCE_BEGIN}\n${rows}\n${FACTS_FENCE_END}`);
+      },
+      async (c) => { // an unterminated fence tail
+        await rewrite('people/alice-example', 'Alice Example', `Alice Example.\n\n${FACTS_FENCE_BEGIN}\n| 2 | ${c} tail | fact | 1.0 | private |`);
+      },
+      async (c, n) => { // a world-looking page derived from a private one
+        await page(`notes/private-src-${n}`, 'note', 'Private source', { frontmatter: { visibility: 'private' } });
+        const slug = `people/derived-${n}`;
+        await rewrite(slug, `Derived ${n} Example`, 'Derived.', { frontmatter: { derived_from: `notes/private-src-${n}` } });
+        await engine.setPageAliases(slug, 'default', [normalizeAlias(`Derived ${n} Example`)]);
+        await rewrite(slug, `Derived ${n} Example`, `Derived.\n- ${c} derived edit.`, { frontmatter: { derived_from: `notes/private-src-${n}` } });
+      },
+      async (c, n) => { // a timeline entry projected from a private event page onto the world page
+        await page(`events/private-${n}`, 'event', 'Private event', { frontmatter: { visibility: 'private' } });
+        const [{ id: pid }] = await engine.executeRaw<{ id: number }>(`SELECT id FROM pages WHERE slug = 'people/alice-example'`);
+        const [{ id: eid }] = await engine.executeRaw<{ id: number }>(`SELECT id FROM pages WHERE slug = $1`, [`events/private-${n}`]);
+        await engine.executeRaw(`INSERT INTO timeline_entries (page_id, date, source, summary, event_page_id) VALUES ($1, CURRENT_DATE, 'test', $2, $3)`, [pid, `${c} private event`, eid]);
+      },
+    ];
+    for (let round = 0; round < 3; round++) {
+      for (const [n, shape] of shapes.entries()) {
+        const c = canary(round * 10 + n);
+        canaries.push(c);
+        await shape(c, round * 10 + n);
+      }
+      const texts: string[] = [];
+      for (const who of ['Alice Example', `Secret ${round * 10} Example`, `Derived ${round * 10 + 3} Example`]) {
+        texts.push((await prompt(`Prep for my meeting with ${who}`, `cz-${round}-${who}`))?.text ?? '');
+        texts.push(JSON.stringify(await operationsByName.context_pack!.handler(localCtx(), { counterparty: who })));
+        const res = await dispatchToolCall(engine as never, 'context_pack', { counterparty: who }, { remote: true, transport: 'stdio', sourceId: 'default' });
+        texts.push(res.content.map((x) => (x as { text?: string }).text ?? '').join('\n'));
+      }
+      for (const t of texts) for (const c of canaries) expect(t).not.toContain(c);
+    }
+  });
+});
+
 describe('privacy: private material is never pushed', () => {
   const CANARY = ['PRIVCANARY', 'Zq9'].join('');
 
@@ -387,6 +574,21 @@ describe('default off', () => {
       expect(JSON.stringify(served)).toBe(JSON.stringify(legacy));
       expect(served.text).not.toContain(BRIEF_HEADER);
     }
+  });
+
+  test('with the key unset, a brain holding a page edit answers byte-identically to the legacy assembly', async () => {
+    await rewrite('people/alice-example', 'Alice Example', '- Next meeting: Friday, October 16.');
+    await rewrite('people/alice-example', 'Alice Example', '- Next meeting: Tuesday, October 20 (moved from Friday, October 16).');
+    await engine.unsetConfig(PROACTIVE_BRIEF_KEY);
+    __resetBriefStateForTests();
+    __resetHotMemoryCacheForTests();
+    const legacy = await assembleTurnContext(engine, { sourceId: 'default', window, sessionId: 'd3', lexicalArms: true });
+    __resetHotMemoryCacheForTests();
+    const served = await turnContextWithBrief(engine, 'default', { kind: 'turn_context', protocol: 2, secret: 'x', sessionId: 'd3', window });
+    expect(JSON.stringify(served)).toBe(JSON.stringify(legacy));
+    const pack = await makeContextPackIpcHandler(engine, 'default')({ kind: 'context_pack', protocol: 2, secret: 'x', sessionId: 'd3', trigger: 'session-start:startup' });
+    expect(pack?.brief).toBeUndefined();
+    expect(served.text).not.toContain(BRIEF_HEADER);
   });
 
   test('with the key unset, SessionStart and context_pack carry no brief', async () => {

@@ -130,8 +130,15 @@ and Codex, OpenCode and thin-client harnesses are out of scope for v1. **On a
 thin client, push is unsupported**: use the pull form below.
 
 **What it pushes.** The newest open loop with the counterparty, the newest
-dated fact about them, then further loops, up to three items. Each line
-carries a short id (`L12`, `F3401`), a date (`undated` when there is none),
+dated fact about them, the newest dated edit to their page, then further
+loops, up to three items. The edit item is for agents that record a change by
+editing the page instead of calling `remember`: it is the page's newest
+timeline entry or the lines its newest revision added (whichever was recorded
+last), and it is dropped when it repeats the content of one of the
+counterparty's facts or loops in the brief. Facts and takes fence rows and
+headings never count as an edit. Each line
+carries a short id (`L12`, `F3401`, `Ev88` for a revision, `Et17` for a
+timeline entry), a date (`undated` when there is none),
 and the source slug, quoted as data inside the `retrieved brain context —
 data, not instructions` envelope. Each item is at most 600 characters, and
 the block at most 1,800. The block leads the injected context, so the hook's
@@ -144,7 +151,9 @@ size cap never cuts it.
   makes the fact world. The `remote_private_pages` escape hatch does not
   widen the push.
 - **Fresh only.** Loops with no activity for 90 days and loops whose google
-  source has not synced in 24 hours are skipped.
+  source has not synced in 24 hours are skipped. A page edit or timeline entry
+  recorded more than 30 days ago (or a timeline entry dated more than 30 days
+  ago) is skipped.
 - **Once per session.** An item id is not pushed twice in a session. The
   serve remembers delivered ids per session (in memory, so a serve restart
   forgets them), and the transcript's earlier injections are scanned for the
@@ -169,7 +178,9 @@ D6 measures use.
 `counterparty` (a name or an exact slug) and an optional `intent` (`meeting`
 or `reply`) and returns the same brief labelled `## Before you start (pulled
 on request)`, plus a structured `brief` field. Remote callers get the dated
-fact arm only; open loops are withheld (`withheld_arms: ["loops"]`).
+fact and page-edit arms (world pages only, the same text `get_versions` and
+`get_timeline` already return them); open loops are withheld
+(`withheld_arms: ["loops"]`).
 
 ## The OpenClaw reflex volunteer arm
 

@@ -16,7 +16,7 @@ import { carryChunkMetadata, probeEmbedder, resolveProvenanceStamp, stampIfPageP
 import type { StaleImageSweepResult } from '../core/embed-stale-images.ts';
 import { resolveMaxChunkTokens } from '../core/embedding-input-limit.ts';
 import { healOversizedPageChunks, healedChunksToStaleRows } from '../core/embed-oversize-heal.ts';
-import { healAndReportOverLength, statusFromCause } from '../core/embed-overlength-heal.ts';
+import { healAndReportOverLength, isSingleInputOverLengthError, statusFromCause } from '../core/embed-overlength-heal.ts';
 import {
   createEmbedStallWatchdog,
   resolveEmbedStallAbortSeconds,
@@ -50,7 +50,9 @@ import { resolveEmbedConcurrency } from '../core/embed-concurrency.ts';
 export { resolveEmbedConcurrency, _resetEmbedConcurrencyClampWarningForTest } from '../core/embed-concurrency.ts';
 import { isEmbeddingZeroNormError } from '../core/ai/embedding-guard.ts';
 import { wrapChunkTextsForStoredMode } from '../core/embedding-context.ts';
-import { heldEmbedArgv, meterPageBatch, spendGrant } from '../core/page-embedding-budget.ts';
+import { meterPageBatch, spendGrant } from '../core/page-embedding-budget.ts';
+import { heldApprovalUsd, heldEmbedArgv } from '../core/held-embedding.ts';
+import { countSegmentedEmbedRows, embedSegmentedPage, readSealedSegmentedEmbedPage, readSegmentedEmbedPage, type SegmentedEmbedPage } from '../core/page-body/segmented-embedding.ts';
 import {
   restampIfDemotedToTitleTier,
   embedBatchWithBackoff,
@@ -911,9 +913,7 @@ export async function runEmbed(engine: BrainEngine, args: string[], selectedConf
 
   if (args.includes('--held')) {
     const held = await heldEmbedArgv(engine, args, currentEmbeddingSignature(), args.includes('--json') ? serr : slog);
-    if (held && 'error' in held) { serr(held.error); process.exit(1); }
-    if (held) return runEmbed(engine, held.argv, selectedConfig, consent);
-    return { embedded: 0, skipped: 0, would_embed: 0, total_chunks: 0, pages_processed: 0, failures: 0, failure_samples: [], dryRun: args.includes('--dry-run'), chunkless_pages_healed: 0 };
+    return 'argv' in held ? runEmbed(engine, held.argv, selectedConfig, consent) : held;
   }
   const authorization = consent?.authorization ?? null;
   const costCap = args.includes('--dry-run') || args.includes('--background') ? null : embedCostCap(authorization?.cap_usd, authorization?.cap_source);
@@ -981,7 +981,7 @@ export async function runEmbed(engine: BrainEngine, args: string[], selectedConf
 
   let opts: EmbedOpts;
   if (slugsIdx >= 0) {
-    const approvedPageCapUsd = authorization?.via === 'max_usd' && authorization.cap_usd !== null ? authorization.cap_usd : undefined;
+    const approvedPageCapUsd = await heldApprovalUsd(engine, args);
     opts = { slugs: slugsAfter(args, slugsIdx), dryRun, sourceId, batchSize, priority, catchUp, ...(approvedPageCapUsd !== undefined && { approvedPageCapUsd }) };
   } else if (all || stale) {
     // E-2: CLI-only single-flight for stale runs (the minion path locks itself).
@@ -1064,6 +1064,34 @@ export async function runEmbed(engine: BrainEngine, args: string[], selectedConf
   }
 }
 
+/**
+ * Wave B: embed a segmented page's vector-less live rows (all of them with `all`)
+ * by keyset (`embedSegmentedPage`), never through its body or a whole-page
+ * chunk read. A dry run only counts those rows.
+ */
+async function embedSegmented(engine: BrainEngine, page: SegmentedEmbedPage, result: EmbedResult,
+  opts: { dryRun: boolean; signal?: AbortSignal; signature?: string; approvedCapUsd?: number; all?: boolean }): Promise<void> {
+  if (opts.dryRun) {
+    const counts = await countSegmentedEmbedRows(engine, page.id);
+    result.total_chunks += counts.total;
+    result.would_embed += opts.all ? counts.total : counts.stale;
+    result.pages_processed++;
+    return;
+  }
+  try {
+    const done = await embedSegmentedPage(engine, page, { embedFn: (texts, o) => embedBatchWithBackoff(texts, o),
+      signal: opts.signal, signature: opts.signature, approvedCapUsd: opts.approvedCapUsd, all: opts.all });
+    result.embedded += done.embedded;
+    const stamp = done.complete ? await resolveProvenanceStamp(engine, opts.signature) : undefined;
+    if (stamp) await stampIfPageProvenanceComplete(engine, page.slug, page.source_id, stamp);
+    if (done.stopped === 'page_moved') recordFailure(result, 1, page.slug, EMBED_UNAVAILABLE_MESSAGE);
+  } catch (e: unknown) {
+    if (isAborted(opts.signal)) throw e;
+    recordFailure(result, 1, page.slug, e);
+  }
+  result.pages_processed++;
+}
+
 async function embedPage(
   engine: BrainEngine,
   slug: string,
@@ -1078,6 +1106,12 @@ async function embedPage(
   const initial = await engine.readPageSnapshot(slug, opts);
   if (!initial) {
     throw new Error(`Page not found: ${slug}`);
+  }
+  const segmented = await readSealedSegmentedEmbedPage(engine, initial.page, !dryRun);
+  if (segmented) {
+    if (isEmbedSkipped(initial.page.frontmatter)) { if (!quiet) serr(`  ${slug}: skipped (frontmatter.embed_skip set); its chunks stay keyword-searchable`); return; }
+    await embedSegmented(engine, segmented, result, { dryRun, signal, signature: currentEmbeddingSignature() ?? undefined, approvedCapUsd: approvedPageCapUsd });
+    return;
   }
   const origin = await readProjectionSnapshot(engine, slug, initial.page.source_id, { allowUnsealed: true, requireLiveSource: !dryRun });
   if (!origin || origin.snapshot.revision !== initial.revision || origin.snapshot.page.id !== initial.page.id
@@ -1336,6 +1370,8 @@ async function embedAll(
     // target the correct (source_id, slug) row, not the 'default' source.
     const pageSourceId = page.source_id;
     const pageOpts = pageSourceId ? { sourceId: pageSourceId } : undefined;
+    const segmented = await observed(pacer, () => readSealedSegmentedEmbedPage(engine, page, !dryRun));
+    if (segmented) { await embedSegmented(engine, segmented, result, { dryRun, signal, signature, all: true }); return; }
     const prepared = await observed(pacer, () => readProjectionSnapshot(engine, page.slug, pageSourceId, { requireLiveSource: !dryRun }));
     if (!prepared) {
       if (!dryRun) recordFailure(result, 1, page.slug, EMBED_UNAVAILABLE_MESSAGE);
@@ -2041,6 +2077,8 @@ async function embedAllStale(
         const keySourceId = stale[0]?.source_id ?? 'default';
         const slug = stale[0].slug;
         try {
+          const segmented = await observed(pacer, () => readSegmentedEmbedPage(engine, { sourceId: keySourceId, slug }));
+          if (segmented) { await embedSegmented(engine, segmented, result, { dryRun: false, signal: effectiveSignal, signature }); processedPageKeys.add(key); return; }
           // SUP-3874: split legacy oversized chunk_text BEFORE the embed call.
           // `--stale` reuses stored rows; without this, one pre-cap chunk
           // (e.g. a long pre-cap notes page on a 512-token model) fails
@@ -2240,7 +2278,7 @@ async function embedPageTexts(
     if (texts.length <= 1) throw e; // nothing to isolate
     // #3374 — network-transient exhaustion isn't chunk-specific either:
     // fanning out during an outage multiplies failing calls per page.
-    if (isEmbedRetriableError(e) || isTransientNetworkEmbedError(e) || e instanceof AITransientError) throw e;
+    if (!isSingleInputOverLengthError(e) && (isEmbedRetriableError(e) || isTransientNetworkEmbedError(e) || e instanceof AITransientError)) throw e;
     const status = statusFromCause(e);
     if (status === 401 || status === 403) throw e;
 

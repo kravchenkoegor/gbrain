@@ -1,3 +1,4 @@
+import { PENDING_IMPORT, pendingImportRefusal } from './pending-import.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { OperationError } from '../ops/contract.ts';
@@ -335,6 +336,11 @@ export function writeResponse(row: WriteRequest, hints: { retryAfterMs?: number 
       ? pendingWriteHint(receipt, row.operation)
       : delivered?.suggestion ?? content?.suggestion ?? held?.suggestion ?? terminalReceiptHint(row, reason), delivered?.docs);
   if (delivered?.detail ?? held?.reason) error.detail = delivered?.detail ?? held?.reason;
+  // #6693: a write refused while its page's file awaited import says so, with the wait (remember) or the sync to run first.
+  if (isTerminal(row) && reason === 'source_changed' && (row.error_detail as { origin?: unknown } | null | undefined)?.origin === PENDING_IMPORT) {
+    const pending = pendingImportRefusal(row, row.authority?.remote === true);
+    Object.assign(error, { suggestion: pending.suggestion, fix: pending.fix, reason: pending.reason, detail: pending.detail, docs: pending.docs ?? error.docs });
+  }
   // #6317 (B1b): a waiter-only process names the owner that publishes for it, so the caller is told who holds the write instead of polling blind.
   if (!isTerminal(row) && hints.waiterOnlyOwner) {
     const owner = hints.waiterOnlyOwner;

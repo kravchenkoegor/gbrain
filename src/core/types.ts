@@ -92,6 +92,10 @@ export interface Page {
   timeline: string;
   frontmatter: Record<string, unknown>;
   content_hash?: string;
+  /** Wave B: on a `segmented` page `compiled_truth`/`timeline` throw `page_body_segmented` (page-body/page-shape.ts); absent = inline. */
+  body_storage?: import('./page-body/types.ts').BodyStorage;
+  /** Wave B: UTF-8 bytes of truth + timeline; always set on a segmented page (`pageBodyBytes`). */
+  body_bytes?: number | null;
   /** Source-relative canonical file identity; snapshot reads expose it for guarded import comparisons. */
   source_path?: string | null;
   /** Opaque canonical state; independent of indexing and telemetry updates. */
@@ -687,13 +691,11 @@ export interface Chunk {
   parent_symbol_path?: string[] | null;
   doc_comment?: string | null;
   symbol_name_qualified?: string | null;
-  /**
-   * v0.27.1 multimodal. Read side of ChunkInput.modality — must round-trip
-   * through getChunks → embed-stale merge → upsertChunks or image rows get
-   * reset to 'text' (EXCLUDED.modality on the upsert) and vanish from the
-   * image search arm.
-   */
+  /** v0.27.1 multimodal. Read side of ChunkInput.modality — must round-trip through getChunks → embed-stale
+   * merge → upsertChunks or image rows get reset to 'text' (EXCLUDED.modality) and vanish from the image arm. */
   modality?: 'text' | 'image';
+  /** #6871: the image vector; only getChunksWithEmbeddings reads it, so `gbrain migrate` carries it. */
+  embedding_image?: Float32Array | null;
   /** v244: UTF-8 byte span in the chunk_source's projected text (see ChunkInput); null when unrecorded. */
   projected_byte_start?: number | null;
   projected_byte_end?: number | null;
@@ -1333,6 +1335,8 @@ export interface SearchOpts extends PageReadPolicy {
    * ignores this flag.
    */
   orFallback?: boolean;
+  /** #6495: hybrid's keyword arm opts in to the Postgres keyword timeout negative cache (postgres-engine/keyword-timeout-cache.ts); PGLite ignores it. */
+  keywordTimeoutCache?: boolean;
   /** Keyword `score` query (websearch syntax) while `query` decides the matches (alias fan-out); ignored on the CJK path. */
   rankQuery?: string;
   /**
@@ -1424,6 +1428,7 @@ export interface SearchOpts extends PageReadPolicy {
    * call. When undefined, the cache decision falls back to global config
    * (search.cache.enabled, default true). Set to `false` to force a fresh
    * search; set to `true` to opt in even when global config has it off.
+   * `false` also bypasses the keyword timeout negative cache (#6495).
    */
   useCache?: boolean;
   /**
@@ -2063,7 +2068,7 @@ export const DEGRADED_STAGES = [
   'safe_index_pending',
   'vector_candidates_incomplete',
   'keyword_candidates_incomplete',
-  'projection_pending',
+  'projection_pending', 'projection_by_design',
   'projection_status_unknown',
   'keyword_count_unavailable',
 ] as const;
@@ -2091,6 +2096,7 @@ export const DEGRADED_REASONS = [
   'iterative_scan_unavailable',
   'egress_denied', // System One: the Jev reranker skipped a query with a candidate from decide.egress.deny_sources
   'embedding_disabled', // the brain opted out of embedding: the query text was never sent to the provider
+  'skipped_after_timeout', // #6495: keyword_arm_failed; the same keyword statement timed out within search.keyword_timeout_negative_cache_seconds
 ] as const;
 export type DegradedReason = (typeof DEGRADED_REASONS)[number];
 
@@ -2217,6 +2223,8 @@ export interface HybridSearchMeta {
    * only when `search.reranker.gate` is not `off`.
    */
   rerank_gate?: import('./search/hybrid/rerank-gate.ts').RerankGateMeta;
+  /** `js_fallback` when the SQL cosine re-score failed and this search computed it in JavaScript (search/cosine-rescore.ts). */
+  cosine_rescore?: 'js_fallback';
   /**
    * v0.32.x (search-lite): token budget enforcement metadata. Omitted when
    * no budget was applied (backward-compatible with pre-search-lite

@@ -26,22 +26,27 @@ import { withFilesystemPublication } from './filesystem-guard.ts';
 import { mayReprepare } from './semantic.ts';
 import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
 import { queuePublicationEffects } from './effect-journal.ts';
+import { timePublicationStep } from './publication-timing.ts';
 import type { GitCommitNote } from './effect-model.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { withNoRepoWriteThroughWarning } from '../write-through.ts';
 import { assertUnboundPublication, classifyUnboundPage, unboundWriteWarning } from './unbound-source.ts';
 import { assertRecoveryStagingAbsent, cleanupRecoveryStaging, recoveryStagingFile, upgradeRecoveryStaging } from './staging.ts';
-import { bindPublicationTimeouts, publicationTransaction } from './publication-deadline.ts';
+import { declarePublication, publicationTransaction } from './publication-deadline.ts';
 import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { assertBundleRecoveryBinding, bundleFileHash, prepareBundleRecovery, publishStagedBundleFile, stageBundleFile, type MutationFile } from './bundle-files.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 import { classifyMirrorPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
+import { PENDING_IMPORT, SYNC_HELD } from './pending-import.ts';
 import { CANONICAL_FILE_MISSING, databaseRefusal, ownerExceptionFailure, withAttempt, type PublicationFailure, type PublicationFailureDetail, type PublicationStage } from './publication-failure.ts';
 import { SYNC_CURSOR_REPLACED } from './sync-checkpoint-replaced.ts';
 import { fenceFailureDetail } from '../fence-repair/refusal.ts';
 import { withdrawalFailureDetail } from '../facts/withdrawal.ts';
 import { faultPoint, withFaultPoints } from './fault-points.ts';
 import { recordPublicationFenceTrend } from '../fence-repair/census-store.ts';
+import { segmentWriteScope } from '../page-body/ingest.ts';
+import { publicationBeliefOptions, withBeliefBatch } from '../belief/ledger.ts';
+import { markBeliefCommits } from '../belief/append.ts';
 
 interface PreparedMutationBase {
   sourceExclusive?: boolean;
@@ -72,6 +77,11 @@ interface PreparedMutationBase {
   validate?(tx: BrainEngine): Promise<void>;
   /** #5575: the tier and origin of the rows apply writes; absent: the request's channel tier (trust/channel.ts). */
   trust?: WriteTrust;
+  /**
+   * Wave B: runs once the publication committed and its recovery record is cleared (a segmented page's
+   * deferred projection and segment GC). Best effort: the projection queue and GC converge after a failure.
+   */
+  afterCommit?(engine: BrainEngine): Promise<void>;
 }
 /**
  * A page file target; `publishMode` (Google pages) is the exact mode it publishes with, and its created directories get 0700.
@@ -131,7 +141,9 @@ function requestError(error: unknown): PublicationFailure {
   if (error instanceof OperationError) {
     // #6188: a typed fence refusal keeps its location in the bounded detail, which outlives receipt compaction.
     const detail = fenceFailureDetail(error) ?? withdrawalFailureDetail(error) ?? (error.syncRefusal as PublicationFailure['detail'] | undefined)
-      ?? (error.detail === CANONICAL_FILE_MISSING ? { origin: CANONICAL_FILE_MISSING } : undefined);
+      ?? (error.detail === CANONICAL_FILE_MISSING ? { origin: CANONICAL_FILE_MISSING } : undefined)
+      // #6693: a refusal on a page whose file awaits import or is held by sync; the replay after import selects on it.
+      ?? (error.code === 'source_changed' && (error.reason === PENDING_IMPORT || error.reason === SYNC_HELD) ? { origin: error.reason } : undefined);
     return { code: error.code, message: error.message, ...(detail ? { detail } : {}) };
   }
   const refusal = databaseRefusal(error);
@@ -269,8 +281,10 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
   let recovery: RecoveryRecord | null = null;
   let published = false;
   let transactionBodyCompleted = false;
+  let afterCommitDue = false;
   const skill = prepared.target === 'skill_bundle';
   const files = skill ? prepared.files ?? [] : prepared.file ? [prepared.file] : [];
+  const beliefReport = { appended: 0 };
   try {
     assertMutationProtocol(row);
     if ((row.target_kind ?? 'page') !== (prepared.target ?? 'page') || (skill ? !!prepared.file || !files.length : prepared.files !== undefined)) {
@@ -351,8 +365,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       await hooks.boundary?.('prepared', row);
     }
     const done = await publicationTransaction(engine, async tx => {
-      await bindPublicationTimeouts(tx);
-      await declareDurablePersistence(tx);
+      await declarePublication(tx);
       const liveBinding = await guardOwnership(tx, row, hostId);
       if (prepared.sourceExclusive && !prepared.exclusiveSources?.length) await tx.executeRaw('SELECT id FROM sources WHERE id=$1 FOR UPDATE', [row.source_id]);
       if (prepared.exclusiveSources?.length) await lockCoreSources(tx, prepared.sourceExclusive ? [row.source_id, ...prepared.exclusiveSources] : prepared.exclusiveSources);
@@ -411,20 +424,25 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
         await hooks.boundary?.('after_publication', row);
       }
       prepared.postimage = undefined;
-      const outcome = await withCoordinatedWrite(tx, [row.source_id], () => prepared.apply(tx, snapshot), publicationAttribution(row, prepared.trust));
+      // W1 finalization contract (docs/designs/BELIEF_LEDGER.md 5.1): the ledger append is the last canonical write before the receipt.
+      const apply = () => timePublicationStep('apply', row.slug, () => prepared.apply(tx, snapshot));
+      const outcome = await withCoordinatedWrite(tx, [row.source_id], skill ? apply
+        : () => withBeliefBatch(tx, publicationBeliefOptions(row, prepared.additionalPageKeys, beliefReport), apply), publicationAttribution(row, prepared.trust));
       if (!skill) await classifyUnboundPage(tx, row);
       if (prepared.databaseOnlyReason === 'mirror_read_only') await classifyMirrorPage(tx, row);
       const final = skill ? null : await publicationPostimage(tx, row, prepared);
       decoratePublicationOutcome(row, prepared, outcome, final, files.length, skill);
       await recordPublicationFenceTrend(tx, row, outcome);
-      await queuePublicationEffects(tx, row, final, outcome, prepared);
+      await timePublicationStep('effects', row.slug, () => queuePublicationEffects(tx, row, final, outcome, prepared));
       await hooks.boundary?.('before_commit', row);
       const committed = await completeWrite(tx, current, 'committed', outcome, undefined, current);
       transactionBodyCompleted = true;
       return committed;
     });
     await hooks.boundary?.('after_commit', done);
+    if (beliefReport.appended && done.state === 'committed') await markBeliefCommits(engine, [row.id]).catch(() => undefined);
     if (recovery) await clearResolvedRecovery(engine, row.id, done);
+    afterCommitDue = done.state === 'committed';
     return done;
   } catch (error) {
     if (recovery) {
@@ -447,7 +465,11 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       return (await getWriteRequestById(engine, row.id))!;
     }
     return finishUnpublishedFailure(engine, row, error);
-  } finally { releaseCapacity?.(); await lock?.release(); }
+  } finally {
+    releaseCapacity?.();
+    await lock?.release();
+    if (afterCommitDue) await prepared.afterCommit?.(engine).catch(() => undefined);
+  }
 }
 
 export async function recoverPublication(engine: BrainEngine, id: string, hostId = localHostId(), alreadyLocked = false,
@@ -545,6 +567,8 @@ export async function recoverPublication(engine: BrainEngine, id: string, hostId
       await faultPoint('publication_recovery:before_clear', { requestId: row.request_id, sourceId: row.source_id, operation: row.operation });
       await clearResolvedRecovery(engine, id);
       row = (await getWriteRequestById(engine, id))!;
+      const pageId = row.page_id === null || row.state !== 'committed' ? null : Number(row.page_id);
+      if (pageId !== null) await segmentWriteScope(engine, row.source_id).then(writes => writes(exec => exec.sweepSegments({ pageId }))).catch(() => undefined);
     }
     return row;
   } finally { releaseCapacity?.(); await lock?.release(); }

@@ -42,12 +42,13 @@ import { redactFindings } from '../secret-scan.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 import type { EntityCandidate } from './entity-salience.ts';
 import { reflexPointerRationale } from './reflex-rationale.ts';
+import { preferEntityTitleMatches } from './title-matches.ts';
 import { logVolunteerEventsFireAndForget, volunteerEventRowsFrom } from './volunteer-events.ts';
 import { boundedProjectedPrefix } from '../page-window/document.ts';
-import { boundedPrefixSql, boundedRawPrefix, overlaidBoundedRows } from '../page-window/bounded-lead.ts';
+import { boundedBodyPrefixSql, boundedRawPrefix, overlaidBoundedRows } from '../page-window/bounded-lead.ts';
 
 /** Large pages: candidate rows carry a bounded body prefix (the synopsis reads only its first sentence). */
-const PREFIX_SQL = boundedPrefixSql('p.compiled_truth');
+const PREFIX_SQL = boundedBodyPrefixSql('p');
 
 export { reflexPointerRationale } from './reflex-rationale.ts';
 
@@ -562,7 +563,7 @@ export async function resolveEntitiesToPointers(
   const trust = await gatePointerCandidates(engine, resolved, opts); // #5575 gate; then pointers by confidence, suppression + cap
   const suppression = opts.suppression ?? 'slug-and-title';
   const pointers: ReflexPointer[] = [];
-  for (const { slug, source_id, arm, matchedNorm } of resolved) {
+  for (const { slug, source_id, arm, matchedNorm } of await preferEntityTitleMatches(engine, resolved, m => rowByKey.get(keyOf(m.source_id, m.slug)), m => trust.has(pageKey(m)), slugToNorm)) {
     const row = rowByKey.get(keyOf(source_id, slug));
     if (!row || !trust.has(pageKey({ source_id, slug }))) continue;
     // Suppression: already present in PRIOR context. The current turn is

@@ -234,6 +234,10 @@
         "name": "pglite_scratch_probe"
       },
       {
+        "category": "ops",
+        "name": "ipc_socket_path"
+      },
+      {
         "category": "brain",
         "name": "text_projection_readiness"
       },
@@ -263,7 +267,15 @@
       },
       {
         "category": "ops",
+        "name": "managed_sync_blocked"
+      },
+      {
+        "category": "ops",
         "name": "persistence_compaction"
+      },
+      {
+        "category": "ops",
+        "name": "sync_soak_counters"
       },
       {
         "category": "ops",
@@ -276,6 +288,14 @@
       {
         "category": "brain",
         "name": "embedding_state"
+      },
+      {
+        "category": "brain",
+        "name": "links_extraction_lag"
+      },
+      {
+        "category": "brain",
+        "name": "partial_embedding"
       },
       {
         "category": "ops",
@@ -363,7 +383,15 @@
       },
       {
         "category": "brain",
+        "name": "embedding_identity_unqualified"
+      },
+      {
+        "category": "brain",
         "name": "supersession_calibration"
+      },
+      {
+        "category": "brain",
+        "name": "fact_admission_floors"
       },
       {
         "category": "ops",
@@ -459,6 +487,10 @@
       },
       {
         "category": "brain",
+        "name": "coordination_lock_location"
+      },
+      {
+        "category": "brain",
         "name": "unbound_source"
       },
       {
@@ -484,6 +516,10 @@
       {
         "category": "ops",
         "name": "google_file_modes"
+      },
+      {
+        "category": "ops",
+        "name": "google_calendar_readable"
       },
       {
         "category": "brain",
@@ -567,10 +603,6 @@
       },
       {
         "category": "brain",
-        "name": "partial_embedding"
-      },
-      {
-        "category": "brain",
         "name": "scraper_junk_pages"
       },
       {
@@ -635,6 +667,14 @@
       },
       {
         "category": "ops",
+        "name": "embed_backfill_stalled"
+      },
+      {
+        "category": "ops",
+        "name": "connector_account_mismatch"
+      },
+      {
+        "category": "ops",
         "name": "legacy_job_authority"
       },
       {
@@ -691,10 +731,6 @@
       },
       {
         "category": "brain",
-        "name": "links_extraction_lag"
-      },
-      {
-        "category": "brain",
         "name": "cycle_freshness"
       },
       {
@@ -712,6 +748,10 @@
       {
         "category": "ops",
         "name": "db_only_collector_collision"
+      },
+      {
+        "category": "brain",
+        "name": "managed_sync_latency"
       },
       {
         "category": "brain",
@@ -771,6 +811,10 @@
       },
       {
         "category": "brain",
+        "name": "belief_ledger_coverage"
+      },
+      {
+        "category": "brain",
         "name": "trust_tiers"
       },
       {
@@ -808,6 +852,26 @@
       {
         "category": "brain",
         "name": "ghost_pages"
+      },
+      {
+        "category": "brain",
+        "name": "rename_identity_downgrades"
+      },
+      {
+        "category": "brain",
+        "name": "purge_parked_pages"
+      },
+      {
+        "category": "brain",
+        "name": "missing_recorded_files"
+      },
+      {
+        "category": "brain",
+        "name": "unindexed_files"
+      },
+      {
+        "category": "meta",
+        "name": "sync_config_keys"
       },
       {
         "category": "brain",

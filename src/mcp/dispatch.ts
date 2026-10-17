@@ -13,6 +13,7 @@ import { operations, OperationError, enforceBoundClientOpAllowList, opError } fr
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import type { OperationMeta } from '../core/ops/contract.ts';
 import { loadConfig } from '../core/config.ts';
+import { withRequestConfigSnapshot, withoutRequestConfigSnapshot } from '../core/config-snapshot.ts';
 import { resolveBrainId } from '../core/brain-resolver.ts';
 import { getCliOptions } from '../core/cli-options.ts';
 import { VERB_NAMES, MEMORY_VERBS_VERSION } from '../core/verbs.ts';
@@ -20,7 +21,7 @@ import { cliRenderContext, orderNotices, redactForTransport, renderNotice, toAge
 import { cliOnlyRefusal, isCallable } from '../core/ops/callable.ts';
 import { hostFix, scopeDeniedError } from '../core/ops/op-fix.ts';
 import { mutedNoticeCodes, processNoticeLedger, __resetProcessNoticeLedgerForTests, type NoticeLedger, type NoticeAudience } from '../core/notice-ledger.ts';
-import { logVerbUsage } from '../core/verbs/usage-log.ts';
+import { logVerbUsage, recordsFiring, type RecordsFiring } from '../core/verbs/usage-log.ts';
 import { searchCountLine } from '../core/search/keyword-paging.ts';
 import { dateLabelLine } from '../core/search/date-labels.ts';
 import { hiddenTakesNotice, localTranscriptsNotice, recallInteropNotices, wantsTranscriptHint } from '../core/interop-notices.ts';
@@ -866,11 +867,25 @@ export async function dispatchToolCall(
   params: Record<string, unknown> | undefined,
   opts: DispatchOpts = {},
 ): Promise<ToolResult> {
+  // #6721: a read op answers every config read from one snapshot of the table
+  // (config-snapshot.ts); a write reads config live, so it sees its own writes.
+  const run = () => dispatchResolvedCall(engine, name, params, opts);
+  return operations.find(o => o.name === name)?.mutating === false
+    ? withRequestConfigSnapshot(engine, run)
+    : withoutRequestConfigSnapshot(run);
+}
+
+async function dispatchResolvedCall(
+  engine: BrainEngine,
+  name: string,
+  params: Record<string, unknown> | undefined,
+  opts: DispatchOpts,
+): Promise<ToolResult> {
   const startedMs = Date.now();
   const isVerb = VERB_NAME_SET.has(name);
   // [c11] dispatch-layer usage sidecar for the five verbs — counts validation
   // failures too. Fire-and-forget; never awaited, never throws.
-  const logVerb = (ok: boolean, extra?: { budget_dropped?: number; entity_found?: boolean; remember_status?: string }) => {
+  const logVerb = (ok: boolean, extra?: { budget_dropped?: number; entity_found?: boolean; remember_status?: string; records_firing?: RecordsFiring }) => {
     if (!isVerb) return;
     logVerbUsage({
       verb: name,
@@ -1072,10 +1087,10 @@ export async function dispatchToolCall(
       logVerb(true, {
         ...(typeof r?.dropped_count === 'number' ? { budget_dropped: r.dropped_count } : {}),
         ...(name === 'entity' && typeof r?.found === 'boolean' ? { entity_found: r.found } : {}),
-        // remember's frozen status enum (inserted|duplicate|superseded) —
-        // the memory_writeback doctor counters read this (all-MCP-callers
-        // semantics, labeled honestly there; OV-A11).
+        // remember's frozen status enum (inserted|duplicate|superseded) — the memory_writeback
+        // doctor counters read this (all-MCP-callers semantics, labeled honestly there; OV-A11).
         ...(name === 'remember' && typeof r?.status === 'string' ? { remember_status: r.status } : {}),
+        ...((name === 'entity' || name === 'context_pack') && recordsFiring(result) ? { records_firing: recordsFiring(result)! } : {}),
       });
     }
     // D8: model-visible loudness for empty retrievals. The body stays a bare
