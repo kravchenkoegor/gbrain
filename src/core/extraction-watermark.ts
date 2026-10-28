@@ -13,10 +13,17 @@
  * in `page_extraction_state`, which doctor's `extraction_input_truncated`
  * check reports. A full read clears the receipt; a tail read keeps it, since
  * the text skipped earlier is still unread.
+ *
+ * A segmented page's compiled truth is planned the same way without holding it
+ * (planSegmentedExtraction): one pass over its segments (readBodyRange) hashes
+ * the body and the watermark prefix and keeps only the head and the newest
+ * window of the appended tail.
  */
 import { createHash } from 'node:crypto';
 import type { BrainEngine } from './engine.ts';
 import { truncateUtf8 } from './text-safe.ts';
+import { openSegmentedBody, readBodyRange } from './page-body/read-range.ts';
+import { readGarbageCollector, segmentedPassWork } from './page-body/segment-blocks.ts';
 
 export type ExtractionPipeline = 'facts_backstop' | 'extract_atoms' | 'conversation_facts';
 
@@ -29,7 +36,14 @@ export type HeadFallbackReason = 'no_watermark' | 'prefix_changed' | 'version_ch
 
 /** The durable receipt of an extraction that did not read all of its input. */
 export interface InputTruncated {
-  kind: 'head' | 'tail_window' | 'skipped_too_large';
+  /**
+   * PR 4 (Wave B incremental derivation, transcripts): `no_messages`, a segmented conversation page reads as a transcript
+   * format over its whole text yet no message parsed under it; the run changed nothing. `detection_ambiguous`, no format is
+   * detected over a segmented conversation page yet the formats in `grammars` parse messages in it: the page is held, nothing
+   * extracted or collected, until it changes or the operator chooses its format. `grammar_chosen`, the operator's format
+   * (`gbrain extract-conversation-facts --grammar`) for page version `version_token`; not a truncation.
+   */
+  kind: 'head' | 'tail_window' | 'skipped_too_large' | 'no_messages' | 'detection_ambiguous' | 'grammar_chosen';
   pipeline: ExtractionPipeline;
   /** Characters the extractor read (0 for a skipped page). */
   processed_chars: number;
@@ -40,6 +54,19 @@ export interface InputTruncated {
   total_bytes?: number;
   cap_bytes?: number;
   origin?: 'page' | 'sidecar';
+  /**
+   * conversation_facts on a page over the window cap: `no_prior_facts` (the newest window was extracted; the page had
+   * no conversation facts a clear could lose) or `prior_facts_kept` (skipped: the page's `prior_facts` conversation
+   * facts may lie outside the window, so nothing was cleared).
+   */
+  window_rule?: 'no_prior_facts' | 'prior_facts_kept';
+  prior_facts?: number;
+  /** PR 4 (Wave B incremental derivation, transcripts): `detection_ambiguous`: the messages each format that parses any parses over the page. */
+  grammars?: Record<string, number>;
+  /** PR 4 (Wave B incremental derivation, transcripts): `grammar_chosen`: the chosen format (null: none, the page is not a transcript). */
+  grammar?: string | null;
+  /** PR 4 (Wave B incremental derivation, transcripts): `grammar_chosen`, `detection_ambiguous`: the page version the choice or the hold is for. */
+  version_token?: string;
 }
 
 export interface StoredWatermark { pipelineVersion: number; bytes: number; sha256: string }
@@ -93,6 +120,57 @@ export function planExtraction(body: string, stored: StoredWatermark | null,
     truncated: { kind: 'tail_window', pipeline, processed_chars: window.length, total_chars: tail.length } };
 }
 
+/**
+ * planExtraction over a segmented page's compiled truth (the trusted stored text readPageSnapshot gives an inline
+ * page), read segment by segment: the same plan, holding at most the head, the newest 2 x `cap` characters of the
+ * tail and one segment. O(page) work, O(segment) memory.
+ */
+export async function planSegmentedExtraction(engine: BrainEngine, pageId: number, stored: StoredWatermark | null,
+  opts: { cap: number; pipeline: ExtractionPipeline; emptyTail: 'skip' | 'head' }): Promise<ExtractionPlan> {
+  const { cap, pipeline } = opts;
+  const body = await openSegmentedBody(engine, { pageId });
+  const offset = stored && stored.pipelineVersion === EXTRACTION_PIPELINE_VERSION[pipeline] ? stored.bytes : null;
+  const whole = createHash('sha256');
+  const prefix = createHash('sha256');
+  const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
+  const tailDecoder = new TextDecoder('utf-8', { ignoreBOM: true });
+  let bytes = 0, chars = 0, tailChars = 0, head = '', tail = '', tailText = false;
+  let boundary: number | undefined;
+  const collect = readGarbageCollector();
+  for await (const piece of readBodyRange(engine, { pageId, space: 'stored', start: 0, end: Infinity, audience: 'trusted', region: 'truth', body })) {
+    const buf = piece.bytes;
+    collect(buf.length);
+    segmentedPassWork.bytes += buf.length;
+    whole.update(buf);
+    const text = decoder.decode(buf, { stream: true });
+    chars += text.length;
+    if (head.length <= cap) head += text.slice(0, cap + 1 - head.length);
+    if (offset !== null) {
+      const split = Math.max(0, Math.min(buf.length, offset - bytes));
+      if (split > 0) prefix.update(buf.subarray(0, split));
+      if (offset >= bytes && offset < bytes + buf.length) boundary = buf[offset - bytes];
+      const after = tailDecoder.decode(buf.subarray(split), { stream: true });
+      tailChars += after.length;
+      tailText ||= after.trim().length > 0;
+      segmentedPassWork.carry += tail.length + after.length;
+      tail = (tail + after).slice(-2 * cap);
+    }
+    bytes += buf.length;
+  }
+  const next = { bytes, sha256: whole.digest('hex') };
+  if (chars <= cap) return { pipeline, mode: 'full', text: head, truncated: null, next };
+  const headPlan = (reason: HeadFallbackReason): ExtractionPlan => ({ pipeline, mode: 'head', text: truncateUtf8(head, cap), next,
+    truncated: { kind: 'head', pipeline, processed_chars: cap, total_chars: chars, reason } });
+  if (!stored) return headPlan('no_watermark');
+  if (offset === null) return headPlan('version_changed');
+  const onBoundary = offset === bytes || (offset < bytes && boundary !== undefined && (boundary & 0xc0) !== 0x80);
+  if (offset > bytes || !onBoundary || prefix.digest('hex') !== stored.sha256) return headPlan('prefix_changed');
+  if (!tailText) return opts.emptyTail === 'skip' ? { pipeline, mode: 'tail', text: '', truncated: null, next } : headPlan('no_new_text');
+  if (tailChars <= cap) return { pipeline, mode: 'tail', text: tail, truncated: null, next };
+  const window = newestWindow(tail, cap);
+  return { pipeline, mode: 'tail', text: window, next, truncated: { kind: 'tail_window', pipeline, processed_chars: window.length, total_chars: tailChars } };
+}
+
 let warnedStorage = false;
 function warnStorageOnce(action: string, error: unknown): void {
   if (warnedStorage) return;
@@ -142,6 +220,19 @@ export async function commitExtractionPlan(engine: BrainEngine, pageId: number, 
 }
 
 /** Record (receipt) or clear (null) the partial-input receipt of a pipeline that keeps no watermark: the conversation-facts size skip. */
+/** PR 4 (Wave B incremental derivation, transcripts): the page's receipt for `pipeline`, or null (none, or unreadable). */
+export async function readExtractionReceipt(engine: BrainEngine, pageId: number, pipeline: ExtractionPipeline): Promise<InputTruncated | null> {
+  try {
+    const [row] = await engine.executeRaw<{ receipt: InputTruncated | string | null }>(
+      'SELECT input_truncated AS receipt FROM page_extraction_state WHERE page_id = $1 AND pipeline = $2', [pageId, pipeline]);
+    const receipt = row?.receipt ?? null;
+    return typeof receipt === 'string' ? JSON.parse(receipt) as InputTruncated : receipt;
+  } catch (error) {
+    warnStorageOnce('read the extraction receipt', error);
+    return null;
+  }
+}
+
 export async function setExtractionReceipt(engine: BrainEngine, pageId: number, pipeline: ExtractionPipeline,
   receipt: InputTruncated | null): Promise<void> {
   try {

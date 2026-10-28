@@ -26,11 +26,11 @@ import type { Action } from '../core/agent-output.ts';
 import { OperationError } from '../core/ops/contract.ts';
 import { managedBrain, readAllSourceHolds, readHoldRetryKeys, requestHoldRetry, writeHeldRetryPointer } from '../core/connectors/item-holds-store.ts';
 import { isConnectorSourceKind } from '../core/persistence/connector-identity.ts';
-import { fenceAutoRepairFor, holdRepairSteps, readGitHoldRetryPaths, readGitSourceHolds, requestGitHoldRetry, type GitHoldRecord } from '../core/persistence/sync-holds.ts';
+import { GIT_HOLD_OP, gitHoldFingerprint, outOfAttemptsHold, fenceAutoRepairFor, holdRepairSteps, readGitHoldRetryPaths, readGitSourceHolds, requestGitHoldRetry, type GitHoldRecord } from '../core/persistence/sync-holds.ts';
 import { readManagedSyncBacklog } from '../core/persistence/sync-drain.ts';
 import type { FenceAutoRepair } from '../core/fence-repair/hold-fix.ts';
 import { companyBrainProfile } from '../core/company-brain/policy.ts';
-import { findUnindexedFiles, refreshUnindexedFiles, UNINDEXED_SCAN_BUDGET_MS, type UnindexedScan } from '../core/persistence/unindexed-files.ts';
+import { findUnindexedFiles, refreshUnindexedFiles, unindexedScanBudgetMs, type UnindexedScan } from '../core/persistence/unindexed-files.ts';
 
 export interface RetryHeldReceipt {
   source_id: string;
@@ -38,7 +38,9 @@ export interface RetryHeldReceipt {
   kind: 'connector' | 'git';
   dry_run: boolean;
   scheduled: number;
-  items: Array<{ key: string; code: string; reason?: string; action: 'would_retry' | 'retry_scheduled'; next_action: string }>;
+  items: Array<{ key: string; code: string; reason?: string; fingerprint?: string; action: 'would_retry' | 'retry_scheduled'; next_action: string }>;
+  /** #7364 (git): the hold rows this receipt read (`op_checkpoints` op `sync-hold` of the source's current incarnation), so a refusal that names a hold this listing missed shows which row each one read. */
+  hold_rows?: { op: string; source_id: string; incarnation: string; read: number };
   next_action: string;
   /** Git sources with held files: the one next step (the sync that re-screens them, or the scheduling command after a dry run). */
   fix?: Action;
@@ -46,7 +48,7 @@ export interface RetryHeldReceipt {
   unindexed?: { complete: boolean; target: string | null; scanned: number; unindexed: number; slug_taken: number; already_scheduled: number; by_code: Record<string, number>; metafile_skipped: number };
 }
 
-interface Scheduled { items: Array<{ key: string; code: string; reason?: string; already: boolean }>; sync: string[]; fenceAuto?: FenceAutoRepair }
+interface Scheduled { items: Array<{ key: string; code: string; reason?: string; fingerprint?: string; already: boolean }>; sync: string[]; fenceAuto?: FenceAutoRepair }
 
 async function scheduleConnectorItems(engine: BrainEngine, sourceId: string, incarnation: string, dryRun: boolean): Promise<Scheduled> {
   const held = (await readAllSourceHolds(engine, { sourceIds: [sourceId] }))[0]?.held ?? [];
@@ -71,7 +73,7 @@ export async function gitFollowUpSync(engine: BrainEngine, sourceId: string, hel
   if (!await managedBrain(engine)) return ['gbrain', 'sync', '--source', sourceId];
   const [backlog] = await readManagedSyncBacklog(engine, [sourceId]).catch(() => []);
   if (backlog) return ['gbrain', 'sync', ...backlog.resume_args];
-  const stalled = held.find(record => record.code === 'preparation_stalled' && record.meta.stall?.sync_argv?.length);
+  const stalled = held.find(record => outOfAttemptsHold(record.code) && record.meta.stall?.sync_argv?.length);
   return ['gbrain', 'sync', ...(stalled?.meta.stall?.sync_argv ?? ['--source', sourceId, '--no-pull'])];
 }
 
@@ -84,7 +86,7 @@ async function scheduleGitFiles(engine: BrainEngine, sourceId: string, incarnati
   const already = new Set(dryRun ? await readGitHoldRetryPaths(engine, sourceId, incarnation) : []);
   const fenceAuto = await fenceAutoRepairFor(engine, held);
   return { items: held.map(record => ({ key: record.path, code: record.code, ...(record.meta.reason ? { reason: record.meta.reason } : {}),
-    already: already.has(record.path) })), sync, ...(fenceAuto ? { fenceAuto } : {}) };
+    fingerprint: gitHoldFingerprint(record.source_id, record.incarnation, record.path), already: already.has(record.path) })), sync, ...(fenceAuto ? { fenceAuto } : {}) };
 }
 
 function gitNextStep(sourceId: string, dryRun: boolean, scheduled: Scheduled): { text: string; fix: Action } {
@@ -98,7 +100,7 @@ function gitNextStep(sourceId: string, dryRun: boolean, scheduled: Scheduled): {
       why: `Schedules a re-screen of ${count} held file(s) on the next sync of ${sourceId}; nothing runs now.` } };
   const fences = scheduled.items.filter(item => item.code === 'invalid_fence').length;
   const concurrent = scheduled.items.filter(item => item.code === 'concurrent_write').length;
-  const stalled = scheduled.items.filter(item => item.code === 'preparation_stalled').length;
+  const stalled = scheduled.items.filter(item => outOfAttemptsHold(item.code)).length;
   const dirty = scheduled.items.filter(item => item.code === 'worktree_dirty').length;
   const drift = scheduled.items.filter(item => item.code === 'file_drift').length;
   return { text: `${count} held file(s) scheduled for a re-screen; none has run yet. ${automatic} Run it now with: ${sync}, then verify with: gbrain sources status ${sourceId}. `
@@ -121,9 +123,10 @@ export async function retryHeld(engine: BrainEngine, sourceId: string, opts: { d
     : step ? step.text
       : dryRun ? `${count} held item(s) would be scheduled; run: gbrain sources retry-held ${sourceId}`
         : `${count} held item(s) scheduled; none has run yet. Run them now with: ${sync}, then verify with: gbrain sources status ${sourceId}`;
-  const items = scheduled.items.map(item => ({ key: item.key, code: item.code, ...(item.reason ? { reason: item.reason } : {}),
+  const items = scheduled.items.map(item => ({ key: item.key, code: item.code, ...(item.reason ? { reason: item.reason } : {}), ...(item.fingerprint ? { fingerprint: item.fingerprint } : {}),
     action: dryRun && !item.already ? 'would_retry' as const : 'retry_scheduled' as const }));
-  return receiptOf({ source_id: sourceId, kind, dry_run: dryRun, scheduled: dryRun ? 0 : count, ...(step ? { fix: step.fix } : {}) }, items, next,
+  const holdRows = kind === 'git' ? { hold_rows: { op: GIT_HOLD_OP, source_id: sourceId, incarnation: source.incarnation, read: count } } : {};
+  return receiptOf({ source_id: sourceId, kind, dry_run: dryRun, scheduled: dryRun ? 0 : count, ...holdRows, ...(step ? { fix: step.fix } : {}) }, items, next,
     dryRun ? 'Run the same command without --dry-run to schedule it.' : `${kind === 'git' ? 'Re-screened' : 'Re-attempted'} on the next ${sync}.`);
 }
 
@@ -145,7 +148,7 @@ export async function retryUnindexed(engine: BrainEngine, sourceId: string, opts
     `Source ${sourceId} is a ${source.config?.kind != null ? 'connector' : 'company-brain'} source; --unindexed applies to managed Git sources only.`,
     `Run gbrain sources retry-held ${sourceId} without --unindexed to re-attempt its held items.`);
   const dryRun = opts.dryRun === true;
-  const deadlineAt = Date.now() + (opts.budgetMs ?? UNINDEXED_SCAN_BUDGET_MS);
+  const deadlineAt = Date.now() + (opts.budgetMs ?? await unindexedScanBudgetMs(engine, sourceId));
   let scan: UnindexedScan, scheduled: string[] = [];
   if (dryRun) scan = await findUnindexedFiles(engine, sourceId, { deadlineAt });
   else ({ scan, scheduled } = await refreshUnindexedFiles(engine, sourceId, { deadlineAt }));

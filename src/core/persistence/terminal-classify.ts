@@ -31,7 +31,9 @@ export type TerminalCategory =
   | 'knock_on' | 'run_replaced' | 'outside_fence'
   | 'operator_cancelled' | 'caller_conflict' | 'file_conflict' | 'canonical_file_missing' | 'fence_unrenderable'
   | 'writer_guard' | 'database_refusal' | 'owner_exception' | 'legacy_publication_refusal'
-  | 'sync_fault' | 'transport' | 'caller_refusal' | 'gbrain_defect' | 'diagnosis_required';
+  | 'sync_fault' | 'transport' | 'caller_refusal' | 'gbrain_defect' | 'diagnosis_required'
+  // #6904: the write met a missing relation or column (42P01 / 42703); the schema is behind this build or lost a table.
+  | 'schema_missing';
 
 /** The receipt columns the classifier reads; every one but `intent_kind` and `error_message` survives compaction. */
 export interface TerminalInput {
@@ -53,6 +55,11 @@ export interface TerminalInput {
   error_message?: string | null;
   /** A reader that computed `terminalKnockOnSql` passes its answer, so the SQL twin and this verdict cannot disagree. */
   knock_on?: boolean;
+  /**
+   * #6904: whether the brain's schema is behind this build now (`readSchemaBehind`), which picks a `schema_missing` verdict's
+   * fix: apply-migrations when behind, the missing-tables check when at head. Absent or null: unknown, the fix is a doctor read.
+   */
+  schema_behind?: boolean | null;
 }
 
 export interface TerminalVerdict {
@@ -211,6 +218,10 @@ function route(input: TerminalInput): Partial_ {
         'Read recent_failures[].error_detail from gbrain sources writer status --probe --json on the brain host, check doctor managed_guard_schema_drift, then retry the write with a new request id (gbrain repair failed-writes replays caller writes).'),
       argv: ['gbrain', 'sources', 'writer', 'status', '--source', source, '--probe', '--json'] } };
   }
+  // #6904: a missing relation or column, classified at publication, or recorded as an owner exception by an older build (its errno).
+  if (reason === 'schema_missing' || (origin === 'owner_exception' && ['42P01', '42703'].includes(stringField(detail, 'errno') ?? ''))) {
+    return schemaMissingVerdict(input, code, origin, stringField(detail, 'missing'));
+  }
   if (origin === 'owner_exception') {
     return { category: 'owner_exception', code, origin, class: 'systemic', safe_actions: ['upgrade'], needs_human: true,
       human_reason: 'The owner raised an unexpected exception while running this write: a gbrain defect.',
@@ -305,8 +316,63 @@ function route(input: TerminalInput): Partial_ {
       why: `The caller's write was refused ${code} and the caller saw why; the receipt carries the diagnosis, read-only.`, verify: { argv: failuresArgv(source) } } };
 }
 
+/** #6904: the schema-missing verdict; the fix depends on whether the schema is behind this build right now. */
+function schemaMissingVerdict(input: TerminalInput, code: string, origin: string | null, missing: string | null): Partial_ {
+  const what = missing ? `the ${missing} relation or column` : 'a relation or column';
+  const verify = { argv: ['gbrain', 'doctor', '--json'] };
+  const base = { category: 'schema_missing' as const, code, origin, class: 'systemic' as const };
+  if (input.schema_behind === true) {
+    return { ...base, safe_actions: ['migrate'], needs_human: false, escalate: 'the schema is still behind after gbrain apply-migrations --yes (doctor schema_version names the failing migration)',
+      action: { argv: ['gbrain', 'apply-migrations', '--yes'], consent: [], actor: 'agent', requires_exclusive: true,
+        why: `The write needed ${what}, which a pending migration adds: the brain schema is behind this gbrain build. Apply the migrations as the database role that owns the gbrain tables, then resubmit the write with a new request id.`,
+        verify, docs: 'docs/guides/write-refusals.md#schema_behind' } };
+  }
+  if (input.schema_behind === false) {
+    const human = `The write needed ${what}, but the schema version is at head: a table or column is missing outside a migration (an older backup restored, a table dropped by hand, or a migration recorded without its change). Doctor's schema_missing_tables check names what is missing and gbrain repair missing-tables previews recreating it; decide with the user before applying.`;
+    return { ...base, safe_actions: ['repair'], needs_human: true, human_reason: human, escalate: 'always: the schema is at head and still lacks what the write needs',
+      action: { argv: ['gbrain', 'doctor', '--json'], consent: [], actor: 'agent', requires_exclusive: false, ask_user: true, user_message: human,
+        why: "Read-only: doctor's schema_missing_tables check lists the missing tables and columns and names the gbrain repair missing-tables preview.", verify } };
+  }
+  return { ...base, safe_actions: ['none'], needs_human: false, escalate: 'doctor reports the schema at head and the write still fails on a missing relation or column',
+    action: { argv: ['gbrain', 'doctor', '--json'], consent: [], actor: 'agent', requires_exclusive: false, verify,
+      why: `The write needed ${what}. Read-only: when doctor's schema_version reports the schema behind, run gbrain apply-migrations --yes as the database role that owns the gbrain tables and resubmit; when it is at head, its schema_missing_tables check names what is missing (gbrain repair missing-tables previews it).` } };
+}
+
+/** #7630: the caller-submitted page and memory writes a caller resubmits; no sync replays them. */
+const RESUBMITTED_WRITES = new Set(['put_page', 'put_pages', 'capture', 'delete_page', 'restore_page', 'revert_version', 'edit_page', 'append_page', 'remember', 'forget', 'forget_fact',
+  'add_tag', 'remove_tag', 'add_link', 'remove_link', 'add_timeline_entry', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve', 'takes_remove']);
+
+/**
+ * #7630: the operation a fault's fix depends on. A reconcile or managed write (import, repair, quarantine clear,
+ * grandfather) is stored as `put_page` under its own intent kind, which names it while the intent survives.
+ */
+export function faultOperation(operation: string, intentKind: string | null | undefined): string {
+  return operation === 'put_page' && intentKind && (intentKind === 'canonical_reconcile' || intentKind.startsWith('managed_')) ? intentKind : operation;
+}
+
+/**
+ * #7630: a sync write, a maintenance job and a recorded sync fault (read as one) are stored as `submit_job`; their
+ * retry is the sync. A foreground write (`remember`, `put_page`, ...) is resubmitted by its caller, and a managed write
+ * by rerunning the command that wrote it. Any other operation (`extract_facts`, writer administration) is neither:
+ * writer status names what holds it.
+ */
 function faultAction(code: string, input: TerminalInput): Action {
   const v = classifySyncFault({ code });
+  const operation = faultOperation(input.operation, input.intent_kind);
+  if (v.safe_actions[0] === 'retry' && operation.startsWith('managed_')) {
+    return inspect(input.source_id, `The ${operation} write ended ${code}; it was not part of a sync, so a sync does not retry it. `
+      + 'Writer status names the step it stopped at and what held it, read-only. Once that clears, rerun the command that wrote it (an import, repair, quarantine clear or grandfather).');
+  }
+  if (v.safe_actions[0] === 'retry' && operation === 'canonical_reconcile') {
+    return syncRetry(input.source_id, `The canonical reconcile recorded ${code} (${v.class}); the next sync re-admits a keep_db reconcile, and a \`gbrain sources reconcile\` run is retried by running it again.`);
+  }
+  if (v.safe_actions[0] === 'retry' && input.operation !== 'submit_job' && !RESUBMITTED_WRITES.has(input.operation)) {
+    return inspect(input.source_id, `The ${input.operation} operation ended ${code}; it was not part of a sync, so a sync does not retry it. Writer status names what holds it, read-only.`, v.human_reason);
+  }
+  if (v.safe_actions[0] === 'retry' && input.operation !== 'submit_job') {
+    return inspect(input.source_id, `The ${input.operation} write ended ${code}; it was not part of a sync, so a sync does not retry it. `
+      + `Writer status names the step it stopped at and what held it, read-only. Once that clears, resubmit the same ${input.operation} with a new request_id (for a page an import or repair wrote, rerun that command).`);
+  }
   if (v.safe_actions[0] === 'retry') return syncRetry(input.source_id, `The sync recorded ${code} (${v.class}); a rerun holds or retries it.`);
   return inspect(input.source_id, `The write ended ${code}; writer status names what holds it, read-only.`, v.human_reason);
 }
@@ -335,8 +401,9 @@ export const PAGE_REMOVAL_OPERATIONS: readonly string[] = ['delete_page', 'purge
  * failed request `r` (both `persistence_requests` aliases): the same intent committed, failed or still pending; a later
  * page removal committed or pending; for a `put_page`, any later write committed or pending, or a later caller
  * `put_page` that failed (the newer content); #6834: for a refused sync checkpoint, any later committed checkpoint of the
- * source (both read by kind; a compacted row, which keeps no kind, by its operation). `r` must expose `id`.
- * Literal strings only; NULL-safe for a compacted `c` (no intent).
+ * source (both read by kind; a compacted row, which keeps no kind, by its operation); #6824: for a refused connector
+ * write, a later committed connector retry whose recorded `retryOf` lineage reaches it (connectorRetrySql). `r` must
+ * expose `id`. Literal strings only; NULL-safe for a compacted `c` (no intent).
  */
 export function supersessionSql(r: string, c: string): string {
   const removals = PAGE_REMOVAL_OPERATIONS.map(op => `'${op}'`).join(',');
@@ -346,7 +413,38 @@ export function supersessionSql(r: string, c: string): string {
     OR (${r}.slug='__managed_sync_checkpoint__' AND ${r}.operation='submit_job' AND ${c}.state='committed' AND ${c}.operation='submit_job'
       AND COALESCE((SELECT k.intent->>'kind' FROM persistence_requests k WHERE k.id=${r}.id),'managed_sync_checkpoint')='managed_sync_checkpoint'
       AND COALESCE(${c}.intent->>'kind','managed_sync_checkpoint')='managed_sync_checkpoint')
-    OR (${r}.operation='put_page' AND ${c}.state='failed' AND ${c}.operation='put_page' AND COALESCE(NOT (${c}.intent ? 'kind'), false))))`;
+    OR (${r}.operation='put_page' AND ${c}.state='failed' AND ${c}.operation='put_page' AND COALESCE(NOT (${c}.intent ? 'kind'), false))
+    OR ${connectorRetrySql(r, c)}))`;
+}
+
+/** Hops a connector retry's `retryOf` lineage is followed back; a longer chain leaves the refusal unresolved (fail closed). */
+export const CONNECTOR_RETRY_LINEAGE_MAX_DEPTH = 32;
+const CONNECTOR_WRITE_KINDS = `'connector_v2_import','connector_v2_delete','connector_v2_checkpoint'`;
+const UUID_TEXT = `'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'`;
+
+/**
+ * #6824: a connector retry records `retryBase`/`retryOf`/`retryAttempt` in its intent, so its digest never equals the
+ * refusal it replaces. A committed retry `c` (read whole as `cc` by its unique sequence) supersedes the refused `r`
+ * (read whole as `k` by id; callers may pass narrow row aliases) only when every hop of its
+ * recorded `retryOf` chain, back to `r`, has the same principal, source and incarnation, operation, slug and connector
+ * intent kind, at a lower sequence, within CONNECTOR_RETRY_LINEAGE_MAX_DEPTH hops. Another refusal of the same item with
+ * no recorded link is not proof. Each hop is one lookup on the (principal_kind, principal_id, request_id) unique index.
+ */
+function connectorRetrySql(r: string, c: string): string {
+  return `(${r}.operation='submit_job' AND ${c}.operation='submit_job' AND ${c}.state='committed' AND COALESCE(${c}.intent ? 'retryOf', false)
+      AND EXISTS (SELECT 1 FROM persistence_requests k, persistence_requests cc WHERE k.id=${r}.id AND cc.sequence=${c}.sequence
+        AND k.intent->>'kind' IN (${CONNECTOR_WRITE_KINDS})
+        AND cc.intent->>'kind'=k.intent->>'kind' AND cc.principal_kind=k.principal_kind AND cc.principal_id=k.principal_id
+        AND cc.source_incarnation=k.source_incarnation
+        AND EXISTS (WITH RECURSIVE lineage(request_id, sequence, intent, depth) AS (
+            SELECT cc.request_id, cc.sequence, cc.intent, 0
+            UNION ALL
+            SELECT p.request_id, p.sequence, p.intent, l.depth+1 FROM lineage l JOIN persistence_requests p
+              ON p.principal_kind=k.principal_kind AND p.principal_id=k.principal_id
+              AND p.request_id=CASE WHEN l.intent->>'retryOf' ~ ${UUID_TEXT} THEN (l.intent->>'retryOf')::uuid END
+            WHERE l.depth<${CONNECTOR_RETRY_LINEAGE_MAX_DEPTH} AND p.sequence<l.sequence AND p.source_id=k.source_id
+              AND p.source_incarnation=k.source_incarnation AND p.operation=k.operation AND p.slug=k.slug AND p.intent->>'kind'=k.intent->>'kind')
+          SELECT 1 FROM lineage WHERE request_id=k.request_id)))`;
 }
 
 /** The order that picks the most telling superseding request: the same intent committed, then the same intent, then the oldest later write. */

@@ -1,9 +1,10 @@
 import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
-import { loadConfig, loadConfigWithEngine } from '../config.ts';
+import { loadConfig, loadConfigFileOnly, loadConfigWithEngine, type GBrainConfig } from '../config.ts';
 import { loadOperatorLiterals } from '../content-sanity-literals.ts';
 import { parseMarkdown } from '../markdown.ts';
+import { alignWithStored } from './align-stored.ts';
 import { parseDataFrontmatter } from '../data-frontmatter.ts';
 import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
@@ -11,13 +12,16 @@ import type { PageSnapshot } from '../page-state/types.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode, scannerSourcePath } from '../write-through.ts';
 import { absentCanonicalPath, findLiveFileClaimants, recordedReconcilePath, type FileClaimTarget } from './file-claims.ts';
+import { wholeBodySnapshot } from './segmented-apply.ts';
 import { sharedOriginExit } from './sync-origin.ts';
+import { originTwinsPreviewArgv } from './origin-twins.ts';
 export { fileClaimCandidatesQuery } from './file-claims.ts';
 import { localHostId } from './identity.ts';
 import { isDatabaseOnlyPage, slugDerivedOrigin } from './unbound-pages.ts';
 import { isUnboundSourcePage } from './unbound-source.ts';
 import { getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
-import { digest, requireUuid, sha256, stableJson } from './digest.ts';
+import { digest, gitBlobOid, requireUuid, sha256, stableJson } from './digest.ts';
+import { SYNC_ORIGIN_DELETED_OP } from './sync-pass-row.ts';
 import { reconcileCanonical, strictReconcileKeys, validateReconcileJson, type ReconcileConflict, type ReconcileDecision } from './reconcile-merge.ts';
 import type { ParsedPage } from '../import-file.ts';
 import type { AutoDecision } from './reconcile-additive.ts';
@@ -56,8 +60,21 @@ export interface ReconcileState {
  */
 const CYCLE_STAMP_KEYS = ['last_source_cycle_at', 'last_full_cycle_at'];
 
+/**
+ * #7506: the file and environment side of the policy digest, as every consumer on the owner host resolves it: the config
+ * file, with the content-sanity overrides the environment sets (the import gate's env > file > DB). Any consumer on that
+ * host may prepare and publish an admitted reconcile, each with its own environment, so the rest of the environment
+ * (credentials, connection targets, model and gateway choices) stays out: none of it changes what a reconcile writes, and
+ * a consumer whose environment differed from the previewing process's read every preview stale.
+ */
+function reconcilePolicyBase(): GBrainConfig | null {
+  const file = loadConfigFileOnly();
+  const sanity = loadConfig()?.content_sanity;
+  return sanity ? { ...(file ?? { engine: 'postgres' }), content_sanity: sanity } : file;
+}
+
 export async function reconcilePolicyDigest(engine: BrainEngine, sourceId: string): Promise<string> {
-  const config = await loadConfigWithEngine(engine, loadConfig());
+  const config = await loadConfigWithEngine(engine, reconcilePolicyBase());
   const [row] = await engine.executeRaw<Record<string, unknown>>('SELECT config,contextual_retrieval_mode,trust_frontmatter_overrides FROM sources WHERE id=$1', [sourceId]);
   let sourceConfig = row?.config;
   if (typeof sourceConfig === 'string') {
@@ -95,6 +112,62 @@ export function canonicalDeletionState(root: string, path: string): 'in_head' | 
   const listed = hardenedGitSync(root, ['ls-tree', '-z', '--full-tree', 'HEAD', '--', repoPath], limits);
   if (!listed.ok) return 'unknown';
   return listed.stdout.toString('utf8').split('\0').some(entry => entry.split('\t')[1] === repoPath) ? 'in_head' : 'gone';
+}
+/**
+ * #6712 PR 4b: the deleted side of a held `file_drift` file that is present (design v3.2 §4, classifier row 9). A deleted page
+ * still at the origin is `tombstone_edited` (the newest one; `pageId` names the held one when it is still there); with no
+ * page row left, a `deleted` marker at the origin (`sync-origin-deleted`) is `purged_differs`. The result pins what a
+ * resolution is bound to: the file's bytes, the tombstone's id and revision, the marker's value.
+ */
+export interface DeletedDriftTarget {
+  state: 'tombstone_edited' | 'purged_differs';
+  root: string;
+  /** Absolute path of the file, and its source-relative spelling. */
+  path: string;
+  relative_path: string;
+  source_path: string;
+  raw: Buffer;
+  raw_file_hash: string;
+  tombstone: { page_id: number; slug: string; revision: string } | null;
+  marker_digest: string | null;
+}
+/** Why a held path no longer has a deleted side to resolve; a fresh sync re-classifies it. */
+export type DeletedDriftChange = 'file_gone' | 'live_page' | 'no_deletion' | 'deleted_same';
+export async function readDeletedDriftTarget(engine: BrainEngine, sourceId: string, input: { path: string; sourcePath: string; pageId?: number | null }):
+  Promise<DeletedDriftTarget | { changed: DeletedDriftChange }> {
+  const binding = await getWorktreeBinding(engine, sourceId);
+  if (!binding?.local_path || binding.owner_host_id !== localHostId() || binding.state !== 'active') {
+    throw new OperationError('owner_unavailable', 'Reconciliation requires the existing active owner on this host.', 'Run repair on the current owner; repair never claims or activates a source.');
+  }
+  const root = realpathSync(join(binding.local_path, binding.relative_path));
+  const path = join(root, ...input.path.split('/'));
+  if (!isWriteTargetContained(path, root)) throw opError('source_changed', 'The held file is outside its registered source.',
+    `Nothing changed. ${input.path} resolves outside source '${sourceId}''s checkout (a symlinked directory or a moved checkout); inspect the owner before previewing again.`);
+  try {
+    const info = lstatSync(path);
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) throw opError('source_changed', 'The held file is not an ordinary file; repair does not replace it.',
+      `Nothing changed. Make ${input.path} in '${sourceId}' a regular file (not a symlink, directory or hard link), then preview again.`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { changed: 'file_gone' };
+    throw error;
+  }
+  const raw = readFileSync(path);
+  const pin = { root, path, relative_path: input.path, source_path: input.sourcePath, raw, raw_file_hash: sha256(raw) };
+  const claims = await engine.executeRaw<{ id: number; slug: string; deleted: boolean }>(
+    `SELECT id, slug, deleted_at IS NOT NULL AS deleted FROM pages WHERE source_id=$1 AND source_path=$2 ORDER BY deleted_at DESC NULLS FIRST, id DESC`, [sourceId, input.sourcePath]);
+  if (claims.some(row => !row.deleted)) return { changed: 'live_page' };
+  const tombstone = claims.find(row => Number(row.id) === input.pageId) ?? claims[0];
+  if (tombstone) {
+    const snapshot = await engine.readPageSnapshot(tombstone.slug, { sourceId, includeDeleted: true });
+    if (!snapshot || Number(snapshot.page.id) !== Number(tombstone.id) || !snapshot.page.deleted_at) staleReconcile('the deleted page changed during the preview');
+    return { state: 'tombstone_edited', ...pin, tombstone: { page_id: Number(tombstone.id), slug: tombstone.slug, revision: snapshot.revision }, marker_digest: null };
+  }
+  const [marker] = await engine.executeRaw<{ value: { kind?: string; blob_oids?: unknown } | null }>('SELECT completed_keys->0 AS value FROM op_checkpoints WHERE op=$1 AND fingerprint=$2',
+    [SYNC_ORIGIN_DELETED_OP, `${sourceId}:${binding.source_incarnation}:${input.sourcePath}`]);
+  if (!marker?.value || marker.value.kind === 'legacy') return { changed: 'no_deletion' };
+  const held = Array.isArray(marker.value.blob_oids) ? marker.value.blob_oids : [];
+  if (held.includes(gitBlobOid(raw, 'sha1')) || held.includes(gitBlobOid(raw, 'sha256'))) return { changed: 'deleted_same' };
+  return { state: 'purged_differs', ...pin, tombstone: null, marker_digest: digest(marker.value) };
 }
 /** Whether `root` or an ancestor holds a `.git` entry (a checkout Git should answer for). */
 function insideGitCheckout(root: string): boolean {
@@ -134,7 +207,10 @@ async function assertSoleFileClaim(engine: BrainEngine, target: FileClaimTarget)
   const [claimant] = await findLiveFileClaimants(engine, target);
   if (claimant) throw opError('source_changed', 'Several pages claim the recorded canonical file.',
     `Nothing changed. Pages ${target.slug} and ${claimant.slug} in '${target.sourceId}' both record the same file, so reconcile cannot tell which owns it; decide with the user which page owns the file before reconciling either. `
-    + sharedOriginExit(target.sourceId, [target.slug, claimant.slug]) + ' Then preview again.');
+    + sharedOriginExit(target.sourceId, [target.slug, claimant.slug]) + ' Then preview again.',
+    // #6948 (B-15): the read-only group listing names the page that keeps the file and the exact command for each other one.
+    { detail: 'shared_origin', fix: readFix(`Lists the duplicate-origin group of ${target.slug} and ${claimant.slug} with the page its path names and the command that resolves each other page; writes nothing.`,
+      { argv: originTwinsPreviewArgv(target.sourceId) }) });
 }
 /**
  * #6394: `adoptSlugPath` lets a live page with no recorded origin and no database-only marker reconcile against the file
@@ -148,7 +224,8 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
     throw new OperationError('owner_unavailable', 'Reconciliation requires the existing active owner on this host.', 'Run repair on the current owner; repair never claims or activates a source.');
   }
   const [brain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
-  const snapshot = await engine.readPageSnapshot(slug, { sourceId, includeDeleted: true });
+  // Wave B: a page stored in segments is compared and merged as strings up to 24 MiB; a larger one refuses.
+  const snapshot = await wholeBodySnapshot(engine, await engine.readPageSnapshot(slug, { sourceId, includeDeleted: true }), 'sources reconcile');
   if (!snapshot || snapshot.page.deleted_at) throw opError('page_not_found', 'Reconciliation requires an existing live page; use the separate restore workflow for deleted pages.',
     `Page ${slug} in '${sourceId}' is deleted or missing; nothing changed. If it was deleted by mistake, restore it (gbrain restore, within the 72-hour window) and then preview it again.`,
     { fix: readFix('Shows whether the page exists or is soft-deleted in this source.', { argv: ['gbrain', 'get', '--source', sourceId, '--include-deleted', '--', slug] }) });
@@ -208,7 +285,7 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
   const importPath = scannerSourcePath(root, path, mode);
   const reading = reconcileFileReading(text, importPath, snapshot.page);
   const parsed = parseMarkdown(reading.content, `${slug}.md`, { validate: true, expectedSlug: slug });
-  if (reading.inferred) parsed.type = snapshot.page.type;
+  alignWithStored(parsed, snapshot.page, reading.inferred);
   const errors = parsed.errors?.filter(e => !['MISSING_OPEN', 'MISSING_CLOSE', 'EMPTY_FRONTMATTER'].includes(e.code)) ?? [];
   if (!errors.length && !parsed.errors?.some(e => e.code === 'MISSING_CLOSE') && parsed.slug !== slug) {
     // #5966 (W14 P1.7): a well-formed file whose path derives another slug is a legacy render of a slug the
@@ -268,7 +345,7 @@ export function validateReconcileArtifact(value: unknown): ReconcileArtifact {
   strictReconcileKeys(value.preimages.database.page, ['id', 'slug', 'source_id', 'type', 'title', 'compiled_truth', 'timeline', 'frontmatter',
     'content_hash', 'source_path', 'knowledge_revision', 'text_projection_revision', 'emotional_weight', 'created_at', 'updated_at', 'updated_at_iso',
     'deleted_at', 'effective_date', 'effective_date_source', 'import_filename', 'salience_touched_at', 'source_kind', 'source_uri', 'ingested_via',
-    'ingested_at', 'contextual_retrieval_mode', 'corpus_generation'], ['id', 'slug', 'source_id', 'type', 'title', 'compiled_truth', 'timeline', 'frontmatter']);
+    'ingested_at', 'contextual_retrieval_mode', 'corpus_generation', 'withheld_source_path'], ['id', 'slug', 'source_id', 'type', 'title', 'compiled_truth', 'timeline', 'frontmatter']);
   strictReconcileKeys(value.preimages.stored_page, ['id', 'source_id', 'slug', 'type', 'title', 'compiled_truth', 'timeline', 'frontmatter',
     'content_hash', 'source_path', 'source_kind', 'source_uri', 'ingested_via', 'ingested_at', 'knowledge_revision', 'deleted_at']);
   strictReconcileKeys(value.result, ['type', 'title', 'compiled_truth', 'timeline', 'frontmatter', 'tags']);

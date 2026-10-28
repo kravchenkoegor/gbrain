@@ -98,7 +98,7 @@ for (const backend of testBackends()) {
 
     test('more than 1000 held pages are counted and listed, none truncated', async () => {
       await engine.executeRaw(`INSERT INTO pages (slug, source_id, type, title, compiled_truth, frontmatter, content_hash, created_at, updated_at)
-        SELECT 'archive/day-' || g, 'default', 'note', 'Day ' || g, 'x', '{}', 'h' || g, now(), now() FROM generate_series(1, 1001) AS g`);
+        SELECT 'archive/day-' || g, 'default', 'note', 'Day ' || g, repeat('x', ${PAGE_INLINE_MAX_BYTES + 1}), '{}', 'h' || g, now(), now() FROM generate_series(1, 1001) AS g`);
       await engine.executeRaw(`INSERT INTO content_chunks (page_id, chunk_index, chunk_text) SELECT id, 0, 'acme-example notes' FROM pages WHERE slug LIKE 'archive/day-%'`);
       await engine.executeRaw(`INSERT INTO page_embedding_budget (page_id, state, reason) SELECT id, 'held', 'upgrade_backfill' FROM pages WHERE slug LIKE 'archive/day-%'`);
       expect((await readBudgetLimited(engine)).held).toBe(1001);
@@ -154,7 +154,8 @@ for (const backend of testBackends()) {
         get(target, key) {
           if (key === 'executeRaw') {
             return async (sql: string, params?: unknown[], opts?: unknown) => {
-              if (/octet_length\(p\.compiled_truth\)/.test(sql)) await new Promise(r => setTimeout(r, 1500));
+              // The held count's size check reads only TOAST size headers; held-budget-count-list.test.ts's 0-TOAST-block work count is the direct guard that partial_embedding never reads bodies.
+              if (/octet_length\(p\.compiled_truth\)/.test(sql) && !/page_embedding_budget/.test(sql)) await new Promise(r => setTimeout(r, 1500));
               return target.executeRaw(sql, params, opts as never);
             };
           }
@@ -202,6 +203,17 @@ for (const backend of testBackends()) {
       expect(result.budget_limited!.by_source.map(s => s.source_id)).toEqual(['default']);
       expect(result.budget_limited!.by_source[0]!.fix.command).toMatch(/^gbrain embed --held --source default --max-usd \d+\.\d\d/);
       expect(await budgetLimitedField(engine, 'alpha', null)).toMatchObject({ budget_limited: { held: 1 } });
+    }, 60_000);
+
+    test('#7193: an incomplete embed-backfill counts the held pages\' chunks in "N chunks remain" and names them', async () => {
+      await holdPageEmbedding(engine, await largePage('chats/held-remaining', 'default', 3), 'upgrade_backfill');
+      await holdPageEmbedding(engine, await largePage('chats/held-elsewhere', 'alpha', 2), 'upgrade_backfill');
+      const controller = new AbortController();
+      const job = { id: 1, name: 'embed-backfill', data: { sourceId: 'default' }, attempts_made: 0, signal: controller.signal, deadlineAtMs: null,
+        shutdownSignal: controller.signal, updateProgress: async () => {}, updateTokens: async () => {}, log: async () => {}, isActive: async () => true, readInbox: async () => [] } as unknown as MinionJobContext;
+      const handler = makeEmbedBackfillHandler(engine, { runStale: async () => ({ embedded: 0, chunksProcessed: 0, pagesProcessed: 0, invalidated: 0, lastCursor: null, done: true, aborted: false,
+        remaining: 2, blocked: 1, complete: false }) });
+      await expect(handler(job)).rejects.toThrow('embed-backfill: incomplete; 5 chunks remain (3 of them on 1 large page(s) held for approval or at their spend cap; gbrain embed --held --dry-run --source default lists them) and 1 projections are blocked.');
     }, 60_000);
   });
 }

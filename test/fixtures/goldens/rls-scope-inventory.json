@@ -2484,12 +2484,12 @@
       },
       "purgeDeletedPages#default": {
         "flagOffLanes": [
-          "pool"
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "unscoped",
         "flagOnLanes": [
-          "pool"
+          "tx"
         ],
         "flagOnScopes": []
       },
@@ -2851,23 +2851,23 @@
       },
       "restorePage#default": {
         "flagOffLanes": [
-          "pool"
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "unscoped",
         "flagOnLanes": [
-          "pool"
+          "tx"
         ],
         "flagOnScopes": []
       },
       "restorePage#sourceId": {
         "flagOffLanes": [
-          "pool"
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "unscoped",
         "flagOnLanes": [
-          "pool"
+          "tx"
         ],
         "flagOnScopes": []
       },
@@ -3550,7 +3550,7 @@
       }
     },
     "static": {
-      "callSites": 32,
+      "callSites": 33,
       "directMethods": {
         "_searchKeywordCJK": 1,
         "countChunklessPagesWithContent": 1,
@@ -3566,6 +3566,7 @@
         "getChunkWindows": 1,
         "getChunks": 1,
         "getLinks": 1,
+        "keywordBoundedRead": 1,
         "listChunklessPagesWithContent": 1,
         "listCorpusSample": 1,
         "listEmbeddingStateRows": 1,
@@ -3604,6 +3605,7 @@
         "batchRetry": "none",
         "connRetry": "none",
         "connect": "none",
+        "connectedDatabaseUrl": "none",
         "consolidateFact": "none",
         "countChunklessPagesWithContent": "direct",
         "countKeywordPages": "direct",
@@ -3687,6 +3689,7 @@
         "invalidateContentDriftEmbeddings": "none",
         "invalidateStaleSignatureEmbeddings": "none",
         "jitOffRead": "none",
+        "keywordBoundedRead": "direct",
         "keywordStatementTimeoutSetting": "none",
         "listActiveTakesForPages": "none",
         "listAllPageRefs": "none",
@@ -3732,7 +3735,9 @@
         "readManifest": "none",
         "readPageSnapshot": "direct",
         "readPageSnapshotsBatch": "direct",
+        "readSegmentDerivations": "none",
         "readSegmentTexts": "none",
+        "readTransaction": "none",
         "reconnect": "none",
         "refreshPageBody": "none",
         "registerBeforeDisconnect": "none",
@@ -3751,6 +3756,7 @@
         "resolveSlugsByPaths": "none",
         "resolveTake": "none",
         "restorePage": "none",
+        "retireSegmentDerivations": "none",
         "revertToVersion": "none",
         "rewriteLinks": "none",
         "rlsScopeBindingEnabled": "none",
@@ -3796,6 +3802,7 @@
         "upsertChunks": "via:_upsertChunksOnce",
         "upsertEventProjection": "none",
         "upsertFile": "none",
+        "upsertSegmentDerivations": "none",
         "vectorIterativeScanSupported": "none",
         "withReservedConnection": "none",
         "withScopedReadTransaction": "none",

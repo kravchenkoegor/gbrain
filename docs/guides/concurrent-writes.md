@@ -346,6 +346,11 @@ Receipts include `request_id`, `state`, and `retry_after_ms`, with optional
 revision, outcome, persistence status, and timestamps. Terminal receipts have
 `retry_after_ms: null`. Private queued content, credential hashes, and recovery
 bytes are never part of the receipt.
+A committed write of a page stored in segments also says whether search sees
+it yet: `searchable: true`, or `searchable: "pending"` with
+`searchable_retry_after_ms` and `searchable_fix` (read the receipt again) while
+its chunks are built after commit; see
+[when a segmented write is searchable](memory-boundaries.md#segmented-searchable).
 
 Nonterminal receipts may include a validated `diagnostic` with `age_ms`,
 `assessment` (`pending`, `blocked`, or `stalled`), a closed `reason`, and
@@ -497,6 +502,12 @@ scan. These are capacity limits, not a latency guarantee or permission to spend
 on providers. `withdrawal_capacity` or `withdrawal_provenance` refuses the
 attempt before ledger, expiry, revision or chunk changes. Matching malformed
 fences need canonical repair.
+
+A facts fence that crosses a forced segment cut is read whole and checked in
+one batch, so one such fence over 16,384 rows (or 8 MiB of rows to check)
+refuses `withdrawal_capacity` with reason `split_fence_rows`, naming the page
+and the fence's row count. Split that fence into fences of at most 16,384 rows,
+write the page again, then retry.
 
 When the claim itself is carried by more than 256 pages, the refusal names the
 matched count and up to 20 matched pages. Reduce the matched set, then retry:
@@ -860,7 +871,7 @@ Default admission limits are enforced atomically:
 | Queued intent bytes | 32 MiB | 256 MiB |
 | Lifetime request IDs | 2,000,000 | 8,000,000 |
 | Terminal receipt reservation | 16 GiB | 64 GiB |
-| Recovery bytes | — | 1 GiB, also 256 MiB per worktree |
+| Recovery bytes | — | 1 GiB, also 256 MiB per worktree (with `pages.segmented_storage on`: twice `pages.max_bytes` plus 2 MiB, at least 256 MiB) |
 
 Completion space is reserved at admission. Beforeimage/recovery bytes are
 reserved before filesystem publication. Reaching a limit refuses additional

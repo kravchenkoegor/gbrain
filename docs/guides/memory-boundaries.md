@@ -56,7 +56,7 @@ prompt or response text).
 |---|---|
 | Trusted local `put_page` / capture | Extracts supported page references without an LLM when auto-linking is enabled. |
 | MCP `put_page` / capture / `edit_page`, including stdio | Saves body references as text; no inline graph extraction. The receipt reports `auto_links.skipped: remote`. |
-| Post-commit `links` effect of an MCP page write | Adds untyped `mentions` edges (`link_source: mcp-remote-mention`) for the body's markdown links, `[[wikilinks]]` and page-path mentions whose target already exists in the same source, is not deleted, is visible to the writer and is inside its slug grant. No typed, frontmatter, timeline or cross-source edges and no new pages. The receipt reports `auto_links.mention_links: queued`; `get_write_request` lists the effect with `added`/`removed` counts. `gbrain config set mcp.remote_auto_links off` (or `auto_link off`) disables it. |
+| Post-commit `links` effect of an MCP page write | Adds untyped `mentions` edges (`link_source: mcp-remote-mention`) for the body's markdown links, `[[wikilinks]]` and page-path mentions whose target already exists in the same source, is not deleted, is visible to the writer and is inside its slug grant. No typed, frontmatter, timeline or cross-source edges and no new pages. The receipt reports `auto_links.mention_links: queued`; `get_write_request` lists the effect with `added`/`removed` counts, plus `invalid_targets` (reason `invalid_slug`) for any target that is not a valid slug (`[[../x]]`, a backslash, an encoded separator): those are skipped and the page's other edges still land (#7008). A remote `append_page` to the page body queues the same effect over the appended text only: it adds edges for what that text mentions and never removes one (#7122). `gbrain config set mcp.remote_auto_links off` (or `auto_link off`) disables it. |
 | Stdio `gbrain serve` | Has bounded, best-effort startup and idle maintenance sweeps, unless disabled. This is eventual maintenance, not a guarantee that a remote write immediately has edges. |
 | `gbrain serve --http` | Does not self-sweep. The host must run maintenance explicitly. |
 
@@ -88,14 +88,16 @@ asks before `gbrain embed --held --source <id> --max-usd <N>`, one source at a t
 
 A page stays one page whatever its size: one slug, one title, one set of
 links. Size no longer decides whether search can find it. Every Markdown page
-up to 24 MiB (25,165,824 bytes) is stored, chunked and keyword-indexed when it
-is written, on every engine. Don't split a page by hand to make it searchable.
+up to the page ceiling is stored, chunked and keyword-indexed when it is
+written: 256 MiB on Postgres and 128 MiB on PGLite (`pages.max_bytes` lowers
+it), or 24 MiB (25,165,824 bytes) while [segmented storage](#segmented-page-storage)
+is off. Don't split a page by hand to make it searchable.
 
 | Page body | Keyword search | Meaning (vector) search |
 | --- | --- | --- |
 | Up to 1 MiB | right after the write | right after the write |
-| Over 1 MiB, up to 24 MiB (a *large* page) | right after the write | after the write commits, when the stale sweep embeds it (`gbrain embed --stale`, sync's embed pass, autopilot) |
-| Over 24 MiB | refused with [`file_too_large`](write-refusals.md#file_too_large); nothing is stored | — |
+| Over 1 MiB, up to the page ceiling (a *large* page) | right after the write | after the write commits, when the stale sweep embeds it (`gbrain embed --stale`, sync's embed pass, autopilot) |
+| Over the page ceiling | refused with [`file_too_large`](write-refusals.md#file_too_large); nothing is stored | — |
 
 Code files keep a lower limit; see [limits per entry point](#large-page-limits).
 
@@ -112,7 +114,7 @@ An operator who set a lower `content_sanity.bytes_block` (the
 stops embedding above that value: such a page is stored with an `embed_skip`
 marker and gets no vectors, but it is still chunked, so keyword search finds
 it. The same holds for any page with an `embed_skip` marker. The default is
-the 24 MiB ceiling, so nothing is skipped for size unless someone lowered it.
+the page ceiling, so nothing is skipped for size unless someone lowered it.
 
 **What a write says about size.** `put_page`, `remember` and sync receipts
 carry the same field for a large or `embed_skip` page, so the writer learns on
@@ -131,8 +133,133 @@ An ordinary page carries no field.
 | `skipped` | `oversized` | Over the operator's `bytes_block`: chunked and keyword-searchable, never embedded. |
 | `skipped` | `operator_marker` | Another `embed_skip` marker: chunked and keyword-searchable, never embedded. |
 
-A body over the 24 MiB ceiling has no receipt: the write is refused as
-`request_too_large`.
+A body over the page ceiling, or `put_page` content over 24 MiB, has no
+receipt: the write is refused as `request_too_large`.
+
+<a id="reading-part-of-a-page"></a>
+### Reading part of a page
+
+**Say to your agent:** *"Show me just the Next steps section of the
+acme-example meeting page."* The agent runs
+`gbrain get <slug> --section "Next steps"` (MCP: `get_page` with
+`section`) instead of reading the whole page.
+
+**Say to your agent:** *"Where does the widget plan page mention pricing?"*
+The agent runs `gbrain get <slug> --grep pricing --context 1` (MCP:
+`get_page` with `grep` and `context`).
+
+`--section` returns the first section whose heading matches (case does not
+matter), down to the next heading of the same or a higher level, with the
+headings above it. If no heading matches, the error lists the page's headings
+(up to 20). `--grep` returns each paragraph with a line containing the text
+(plain text, not a pattern) plus `--context` paragraphs either side (default
+1, at most 5), with line numbers and `total_matches`. It returns at most 50
+matching paragraphs and 100,000 characters, and says `truncated` when it
+stops early. The line numbers are the ones a `--body window` read takes:
+`gbrain get <slug> --body window --lines 100-140` reads lines 100 to 140
+(`--lines 100` reads one line, `--bytes 0-999` the first 1,000 bytes).
+Both read the same text a window does, so they show a remote caller nothing a
+window would not, and they work on segmented pages one segment at a time.
+Every `get_page` response carries `chars`, the characters of page text it
+returned.
+
+<a id="segmented-page-storage"></a>
+### Segmented page storage
+
+A page over 1 MiB is stored as segments of about 256 KiB instead of one text
+column (`pages.segmented_storage`, on by default). Reading a window, an
+outline or a chunk's context costs the size of the window, not the page, and
+a rewrite re-indexes only the segments that changed. Pages at or under 1 MiB
+are stored exactly as before; a segmented page goes back to one column when a
+write leaves it at or under 512 KiB.
+
+A body that arrives as one string (`put_page`, `put_pages`, `capture` content
+and `gbrain put` stdin) stays limited to 24 MiB per call. A larger page comes
+in by `gbrain import` or `gbrain sync` of its file. On a source backed by
+files that is only the file at its own place in the checkout, which gbrain
+never rewrites; a database-only source takes it by `gbrain import`.
+
+The switch stays off while an older gbrain writes to the same brain: a
+gbrain older than the release that turned it on by default (v0.60.290.0
+included), or one that stamps no version, that in the last 7 days admitted or
+published a managed write, logged an import, sync or connector run, or ran a
+resident process keeps new pages inline, even when the setting is `on`.
+`gbrain doctor` check `segmented_storage` shows the configured and effective
+value and names each blocking host by UUID. Run `gbrain upgrade` there; the
+hold clears 7 days after that writer's last write. An older binary's
+single-page write on a brain without managed persistence (a classic brain
+shared by several hosts) is not detected: upgrade every host that writes to
+such a brain, or run `gbrain config set pages.segmented_storage off` until
+they are upgraded.
+
+<a id="segmented-searchable"></a>
+**When a segmented write is searchable.** The receipt of a write that stores a
+page in segments says `searchable`. A new page up to 4 MiB, and every rewrite of
+a segmented page, is searchable when it commits (`searchable: true`). A larger
+new page commits first and builds its chunks and keyword index right after,
+about 10 seconds for 20 MB: its receipt says `searchable: "pending"`, with
+`searchable_retry_after_ms` and a `searchable_fix` that reads the receipt again
+(`get_write_request`, `gbrain write-request -- <id>`). Read it at that interval
+until it says `searchable: true`; search finds the page from then on. Until
+then, search does not return the page. If it still says `"pending"` after a
+minute, no running gbrain process is building it (a brain with no resident
+writer, or a build that died): `gbrain projections drain`, the fix's fallback,
+builds it now, and doctor `text_projection_readiness` names how many such
+pages wait. A quarantined page says
+`searchable: false`. A managed `gbrain import` or `gbrain sync` of such a
+page replies the same way, when the write commits: its result says
+`searchable: "pending"` and `projection: "pending"` with the `request_id` to read
+again, `searchable_retry_after_ms` and `searchable_fix`, and the build does not
+hold up the source's next write. A new page up to 4 MiB still imports
+searchable (`searchable: true`).
+
+Deleting and restoring a segmented page on a source backed by files works up
+to the page ceiling. A restore reserves room for its file twice (the staging
+file and the file) in the worktree recovery budget, so with the switch on
+`persistence.limits.worktree_recovery_bytes` defaults to twice `pages.max_bytes`
+plus 2 MiB, never less than 256 MiB (514 MiB on Postgres and 258 MiB on PGLite
+at the default ceilings). A value you set is kept; a page that does not fit it
+is refused with `request_too_large` before anything is touched. A restored
+page is searchable when the restore commits, or, when its chunks were never
+built, right after it (`gbrain projections drain` builds it if that build
+dies).
+
+<a id="segmented-withdrawal-mirror"></a>
+**Withdrawals rewrite a segmented page's file.** `forget`, `forget_fact` and
+`purge_fact` on a page stored in segments, on a source backed by files,
+rewrite its canonical file as they rewrite an inline page's: the file shows the
+row forgotten, or loses the purged row, and holds the bytes `gbrain export`
+writes for the page; the withdrawal's Git effect commits it. The file is
+streamed from the segments into its staging file, one segment at a time, and
+never held whole. Its recovery record names that staging file by path and
+SHA-256 instead of holding the file, so the mirror reserves the file once in
+the recovery budget. A mirror interrupted before, during or after writing the
+staging file finishes on the writer's next pass: a staging file a crash cut
+short is discarded and written again.
+
+<a id="segmented-doctor-skips"></a>
+**What doctor does not read on a segmented page.** Some doctor checks read a
+page's whole body as one string, and a page stored in segments has none.
+Those checks say how many such pages they passed by: `oversized_pages`,
+`scraper_junk_pages`, `markdown_body_completeness`,
+`link_resolution_opportunity`, `fence_integrity`, `core_memory` and
+`extract_health` (its facts-backlog overlay) carry `skipped_segmented: N` in
+`gbrain doctor --json` and end their message with `skipped (segmented): N`.
+`gbrain repair frontmatter` reports the same count (residual
+`skipped_segmented` and a warning) for the stored bodies it does not check;
+it still checks their files. An `ok` from such a check covers only the pages
+it read. The field is absent when no page is stored in segments.
+Core memory reads a core page stored in segments back whole up to 24 MiB,
+as it reads an inline page, so `core_memory` counts only the core pages over
+24 MiB, which core leaves out of every session and of its budget. A
+frontmatter re-import of a page stored in segments works the same way up to
+24 MiB; over it the file is listed `needs_review` with `page_body_segmented`
+and nothing is written.
+
+While the switch is off (`gbrain config set pages.segmented_storage off`, or
+held by an older writer), new pages are stored inline up to 24 MiB as before.
+Pages already stored in segments stay readable and exportable; a write that
+would leave one over 24 MiB is refused until the switch is on again.
 
 <a id="large-page-limits"></a>
 ### Limits per entry point
@@ -143,17 +270,17 @@ wrong with the page.
 
 | Entry point | Limit | What to do above it today |
 | --- | --- | --- |
-| Markdown import and sync (`gbrain import`, `gbrain sync`, the managed sync blob read) | 24 MiB | — |
-| CLI stdin (`gbrain put`, `gbrain capture --stdin`) | 24 MiB (was 5 MB) | — |
+| Markdown import and sync (`gbrain import`, `gbrain sync`, the managed sync blob read) | the page ceiling: 256 MiB on Postgres, 128 MiB on PGLite (24 MiB while segmented storage is off); above 24 MiB on a source backed by files, only from the file's own place in the checkout | — |
+| CLI stdin (`gbrain put`, `gbrain capture --stdin`) | 24 MiB (was 5 MB) | `gbrain import` the file |
 | MCP stdio (local agents, `gbrain serve`) | 64 MiB per JSON-RPC message (the MCP SDK default of 10 MiB is raised), so a JSON-escaped page at the ceiling fits | — |
 | MCP over HTTP (`gbrain serve --http`) | 4 MiB request body (the MCP SDK default) | the same: sync or the CLI on the brain host (chunked uploads arrive in a later release) |
 | Legacy HTTP transport | 1 MiB (`GBRAIN_HTTP_MAX_BODY_BYTES`) | the same |
 | `put_pages` batch | 8 MiB per batch | send large pages one per `put_page`, or by file |
 | Persistence journal | 64 MiB of outstanding JSON-escaped write intent per principal (was 32 MiB), 256 MiB per brain | nothing: a second large write waits for the first |
 | Local persistence socket (IPC) | 32 MiB per frame, JSON-escaped | nothing for ordinary text; only a pathological page (mostly quotes or backslashes) reaches it below the ceiling |
-| Pre-push secret scan | 25 MiB per file; gbrain never writes a canonical file over it | — |
+| Pre-push secret scan | 512 MiB per staged file: up to 25 MiB a file is scanned whole, above it in bounded windows streamed from git; gbrain still never writes a canonical file over 25 MiB | split the file, or `git rm --cached` it |
 | GitHub | warns at 50 MB, rejects at 100 MB | — |
-| Export | aborts on a page over 32 MiB, which the 24 MiB ceiling makes unreachable | — |
+| Export | streams a page stored in segments, up to the page ceiling; aborts on an inline page whose payload is over 32 MiB, which the 24 MiB ceiling makes unreachable | — |
 | Company-brain inspection | 5 MB per file | unchanged |
 | Transcript ingest input (Claude Code `.jsonl`) | 10 MiB by default, 50 MiB hard cap | unchanged |
 | Code files | 5 MB | unchanged |
@@ -165,7 +292,7 @@ describes how to read the next window.
 
 **Cost.** Chunking and keyword indexing run locally and cost nothing.
 Embedding a large page costs about $0.15 per 10 MB at the default embedding
-model, so a page at the 24 MiB ceiling costs about $0.40. Each page has a paid
+model, so a 24 MiB page costs about $0.40 and one at the 256 MiB ceiling about $4. Each page has a paid
 spend cap, `embed.max_usd_per_page` (default $2), covering its embedding at
 every paid entry point (the stale sweep, `gbrain embed`, the post-write
 embedding job). A large page uses the free title context tier, never paid
@@ -188,11 +315,18 @@ for up to two minutes, on the CPU, on keyless brains too, and prints a receipt;
 resumes where it stopped. It removes only gate-written markers whose reason is
 `oversized`, and the matching `content_flag: oversized`; a page above the
 operator's effective `bytes_block` keeps both and is re-chunked for keyword
-search with no vectors. The backfill never embeds.
+search with no vectors. The backfill never embeds. A page whose rewrite is
+refused (an invalid fence the canonical owner will not write, for example)
+keeps its marker and is listed under `failed`; the hold placed for it is put
+back, so it is not left waiting for an approval that cannot embed it. Until
+its content is repaired, the chunk safety net (`gbrain embed --stale`, the
+cycle's embed phase) gives it chunks for keyword search with no vectors, and
+doctor `oversized_pages` counts the marked pages with and without chunks.
 Backfilled pages over 1 MiB are held for consent; the post-upgrade notice,
 `gbrain embed --stale` (its `budget_limited` line) and doctor's
 `partial_embedding` check show how many are held and what embedding them
-would cost. Pages between 500 KB and 1 MiB cost a cent or two each and embed
+would cost; doctor also says how many holds have waited more than a day
+without a decision, and since when. Pages between 500 KB and 1 MiB cost a cent or two each and embed
 through the normal sweep under the existing caps.
 
 Nothing releases a hold automatically. `gbrain embed --held --dry-run` lists

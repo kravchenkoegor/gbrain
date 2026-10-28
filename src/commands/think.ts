@@ -263,8 +263,9 @@ prints what would have been the input (exit 0).
 
   // F8: keyless-by-design output carries its explanation as an info notice.
   if (result.synthesis_status === 'no_llm') captureOpNotice(keylessThinkNotice());
+  const { persist_base: _persistBase, ...visible } = result;
   const { result: jsonDoc, stderr: noticeText } = applyCliOpNotices({
-    ...result,
+    ...visible,
     cost_usd: costUsd ?? null,
     saved_slug: savedSlug ?? null,
     evidence_inserted: evidenceInserted,
@@ -287,7 +288,8 @@ prints what would have been the input (exit 0).
   }
   console.log('---');
   const costSuffix = costUsd !== undefined ? ` | Cost: $${costUsd.toFixed(4)}` : '';
-  console.log(`Model: ${result.modelUsed} | Pages: ${result.pagesGathered} | Takes: ${result.takesGathered} | Graph: ${result.graphHits} | Citations: ${result.citations.length}${costSuffix}`);
+  const fallbackNote = result.requested_model ? ` (fallback from ${result.requested_model}${result.fallback_reason ? `: ${result.fallback_reason}` : ''})` : '';
+  console.log(`Model: ${result.modelUsed}${fallbackNote} | Pages: ${result.pagesGathered} | Takes: ${result.takesGathered} | Graph: ${result.graphHits} | Citations: ${result.citations.length}${costSuffix}`);
   if (savedSlug) {
     console.log(`Saved: ${savedSlug} (${evidenceInserted} evidence rows)`);
   }

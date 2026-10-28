@@ -9,7 +9,7 @@ import { runPhaseSynthesize } from '../src/core/cycle/synthesize.ts';
 import { retryWriteAdmission } from '../src/core/persistence/admission-retry.ts';
 import * as journal from '../src/core/persistence/journal.ts';
 import { OperationError } from '../src/core/ops/contract.ts';
-import { acquireWorktree, claimWorktree, getWorktreeBinding } from '../src/core/persistence/ownership.ts';
+import { acquireWorktree, getWorktreeBinding } from '../src/core/persistence/ownership.ts';
 import { __setMaintenanceWriteWaitForTests } from '../src/core/persistence/maintenance-wait.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { clientRequestUuid } from '../src/core/persistence/preconditions.ts';
@@ -19,12 +19,14 @@ import { requestIndexesCheck } from '../src/commands/doctor/checks/persistence-r
 import { PERSISTENCE_REQUEST_ID_INDEX } from '../src/core/persistence/schema.ts';
 import { buildIndexOnline } from '../src/core/schema-migrations/helpers.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
+import { isTerminal as isTerminalRequest, type RequestState as PersistenceRequestState } from '../src/core/persistence/model.ts';
 import { configureGateway, resetGateway, __setChatTransportForTests, __setEmbedTransportForTests, __setDecideTransportForTests } from '../src/core/ai/gateway.ts';
 import { flushDecideWrites } from '../src/core/ai/decide/store.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
-import { withEnv } from './helpers/with-env.ts';
 import * as staleEmbedding from '../src/core/embed-stale.ts';
 import { testBackends } from './helpers/test-backends.ts';
+import { freezeCorpusSessions } from './helpers/frozen-corpus.ts';
+import { childCommittedOrdinaryCycle, interruptAfterChild, laterQuote, managedSynthesisFixture, outputSlug, type SynthesisFixture } from './helpers/managed-synthesis-fixture.ts';
 
 const backends = testBackends();
 const engines: BrainEngine[] = [];
@@ -52,79 +54,7 @@ afterAll(async () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-const laterQuote = 'a legitimate later quotation from a completely different interview';
-
-async function fixture(run: (f: {
-  engine: BrainEngine; sourceId: string; root: string;
-  opts: { brainDir: string; sourceId: string; dryRun: boolean; inputFile: string; date: string };
-  calls: () => number; edit: (slug: string) => Promise<void>;
-}) => Promise<void>, outputCount = 1, outputBody?: string) {
-  for (const engine of engines) {
-    const dir = mkdtempSync(join(tmpdir(), 'gbrain-synth-postprocess-'));
-    const root = join(dir, 'brain');
-    mkdirSync(root);
-    const sourceId = `synthesis-${randomUUID().slice(0, 8)}`;
-    let calls = 0;
-    try {
-      await withEnv({ GBRAIN_HOME: join(dir, 'home'), ANTHROPIC_API_KEY: 'sk-test-synthesis' }, async () => {
-        await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
-        await engine.executeRaw('INSERT INTO sources(id,name,local_path) VALUES($1,$1,$2)', [sourceId, root]);
-        await engine.setConfig('sync.write_through', 'true');
-        await claimWorktree(engine, sourceId, root);
-        const ctx = { engine, sourceId, remote: false as const, config: { engine: engine.kind, embedding_disabled: true },
-          dryRun: false, logger: { info() {}, warn() {}, error() {} } };
-        await submitPageMutation(ctx, { operation: 'put_page', params: {
-          slug: 'people/example', content: '---\ntitle: Example\ntype: note\n---\nExample evidence.', request_id: randomUUID(),
-        } });
-        const inputFile = join(root, '2026-09-20-session.txt');
-        const quote = 'we charge for durability because reliable memories should survive every tool';
-        writeFileSync(inputFile, `User: ${quote}.\n${'Assistant: Discuss the long term roadmap.\n'.repeat(15)}`);
-        for (const [key, value] of Object.entries({
-          'dream.synthesize.enabled': 'true', 'dream.synthesize.cooldown_hours': '0',
-          'dream.synthesize.min_chars': '100', 'dream.synthesize.link_manifest': 'false',
-          'dream.synthesize.mode': 'oneshot', 'dream.synthesize.quote_verify': 'true',
-          'models.dream.synthesize': 'anthropic:claude-sonnet-4-6',
-          'models.dream.triage': 'anthropic:claude-sonnet-4-6',
-        })) await engine.setConfig(key, value);
-        await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
-        __setChatTransportForTests(async opts => {
-          calls++;
-          const hash = /hash suffix \(USE THIS in slugs\): ([a-z0-9-]+)/i.exec(String(opts.messages?.[0]?.content ?? ''))?.[1] ?? 'missing';
-          const text = (opts.system ?? '').startsWith('You triage a conversation transcript')
-            ? JSON.stringify({ score: 0.9, content_type: 'reflection', segments: [{ quote, note: 'evidence' }], entities: [], reasons: ['durable insight'] })
-            : JSON.stringify({ pages: Array.from({ length: outputCount }, (_, i) => ({
-              slug: `wiki/personal/reflections/session${i ? `-${i}` : ''}-${hash}`, title: `Session ${i}`, type: 'note',
-              body: outputBody ?? `A memory strategy with [[people/example]]. Evidence item ${i}. Allegedly: "an entirely invented quotation that should lose its marks".`,
-            })), skipped: false });
-          return { text, blocks: [{ type: 'text', text }], stopReason: 'end',
-            usage: { input_tokens: 100, output_tokens: 100, cache_read_tokens: 0, cache_creation_tokens: 0 },
-            model: opts.model!, providerId: 'anthropic' };
-        });
-        await run({ engine, sourceId, root, opts: { brainDir: root, sourceId, dryRun: false, inputFile, date: '2026-09-20' },
-          calls: () => calls, edit: async slug => {
-            const snapshot = (await engine.readPageSnapshot(slug, { sourceId }))!;
-            await submitPageMutation(ctx, { operation: 'put_page', params: { slug,
-              content: `---\ntitle: User revision\ntype: note\n---\nUser evidence: "${laterQuote}".`,
-              expected_revision: snapshot.revision, request_id: randomUUID() } });
-          } });
-      });
-    } finally {
-      await flushDecideWrites();
-      __setDecideTransportForTests(null);
-      configureGateway({ embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536, env: {} });
-      __setChatTransportForTests(null);
-      __setEmbedTransportForTests(null);
-      await disposePersistenceConsumer(engine);
-      await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }
-}
-
-async function outputSlug(engine: BrainEngine, sourceId: string): Promise<string> {
-  const [row] = await engine.executeRaw<{ slug: string }>("SELECT slug FROM pages WHERE source_id=$1 AND slug LIKE 'wiki/personal/reflections/session-%'", [sourceId]);
-  return row.slug;
-}
+const fixture = (run: (f: SynthesisFixture) => Promise<void>, outputCount = 1, outputBody?: string) => managedSynthesisFixture(engines, run, outputCount, outputBody);
 
 test('managed native synthesis quarantines interpretations around valid evidence before mirror/chunk publication', async () => {
   const supported = 'Reliable memories should survive every tool change.';
@@ -182,29 +112,20 @@ test('managed native synthesis quarantines interpretations around valid evidence
   }, 1, [supported, ...unsupported, 'Related context: [[people/example]].'].join('\n\n'));
 }, 120_000);
 
-async function interruptAfterChild(engine: BrainEngine, sourceId: string, opts: Parameters<typeof runPhaseSynthesize>[1]) {
-  const controller = new AbortController();
-  const result = await runPhaseSynthesize(engine, { ...opts, signal: controller.signal, yieldDuringPhase: async () => {
-    const rows = await engine.executeRaw("SELECT id FROM minion_jobs WHERE status='completed' AND data->>'source_id'=$1", [sourceId]);
-    if (rows.length) controller.abort();
-  } });
-  expect(result.status).toBe('fail');
-  await disposePersistenceConsumer(engine);
-  await engine.executeRaw('DELETE FROM dream_verdicts');
-}
-
-/** An ordinary (corpus) cycle whose child committed before postprocessing ran; the cooldown is unstamped. */
-async function childCommittedOrdinaryCycle({ engine, sourceId, root, opts, calls }: Parameters<Parameters<typeof fixture>[0]>[0]) {
-  const corpus = join(root, '..', 'corpus');
-  mkdirSync(corpus);
-  writeFileSync(join(corpus, basename(opts.inputFile)), readFileSync(opts.inputFile));
-  await engine.setConfig('dream.synthesize.session_corpus_dir', corpus);
-  const ordinary = { brainDir: root, sourceId, dryRun: false };
-  await interruptAfterChild(engine, sourceId, ordinary);
-  const slug = await outputSlug(engine, sourceId);
-  await engine.executeRaw("DELETE FROM config WHERE key='dream.synthesize.last_completion_ts'");
-  return { ordinary, slug, jobsBefore: await engine.executeRaw('SELECT id FROM minion_jobs ORDER BY id'), spent: calls() };
-}
+test('GBRA-60: a child that verifies and stamps writes each output once; postprocessing counts its repair and publishes nothing', async () => {
+  await managedSynthesisFixture(engines, async ({ engine, sourceId, opts }) => {
+    const report = await runPhaseSynthesize(engine, opts);
+    expect(report.status).toBe('ok');
+    expect((report.details.synthesis as { quote_verify: { pages_repaired: number } }).quote_verify.pages_repaired).toBe(1);
+    const slug = await outputSlug(engine, sourceId);
+    const page = (await engine.readPageSnapshot(slug, { sourceId }))!.page;
+    expect({ stamped: page.frontmatter.dream_generated, invented: page.compiled_truth.includes('"an entirely invented') }).toEqual({ stamped: true, invented: false });
+    const [{ n: versions }] = await engine.executeRaw<{ n: number }>('SELECT count(*)::int AS n FROM page_versions v JOIN pages p ON p.id=v.page_id WHERE p.source_id=$1 AND p.slug=$2', [sourceId, slug]);
+    const [{ n: postprocessed }] = await engine.executeRaw<{ n: number }>(
+      "SELECT count(*)::int AS n FROM persistence_requests WHERE source_id=$1 AND slug=$2 AND intent->>'kind'='managed_maintenance_page'", [sourceId, slug]);
+    expect({ versions, postprocessed }).toEqual({ versions: 0, postprocessed: 0 });
+  }, 1, undefined, true);
+}, 120_000);
 
 /**
  * #6051: deterministic contention injection. Each maintenance admission for
@@ -624,6 +545,7 @@ test('#5854: a postprocess publish still pending after its wait is deferred, the
     const corpus = join(root, '..', 'corpus');
     mkdirSync(corpus);
     writeFileSync(join(corpus, basename(opts.inputFile)), readFileSync(opts.inputFile));
+    freezeCorpusSessions(corpus, sourceId);
     await engine.setConfig('dream.synthesize.session_corpus_dir', corpus);
     const ordinary = { brainDir: root, sourceId, dryRun: false };
     await interruptAfterChild(engine, sourceId, ordinary);
@@ -883,3 +805,156 @@ test('#6757: three deferred passes in a row put a line on doctor persistence_req
     expect(await requestIndexesCheck(engine)).toMatchObject({ status: 'ok', message: 'Request-table indexes are valid.' });
   });
 }, 180_000);
+
+// A shared wait may leave admitted writes pending while later admissions hit an outstanding cap (#6916).
+for (const scope of ['principal', 'brain'] as const) {
+  test(`synthesis defers ${scope} outstanding admission and replays the same request IDs`, async () => {
+    const { MaintenanceWriteWait } = await import('../src/core/persistence/maintenance-wait.ts');
+    const { isWriteCapacityWait, outstandingCapacityOf } = await import('../src/core/persistence/admission-retry.ts');
+    await fixture(async f => {
+      const { engine, sourceId, root, calls } = f;
+      const { ordinary, jobsBefore, spent } = await childCommittedOrdinaryCycle(f);
+      const ready = await engine.executeRaw<{ slug: string }>(
+        "SELECT slug FROM pages WHERE source_id=$1 AND slug LIKE 'wiki/personal/reflections/session%' ORDER BY slug", [sourceId]);
+      expect(ready).toHaveLength(4);
+      const children = await engine.executeRaw<{ state: string }>(
+        "SELECT state FROM persistence_requests WHERE source_id=$1 AND operation='put_page' AND slug LIKE 'wiki/personal/reflections/session%'", [sourceId]);
+      expect(children).toHaveLength(4);
+      expect(children.every(r => r.state === 'committed')).toBe(true);
+      const baseline = await engine.executeRaw<{ outstanding_count: number | string }>('SELECT outstanding_count FROM persistence_counters');
+      expect(baseline.every(r => Number(r.outstanding_count) === 0)).toBe(true);
+      await disposePersistenceConsumer(engine);
+      const key = `persistence.limits.${scope}_outstanding`;
+      const previous = await engine.getConfig(key);
+      const events: unknown[] = [];
+      let restoreWait: (() => void) | undefined;
+      let msSpy: { mockRestore(): void } | undefined, observeSpy: { mockRestore(): void } | undefined, admitSpy: { mockRestore(): void } | undefined;
+      const binding = await getWorktreeBinding(engine, sourceId);
+      if (!binding) throw new Error('No worktree binding for publication barrier');
+      const lock = await acquireWorktree(binding, 1000);
+      if (!lock) throw new Error('Publication barrier was not acquired');
+      try {
+      restoreWait = __setMaintenanceWriteWaitForTests(300); // existing #5854 seam, same value
+      const originalMs = MaintenanceWriteWait.prototype.ms;
+      const originalObserve = MaintenanceWriteWait.prototype.observe;
+      const originalAdmit = journal.admitWrite;
+      msSpy = spyOn(MaintenanceWriteWait.prototype, 'ms').mockImplementation(function (this: InstanceType<typeof MaintenanceWriteWait>) {
+        const ms = originalMs.call(this); events.push({ kind: 'wait_ms', ms }); return ms;
+      });
+      observeSpy = spyOn(MaintenanceWriteWait.prototype, 'observe').mockImplementation(function (this: InstanceType<typeof MaintenanceWriteWait>, row) {
+        events.push({ kind: 'observe', request_id: row.request_id, state: row.state });
+        return originalObserve.call(this, row);
+      });
+      admitSpy = spyOn(journal, 'admitWrite').mockImplementation(async (...args) => {
+        const [eng, input] = args;
+        try {
+          const row = await originalAdmit(...args);
+          if (eng === engine && input.sourceId === sourceId) events.push({ kind: 'admitted', request_id: row.request_id, slug: row.slug,
+            state: row.state, counters: await engine.executeRaw('SELECT key,outstanding_count FROM persistence_counters ORDER BY key') });
+          return row;
+        } catch (error) {
+          if (eng === engine && input.sourceId === sourceId) events.push({ kind: 'refusal', request_id: input.requestId, slug: input.slug,
+            error: error instanceof Error ? { name: error.name, message: error.message } : String(error),
+            code: error instanceof OperationError ? error.code : null, detail: error instanceof OperationError ? error.detail : null,
+            classified: isWriteCapacityWait(error), capacity: error instanceof OperationError ? outstandingCapacityOf(error) : null,
+            counters: await engine.executeRaw('SELECT key,outstanding_count FROM persistence_counters ORDER BY key') });
+          throw error;
+        }
+      });
+        await engine.setConfig(key, '2'); // this entirely disposable scratch DB only
+        const report = await runPhaseSynthesize(engine, ordinary);
+        // Only this retryable refusal is a hold: nothing is published or stamped early.
+        expect(report.status).toBe('warn');
+        expect(report.error).toBeUndefined();
+        expect(report.details.pages_written).toBe(0);
+        expect(report.details.publish_pending).toBe(4);
+        expect(events.some(e => (e as { kind: string; ms?: number }).kind === 'wait_ms' && (e as { ms?: number }).ms === 0)).toBe(true);
+        const rows = await engine.executeRaw<{ state: PersistenceRequestState }>(
+          "SELECT state FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_maintenance_page'", [sourceId]);
+        expect(rows).toHaveLength(2);
+        const refused = events.filter(e => (e as { kind: string }).kind === 'refusal') as Array<{ code: string; detail: string; classified: boolean; capacity: { outstanding: number; limit: number; scope: string }; request_id: string }>;
+        expect(refused).toHaveLength(2);
+        expect(new Set(refused.map(row => row.request_id)).size).toBe(2);
+        expect(events.filter(e => (e as { kind: string }).kind === 'admitted')).toHaveLength(2);
+        for (const refusal of refused) {
+          expect(refusal).toMatchObject({ code: 'queue_capacity', detail: 'outstanding=2 limit=2', classified: true, capacity: { outstanding: 2, limit: 2, scope } });
+          expect(await engine.executeRaw('SELECT request_id FROM persistence_requests WHERE request_id=$1::uuid', [refusal.request_id])).toEqual([]);
+        }
+        expect(rows.every(r => !isTerminalRequest(r) && ['queued', 'running', 'recovering'].includes(r.state))).toBe(true);
+        expect(await engine.getConfig('dream.synthesize.last_completion_ts')).toBeNull();
+        for (const { slug } of ready) expect((await engine.readPageSnapshot(slug, { sourceId }))!.page.frontmatter.dream_generated).not.toBe(true);
+        expect(calls()).toBe(spent);
+        expect(await engine.executeRaw('SELECT id FROM minion_jobs ORDER BY id')).toEqual(jobsBefore);
+      } finally {
+        try {
+          try { admitSpy?.mockRestore(); } finally { try { observeSpy?.mockRestore(); } finally { try { msSpy?.mockRestore(); } finally { restoreWait?.(); } } }
+        } finally {
+          try { if (previous === null) await engine.unsetConfig(key); else await engine.setConfig(key, previous); }
+          finally { await lock.release(); }
+        }
+        // fixture-level finally disposes the consumer even if validation throws.
+      }
+      // Ordinary recovery only after actual barrier release; pending is not written.
+      await disposePersistenceConsumer(engine);
+      const retained = await engine.executeRaw<{ request_id: string }>(
+        "SELECT request_id::text FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_maintenance_page' ORDER BY sequence", [sourceId]);
+      const recovery = await runPhaseSynthesize(engine, ordinary);
+      expect(recovery.status).toBe('ok');
+      expect(calls()).toBe(spent);
+      expect(await engine.executeRaw('SELECT id FROM minion_jobs ORDER BY id')).toEqual(jobsBefore);
+      for (const { slug } of ready) expect((await engine.readPageSnapshot(slug, { sourceId }))!.page.frontmatter.dream_generated).toBe(true);
+      for (const row of retained) expect(await engine.executeRaw('SELECT state FROM persistence_requests WHERE request_id=$1::uuid', [row.request_id])).toEqual([{ state: 'committed' }]);
+      const refusedBeforeRelease = events.filter(e => (e as { kind: string }).kind === 'refusal') as Array<{ request_id: string }>;
+      expect(refusedBeforeRelease).toHaveLength(2);
+      // These IDs had NO row at refusal; ordinary replay must derive the SAME IDs, not allocate replacements.
+      for (const refusal of refusedBeforeRelease) expect(await engine.executeRaw(
+        'SELECT state FROM persistence_requests WHERE request_id=$1::uuid', [refusal.request_id])).toEqual([{ state: 'committed' }]);
+      expect((await engine.executeRaw<{ outstanding_count: number | string }>('SELECT outstanding_count FROM persistence_counters')).every(r => Number(r.outstanding_count) === 0)).toBe(true);
+      expect(await engine.getConfig('dream.synthesize.last_completion_ts')).not.toBeNull();
+      const stable = await engine.executeRaw('SELECT request_id::text,state FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [sourceId]);
+      expect((await runPhaseSynthesize(engine, ordinary)).status).toBe('ok');
+      expect(calls()).toBe(spent);
+      expect(await engine.executeRaw('SELECT id FROM minion_jobs ORDER BY id')).toEqual(jobsBefore);
+      expect(await engine.executeRaw('SELECT request_id::text,state FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [sourceId])).toEqual(stable);
+    }, 4);
+  }, 120_000); // original surrounding fixture cap, no enlargement
+}
+
+// Other refusal classes retain their original error and fail the phase.
+test('synthesis preserves non-outstanding publication refusals', async () => {
+  const { isWriteCapacityWait, outstandingCapacityOf } = await import('../src/core/persistence/admission-retry.ts');
+  const { deferPublishOrThrow } = await import('../src/core/cycle/synthesize-postprocess.ts');
+  const cases: Array<{ id: string; kind: string; code: string | null; message: string; detail: string | null; helper_expected: boolean; receipt_state?: string }> = [
+    {"id": "generic-error", "kind": "Error", "code": null, "message": "Write capacity exhausted: principal outstanding requests.", "detail": "outstanding=2 limit=2", "helper_expected": false},
+    {"id": "plain-object", "kind": "plain-object", "code": "queue_capacity", "message": "Write capacity exhausted: principal outstanding requests.", "detail": "outstanding=2 limit=2", "helper_expected": false},
+    {"id": "generic-queue", "kind": "OperationError", "code": "queue_capacity", "message": "Generic capacity failure.", "detail": null, "helper_expected": false},
+    {"id": "zero-principal-cap", "kind": "OperationError", "code": "queue_capacity", "message": "Write capacity exhausted: principal outstanding requests.", "detail": "outstanding=0 limit=0", "helper_expected": true},
+    {"id": "zero-brain-cap", "kind": "OperationError", "code": "queue_capacity", "message": "Write capacity exhausted: brain outstanding requests.", "detail": "outstanding=0 limit=0", "helper_expected": true},
+    {"id": "unknown-scope-structured", "kind": "OperationError", "code": "queue_capacity", "message": "Write capacity exhausted: unknown resource.", "detail": "outstanding=2 limit=2", "helper_expected": true},
+    {"id": "intent-bytes", "kind": "OperationError", "code": "queue_capacity", "message": "Write capacity exhausted: principal intent bytes.", "detail": null, "helper_expected": false},
+    {"id": "receipt-bytes", "kind": "OperationError", "code": "write_quota_exhausted", "message": "Reserved receipt bytes exhausted.", "detail": "persistence.limits.principal_terminal_bytes", "helper_expected": false},
+    {"id": "lifetime", "kind": "OperationError", "code": "write_quota_exhausted", "message": "Permanent request IDs exhausted.", "detail": "persistence.limits.principal_lifetime_ids", "helper_expected": false},
+    {"id": "permission", "kind": "OperationError", "code": "permission_denied", "message": "Write capacity exhausted: principal outstanding requests.", "detail": "outstanding=2 limit=2", "helper_expected": false},
+    {"id": "storage", "kind": "OperationError", "code": "storage_error", "message": "Storage unavailable.", "detail": "disk_full", "helper_expected": false},
+    {"id": "malformed-9", "kind": "OperationError", "code": "queue_capacity", "message": "Write capacity exhausted: principal outstanding requests.", "detail": "outstanding=-1 limit=2", "helper_expected": false},
+    {"id": "malformed-10", "kind": "OperationError", "code": "queue_capacity", "message": "Write capacity exhausted: principal outstanding requests.", "detail": "outstanding=2 limit=2 trailing", "helper_expected": false},
+    {"id": "malformed-11", "kind": "OperationError", "code": "queue_capacity", "message": "Write capacity exhausted: principal outstanding requests.", "detail": " outstanding=2 limit=2", "helper_expected": false},
+    {"id": "malformed-12", "kind": "OperationError", "code": "queue_capacity", "message": "Write capacity exhausted: principal outstanding requests.", "detail": "outstanding=2", "helper_expected": false},
+    {"id": "malformed-13", "kind": "OperationError", "code": "queue_capacity", "message": "Write capacity exhausted: principal outstanding requests.", "detail": "outstanding=2 limit=NaN", "helper_expected": false},
+    {"id": "realcapacity-with-receipt-committed", "kind": "OperationError", "code": "queue_capacity", "message": "Write capacity exhausted: principal outstanding requests.", "detail": "outstanding=2 limit=2", "helper_expected": true, "receipt_state": "committed"},
+    {"id": "realcapacity-with-receipt-queued", "kind": "OperationError", "code": "queue_capacity", "message": "Write capacity exhausted: principal outstanding requests.", "detail": "outstanding=2 limit=2", "helper_expected": true, "receipt_state": "queued"},
+    {"id": "realcapacity-with-receipt-unknown", "kind": "OperationError", "code": "queue_capacity", "message": "Write capacity exhausted: principal outstanding requests.", "detail": "outstanding=2 limit=2", "helper_expected": true, "receipt_state": "unknown"},
+  ];
+  for (const item of cases) {
+    let error: unknown;
+    if (item.kind === 'plain-object') error = { code: item.code, message: item.message, detail: item.detail };
+    else if (item.kind === 'Error') error = Object.assign(new Error(item.message), { detail: item.detail });
+    else error = Object.assign(new OperationError(item.code as ConstructorParameters<typeof OperationError>[0], item.message, 'Inspect the refused publication.'), { detail: item.detail ?? undefined });
+    if (item.receipt_state) Object.assign(error as object, { writeRequest: { request_id: '00000000-0000-4000-8000-000000000001', state: item.receipt_state } });
+    expect(isWriteCapacityWait(error), item.id).toBe(item.helper_expected);
+    if (item.id === 'unknown-scope-structured') expect(outstandingCapacityOf(error as OperationError).scope).toBeNull();
+    let caught: unknown = Symbol('not-thrown');
+    try { deferPublishOrThrow(error, 'refused-publication'); } catch (failure) { caught = failure; }
+    expect(caught, item.id).toBe(error);
+  }
+});

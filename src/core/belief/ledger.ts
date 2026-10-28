@@ -518,6 +518,12 @@ export { stateHashOf };
  * redaction; sync (`submit_job`), gate release, held accept, backfill, revert, restore and retention never do.
  * append.ts still requires the writer tier at or above OWNER_TIER_FLOOR, and the trust channel records these verbs
  * as agent_written even from the local CLI, so today `trust confirm` is the release that reaches it.
+ *
+ * append_page stays out (#7123). The redaction release is this list's only consumer (`ownerEdit` reaches nothing else;
+ * the ledger attributes every publication by its `op`, so an append's events say `append_page` either way). An append
+ * cannot set a fact or take field (its text refuses fence markers), so as an owner edit it could only release a
+ * redaction on a field its publication re-derives from text the owner did not edit. Its intent's `kind` keeps it out
+ * a second time. Pinned by test/belief-ledger-append-owner.test.ts.
  */
 const OWNER_EDIT_OPERATIONS: ReadonlySet<string> = new Set(['put_page', 'edit_page', 'takes_update', 'takes_resolve']);
 let allowlistDropped = false;
@@ -531,5 +537,6 @@ export function publicationBeliefOptions(row: { id: string; source_id: string; s
     publicationId: row.id, op: row.operation, remote: row.authority.remote !== false,
     ...(row.authority.remote === false && (allowlistDropped || OWNER_EDIT_OPERATIONS.has(row.operation) && row.intent?.kind == null) ? { ownerEdit: true } : {}),
     ...(row.operation === 'revert_version' ? { pageEventType: 'page.reverted' as const } : {}),
+    ...(row.operation === 'trust_release' ? { cause: { hold: `wh${row.intent?.hold_id}` } } : {}),
     ...(row.operation === 'delete_page' && row.intent?.retention === true ? { hardDeleteEvent: 'page.expired' as const } : {}), ...(report ? { report } : {}) };
 }

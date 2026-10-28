@@ -4,30 +4,38 @@ import { throwIfAborted } from '../abort-check.ts';
 import { parseMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import type { Action } from '../agent-output.ts';
 import { opError } from '../ops/contract.ts';
+import { ItemRun } from '../item-failure.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { publicationHold } from '../persistence/accepted-pending.ts';
+import { isWriteCapacityWait, outstandingCapacityOf } from '../persistence/admission-retry.ts';
 import { authorizeStoredRequest } from '../persistence/authority.ts';
 import { digest } from '../persistence/digest.ts';
 import { getWriteRequest } from '../persistence/journal.ts';
 import { parseWriteRequestId } from '../persistence/preconditions.ts';
 import type { WriteRequest } from '../persistence/model.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
-import { writeResponse } from '../persistence/service.ts';
 import type { PhaseResult } from '../cycle.ts';
 import type { DiscoveredTranscript } from './transcript-discovery.ts';
 import { transcriptDerivation } from './dream-taint.ts';
 import { declareDerivation, readDerivationDeclaration } from '../trust/taint.ts';
-import { emptyQuoteVerifyStats, groundSource, isDreamOwnedPage, resolveVerifyPrior, verifyDreamPage, type GroundedSource, type GroundingPass } from './synthesize-verify.ts';
+import { addGroundingCounts, addVerifyStats, type ChildVerification } from './synthesize-child-verify.ts';
+import { storedPageTier } from '../trust/page-write.ts';
+import { emptyQuoteVerifyStats, groundSource, isDreamOwnedPage, resolveVerifyPrior, verifyDreamPage, type GroundedSource } from './synthesize-verify.ts';
 import { attributionChecksEnabled } from './attribution-checks.ts';
-import { resolveGroundingDecide } from './grounding-decide.ts';
+import { resolveGroundingDecide, type GroundingDecide } from './grounding-decide.ts';
 import { resolveCycleDate } from './cycle-date.ts';
 import { DEFERRED_READ_LABEL, isPostprocessReadTimeout, pendingOutputsFor, readPostprocessDeferrals, recordPostprocessPass,
   type DeferredRead, type PendingOutput, type PostprocessDeferral } from './synthesize-postprocess-deferral.ts';
 
 interface OutputRef { slug: string; source_id: string; raw_source?: string; seat?: string; first_write_at?: Date; }
-export interface RetainedOutput { job_id: number | bigint; job_key: string; input_slug: string; request: WriteRequest; }
-/** #6360: a retained output a later non-maintenance write moved; it is left alone and reported once. */
-export interface PostprocessConflict { slug: string; source_id: string; request_id: string; message: string; fix: Action; }
+/** `verification` (GBRA-60): the child verified and stamped the page it wrote (synthesize-child-verify.ts). */
+export interface RetainedOutput { job_id: number | bigint; job_key: string; input_slug: string; request: WriteRequest; verification?: ChildVerification }
+/**
+ * An output postprocessing leaves alone for good and reports once (GBRA-130 A-4): a later non-maintenance write
+ * moved its page (#6360, revision_conflict), its postprocess request ended without committing (the request's
+ * error_code), or its retained request or carried provenance cannot be finished (recovery_required).
+ */
+export interface PostprocessConflict { slug: string; source_id: string; request_id: string; code: string; message: string; fix: Action; }
 
 export const POSTPROCESS_CONFLICTS_KEY = 'dream.synthesize.postprocess_conflicts';
 const CONFLICT_MEMORY_MS = 30 * 86_400_000;
@@ -50,6 +58,8 @@ async function laterRequests(engine: BrainEngine, output: WriteRequest): Promise
 const localMaintenance = (r: WriteRequest) => r.operation === 'submit_job' && r.intent?.kind === 'managed_maintenance_page' && r.authority?.remote === false;
 
 const writerStatusFix = (sourceId: string, why: string): Action => readFix(why, { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'] });
+const receiptFix = (requestId: string): Action => readFix(`Reads postprocess request ${requestId}'s durable receipt: its state, recorded error and retained intent, read-only.`,
+  { argv: ['gbrain', 'write-request', '--', requestId] });
 
 /** The slug submitPageMutation journals for a client slug: it lowercases it (page-mutations.ts). */
 export const journaledPageSlug = (slug: string): string => slug.toLowerCase();
@@ -67,7 +77,7 @@ export async function loadCommittedSynthesisOutputs(engine: BrainEngine, authori
   return committedRequestsFor(engine, authority, await retainedPutPageCalls(engine, childIds));
 }
 
-interface RetainedCall { job_id: number | bigint; job_key: string; input_slug: string; slug: string; requestId: string; revision: string; started_at?: string }
+interface RetainedCall { job_id: number | bigint; job_key: string; input_slug: string; slug: string; requestId: string; revision: string; started_at?: string; verification?: ChildVerification }
 
 async function retainedPutPageCalls(engine: BrainEngine, childIds: number[]): Promise<RetainedCall[]> {
   if (!childIds.length) return [];
@@ -81,9 +91,11 @@ async function retainedPutPageCalls(engine: BrainEngine, childIds: number[]): Pr
     let requestId: string | undefined;
     try { requestId = parseWriteRequestId(t.input?.request_id); } catch { return []; }
     const startedAt = t.started_at ? new Date(t.started_at) : null;
+    const verification = t.input?.dream_verify as ChildVerification | undefined;
     return requestId && typeof inputSlug === 'string' && typeof revision === 'string'
       ? [{ job_id: t.job_id, job_key: t.job_key, input_slug: inputSlug, slug: journaledPageSlug(inputSlug), requestId, revision,
-        ...(startedAt && !Number.isNaN(startedAt.getTime()) ? { started_at: startedAt.toISOString() } : {}) }] : [];
+        ...(startedAt && !Number.isNaN(startedAt.getTime()) ? { started_at: startedAt.toISOString() } : {}),
+        ...(typeof verification?.transcript_hash === 'string' ? { verification } : {}) }] : [];
   });
 }
 
@@ -102,7 +114,7 @@ async function committedRequestsFor(engine: BrainEngine, authority: MaintenanceA
     [[...new Set(calls.map(c => c.requestId))], authority.writer.sourceId, authority.writer.sourceIncarnation]);
   return requests.flatMap(({ request }) => calls
     .filter(c => c.requestId === String(request.request_id) && c.slug === request.slug && c.revision === request.outcome?.revision)
-    .map(c => ({ job_id: c.job_id, job_key: c.job_key, input_slug: c.input_slug, request })));
+    .map(c => ({ job_id: c.job_id, job_key: c.job_key, input_slug: c.input_slug, request, ...(c.verification ? { verification: c.verification } : {}) })));
 }
 
 /** Child outputs for postprocessing, or the outputs to carry when the committed-outputs read hit the statement timeout (#6757). */
@@ -158,7 +170,7 @@ export async function postprocessManagedSynthesis(
   childIds: number[],
   jobRawSource: Map<number, string>,
   transcripts: DiscoveredTranscript[],
-  opts: { cycleDate: string; quoteVerify: boolean; sinceByTranscript: Map<string, Date>; signal?: AbortSignal; grounding?: GroundingPass;
+  opts: { cycleDate: string; quoteVerify: boolean; sinceByTranscript: Map<string, Date>; signal?: AbortSignal; grounding?: GroundingDecide;
     /** The child outputs slug discovery already loaded (loadCommittedOutputsOrDefer). */
     committedOutputs?: CommittedOutputs;
     /** #5575 I2: files under it are third-party speech; their outputs publish external_untrusted. */
@@ -206,7 +218,7 @@ export async function postprocessManagedSynthesis(
       if (transcript === undefined) { carry.push(p); pending++; continue; }
       if (!output || !transcript) {
         settled.push(p.request_id);
-        if (!reported.has(p.request_id)) conflicts.push({ slug: p.slug, source_id: sourceId, request_id: p.request_id,
+        if (!reported.has(p.request_id)) conflicts.push({ slug: p.slug, source_id: sourceId, request_id: p.request_id, code: 'recovery_required',
           message: `Deferred synthesis output ${p.slug} in source ${sourceId} ${output ? `lost its transcript ${p.raw_source}` : `has no committed journal row for child request ${p.request_id}`}, so postprocessing left it alone and did not verify or stamp it. Review the page; this output is not retried.`,
           fix: writerStatusFix(sourceId, `Shows source ${sourceId}'s committed and pending maintenance requests, read-only.`) });
         continue;
@@ -227,8 +239,9 @@ export async function postprocessManagedSynthesis(
     }
   };
   let grounded: GroundedSource | undefined;
-  for (const [index, { ref, output, path, transcript, hash }] of items.entries()) {
-    throwIfAborted(opts.signal, '[dream] synthesis postprocessing');
+  const run = new ItemRun('synthesize.postprocess');
+  let itemError: unknown;
+  const postprocessOne = async (index: number, { ref, output, path, transcript, hash }: Item): Promise<'stop' | void> => {
     if (ref.source_id !== authority.writer.sourceId) {
       throw opError('source_changed', 'The synthesis output source changed.',
         `Synthesis output ${ref.slug} belongs to source ${ref.source_id}, not ${authority.writer.sourceId} that this dream cycle writes, so it was not postprocessed. Check source ${authority.writer.sourceId}'s writer status, then run gbrain dream --phase synthesize --source ${authority.writer.sourceId} again.`,
@@ -251,7 +264,7 @@ export async function postprocessManagedSynthesis(
     let base = revision;
     let requestId = postprocessId(base);
     let prior = await readPrior(index, requestId);
-    if (prior === undefined) break;
+    if (prior === undefined) return 'stop';
     let snapshot: Awaited<ReturnType<BrainEngine['readPageSnapshot']>> = null;
     if (!prior) {
       snapshot = await engine.readPageSnapshot(ref.slug, { sourceId: ref.source_id });
@@ -263,42 +276,58 @@ export async function postprocessManagedSynthesis(
           base = ours.intent!.expected_revision as string;
           requestId = ours.request_id;
           prior = await readPrior(index, requestId);
-          if (prior === undefined) break;
+          if (prior === undefined) return 'stop';
         } else if (snapshot && later.filter(r => r.state === 'committed').every(localMaintenance) && sameBody(output.request.intent?.content, snapshot.page, ref.slug)) {
           base = snapshot.revision;
           requestId = postprocessId(base);
         } else {
           settled.push(outputRequestId);
-          if (!reported.has(requestId)) conflicts.push({ slug: ref.slug, source_id: ref.source_id, request_id: requestId,
+          if (!reported.has(requestId)) conflicts.push({ slug: ref.slug, source_id: ref.source_id, request_id: requestId, code: 'revision_conflict',
             message: `Page ${ref.slug} in source ${ref.source_id} changed after the synthesis child committed revision ${revision}, so postprocessing left it alone and did not verify or stamp it. Review the page; this output is not retried.`,
             fix: readFix(`Shows page ${ref.slug} as it is now, read-only.`, { argv: ['gbrain', 'get', '--source', ref.source_id, '--', ref.slug] }) });
-          continue;
+          return;
         }
       }
     }
     if (prior) {
       await authorizeStoredRequest(engine, prior);
-      if (prior.state === 'committed') { settled.push(outputRequestId); finalizedRefs.push(finalizedRef); continue; }
-      if (['conflict', 'failed', 'cancelled'].includes(prior.state)) writeResponse(prior);
+      if (prior.state === 'committed') { settled.push(outputRequestId); finalizedRefs.push(finalizedRef); return; }
+      if (['conflict', 'failed', 'cancelled'].includes(prior.state)) {
+        settled.push(outputRequestId);
+        const code = prior.error_code ?? prior.state;
+        if (!reported.has(prior.request_id)) conflicts.push({ slug: ref.slug, source_id: ref.source_id, request_id: prior.request_id, code,
+          message: `Postprocess request ${prior.request_id} for page ${ref.slug} in source ${ref.source_id} ended ${prior.state} (${code}) without committing, so postprocessing left the page alone and did not verify or stamp it. Read the request's receipt for the cause; this output is not retried.`,
+          fix: receiptFix(prior.request_id) });
+        return;
+      }
     }
     await authorizeStoredRequest(engine, output.request);
-    let content: string;
+    let content: string, unchanged = false;
     if (prior) {
       if (prior.intent?.kind !== 'managed_maintenance_page' || prior.intent.expected_revision !== base || typeof prior.intent.content !== 'string') {
-        throw opError('recovery_required', 'The retained synthesis postprocessing intent is unavailable.',
-          `Postprocess request ${prior.request_id} for ${ref.slug} in source ${ref.source_id} exists, but its retained intent does not match revision ${base}. Inspect it in writer status; do not resubmit under a new request.`,
-          { fix: writerStatusFix(ref.source_id, `Shows request ${prior.request_id} and any recovery it holds, read-only.`) });
+        settled.push(outputRequestId);
+        if (!reported.has(prior.request_id)) conflicts.push({ slug: ref.slug, source_id: ref.source_id, request_id: prior.request_id, code: 'recovery_required',
+          message: `Postprocess request ${prior.request_id} for page ${ref.slug} in source ${ref.source_id} exists, but its retained intent does not match revision ${base}, so postprocessing left the page alone and did not verify or stamp it. Read the request's receipt; do not resubmit it under a new request. This output is not retried.`,
+          fix: receiptFix(prior.request_id) });
+        return;
       }
       content = prior.intent.content;
     } else {
       if (!snapshot) throw new Error(`synthesis postprocess: no snapshot for ${ref.slug}`);
       const firstDate = snapshot.page.frontmatter.dream_created_cycle_date || snapshot.page.frontmatter.dream_cycle_date || opts.cycleDate;
       const since = ref.first_write_at ?? opts.sinceByTranscript.get(transcript.filePath);
-      let page = isDreamOwnedPage(snapshot.page, since) ? { ...snapshot.page, frontmatter: { ...snapshot.page.frontmatter, dream_generated: true,
+      // GBRA-60: the child stamped (and, with quote_verify, verified) this page against the same transcript and nothing
+      // moved it since, so its stamp stands, as a committed postprocess would on a replay, and its stats count.
+      const child = output.verification?.transcript_hash === hash && snapshot.revision === revision ? output.verification : undefined;
+      let page = !child && isDreamOwnedPage(snapshot.page, since) ? { ...snapshot.page, frontmatter: { ...snapshot.page.frontmatter, dream_generated: true,
         dream_cycle_date: firstDate, dream_created_cycle_date: firstDate, raw_source: path, ...(transcript.seat ? { seat: transcript.seat } : {}) } } : snapshot.page;
       if (opts.quoteVerify) {
-        const prior = since ? await resolveVerifyPrior(engine, snapshot.page, ref.source_id, since) : null;
-        if (prior === 'unchanged') stats.skipped_unchanged++;
+        const prior = child?.quote_verify ? 'child' : since ? await resolveVerifyPrior(engine, snapshot.page, ref.source_id, since) : null;
+        if (prior === 'child') {
+          addVerifyStats(stats, child!.stats);
+          if (opts.grounding && child!.grounding) addGroundingCounts(opts.grounding.stats, child!.grounding);
+        }
+        else if (prior === 'unchanged') stats.skipped_unchanged++;
         else {
           if (prior) stats.preexisting_diffed++;
           const source = grounded?.path === transcript.filePath ? grounded : (grounded = groundSource(transcript.filePath, transcript.content));
@@ -309,12 +338,21 @@ export async function postprocessManagedSynthesis(
         }
       }
       content = serializePageToMarkdown(page, snapshot.tags);
+      unchanged = content === serializePageToMarkdown(snapshot.page, snapshot.tags);
     }
     throwIfAborted(opts.signal, '[dream] synthesis postprocessing');
     // #5575 I2: the page publishes at its transcript's tier (lowered even when the content is unchanged), with its input edges.
     // A retained request replays the declaration it was admitted with (none for one admitted before tiers).
     const derivation = prior ? readDerivationDeclaration(prior.intent?.derivation) ?? undefined
       : await transcriptDerivation(engine, transcript, opts.meetingTranscriptsDir).then(d => declareDerivation(d.trust, d.inputs));
+    // GBRA-60: a page the child already wrote verified and stamped, at the transcript's tier with no input edges to
+    // record, has nothing left to publish; skipping keeps a strict source at one commit per output.
+    if (unchanged && derivation && !derivation.inputs.length && await storedPageTier(engine, ref.source_id, ref.slug) === derivation.tier) {
+      settled.push(outputRequestId);
+      writtenRefs.push(finalizedRef);
+      finalizedRefs.push(finalizedRef);
+      return;
+    }
     try {
       await publishMaintenancePage(engine, authority, ref.slug, content, { requestId, expectedRevision: base, derivation });
     } catch (error) {
@@ -322,16 +360,28 @@ export async function postprocessManagedSynthesis(
       // #6757: carried too, so the same request finishes even after the transcript grows or the child's rows are pruned.
       carry.push(...pendingOf(items[index]!));
       pending++;
-      continue;
+      return;
     }
     settled.push(outputRequestId);
     writtenRefs.push(finalizedRef);
     finalizedRefs.push(finalizedRef);
     await new Promise(resolve => setTimeout(resolve, 0));
+  };
+  for (const [index, item] of items.entries()) {
+    throwIfAborted(opts.signal, '[dream] synthesis postprocessing');
+    try {
+      if (await postprocessOne(index, item) === 'stop') break;
+      run.succeed();
+    } catch (error) {
+      throwIfAborted(opts.signal, '[dream] synthesis postprocessing');
+      run.fail(item.ref.slug, error);
+      itemError ??= error;
+    }
   }
   if (deferred?.read === 'postprocess_request') pending += items.length - readsFrom;
   if (conflicts.length) await rememberConflicts(engine, reported, conflicts);
   const deferral = await recordPostprocessPass(engine, sourceId, sourceIncarnation, { settled, carry, deferred });
+  if (itemError) throw itemError;
   return { writtenRefs, finalizedRefs, stats, pending, conflicts, deferral };
 }
 
@@ -350,24 +400,34 @@ async function rememberConflicts(engine: BrainEngine, reported: Map<string, stri
 }
 
 /**
- * #6360: outputs a later non-maintenance write moved are terminal (retrying
- * cannot help), so the phase warns once per output instead of failing every
- * cycle, and the cooldown still stamps.
+ * #6360, GBRA-130 A-4: postprocess conflicts are terminal (retrying cannot
+ * help), so the phase warns once per output, naming each page and its code,
+ * instead of failing every cycle, and the cooldown still stamps.
  */
 export function withPostprocessConflicts(conflicts: PostprocessConflict[], result: PhaseResult): PhaseResult {
   if (!conflicts.length) return result;
   return { ...result, status: result.status === 'fail' ? 'fail' : 'warn',
-    summary: `${result.summary}; ${conflicts.length} output page(s) changed after the child committed and were left alone`,
+    summary: `${result.summary}; ${conflicts.length} output page(s) left alone, not verified or stamped: ${conflicts.map(c => `${c.slug} (${c.code})`).join(', ')}`,
     details: { ...result.details, postprocess_conflicts: conflicts } };
 }
 
 /**
  * A publish that is still pending after its wait (#5854) or whose admission
  * gave up on database contention without recording anything (#6051) is
- * deferred, never failed: the next cycle derives the same request id. Every
- * other error is rethrown. A contended publish writes one stderr line naming it.
+ * deferred, never failed: the next cycle derives the same request id. So is
+ * an unadmitted publish refused by a known positive outstanding-request cap
+ * (`queue_capacity` with outstanding/limit counts, a principal or brain scope
+ * and no write receipt): it waits for other writes to settle. A zero cap,
+ * cumulative quotas, unknown capacity and a refusal carrying a receipt are
+ * rethrown with every other error. A contended or capacity-blocked publish
+ * writes one stderr line naming it.
  */
 export function deferPublishOrThrow(error: unknown, what: string): void {
+  const capacity = isWriteCapacityWait(error) && error.writeRequest == null ? outstandingCapacityOf(error) : null;
+  if (capacity?.scope && capacity.limit !== null && capacity.limit > 0) {
+    process.stderr.write(`[dream] synthesize: ${what} deferred, ${capacity.scope} outstanding write capacity is full (${capacity.outstanding}/${capacity.limit}); the next cycle admits it\n`);
+    return;
+  }
   const deferral = publicationHold(error);
   if (!deferral) throw error;
   if (deferral === 'contention') {

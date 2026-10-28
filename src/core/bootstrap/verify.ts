@@ -36,7 +36,7 @@ import { pendingReceiptOf, pollCommand, resolveCliWriteWaitMs, WRITE_WAIT_ENV } 
 import { maintenanceAttribution } from '../persistence/attribution.ts';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from '../spawn.ts';
 import { join, resolve } from 'node:path';
 
 import type { BrainEngine } from '../engine.ts';
@@ -289,12 +289,12 @@ function checkTokenSweep(ws: string): VerifyCheck {
       return { id, ok: true, warn: true, detail: 'template clone (initialized:false) — placeholder tokens are expected; render before verifying for real' };
     }
     const offenders: string[] = [];
-    for (const t of BOOTSTRAP_TEMPLATES) {
-      const p = join(ws, t.dest);
+    for (const dest of BOOTSTRAP_TEMPLATES.flatMap((t) => (t.openclawDest ? [t.dest, t.openclawDest] : [t.dest]))) {
+      const p = join(ws, dest);
       if (!existsSync(p)) continue;
       const raw = readFileSync(p, 'utf8');
       const tokens = [...raw.matchAll(TOKEN_RE)].map((m) => m[1]);
-      if (tokens.length > 0) offenders.push(`${t.dest} (${[...new Set(tokens)].join(', ')})`);
+      if (tokens.length > 0) offenders.push(`${dest} (${[...new Set(tokens)].join(', ')})`);
     }
     if (offenders.length > 0) {
       return { id, ok: false, detail: `unresolved {{TOKEN}}s in rendered files: ${offenders.join('; ')} — finish the interview and re-run render` };
@@ -362,8 +362,8 @@ function trackedWorkspaceFiles(ws: string): { files: string[]; via: 'git' | 'fal
     /* not a repo — fallback below */
   }
   const files: string[] = [];
-  for (const t of BOOTSTRAP_TEMPLATES) {
-    if (existsSync(join(ws, t.dest))) files.push(t.dest);
+  for (const dest of BOOTSTRAP_TEMPLATES.flatMap((t) => (t.openclawDest ? [t.dest, t.openclawDest] : [t.dest]))) {
+    if (existsSync(join(ws, dest))) files.push(dest);
   }
   if (existsSync(join(ws, 'state', 'interview.json'))) files.push(join('state', 'interview.json'));
   return { files, via: 'fallback' };

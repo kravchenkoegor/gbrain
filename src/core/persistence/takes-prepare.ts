@@ -7,6 +7,7 @@ import { isValidHolder, parseTakesFence, upsertTakeRow, supersedeRow, type Parse
 import { takesPreparation as edit, TakesWriteError } from '../takes-write.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { preparePageMutation } from './page-prepare.ts';
+import { wholeBodySnapshot } from './segmented-apply.ts';
 import { authorizeTakeHolder } from './authority.ts';
 import type { WriteRequest } from './model.ts';
 import type { PreparedMutation } from './coordinator.ts';
@@ -91,15 +92,18 @@ async function takeRemovalRequiresOwner(engine: BrainEngine, row: WriteRequest, 
   return error;
 }
 
-export async function prepareTakesMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
-  try { return await prepare(engine,row,config); } catch (error) { return fail(error); }
+/** `editBody`: a same-page edit published with the takes change (consolidation closes its fenced facts here). */
+export async function prepareTakesMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig, editBody?: (body: string) => string): Promise<PreparedMutation> {
+  try { return await prepare(engine,row,config,editBody); } catch (error) { return fail(error); }
 }
-async function prepare(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
-  const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id });
-  if (!snapshot || snapshot.page.id !== row.page_id) throw takesRefusal('page_identity_changed','The accepted page no longer exists.',row,
+async function prepare(engine: BrainEngine, row: WriteRequest, config: GBrainConfig, editBody?: (body: string) => string): Promise<PreparedMutation> {
+  const stored = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id });
+  if (!stored || stored.page.id !== row.page_id) throw takesRefusal('page_identity_changed','The accepted page no longer exists.',row,
     `Page ${row.slug} was deleted or replaced after the takes request was accepted.`);
   const p = row.intent!;
-  if (p.expected_revision !== undefined) assertPageRevision(snapshot,engineMutationPrecondition(parseMutationPrecondition(p)));
+  if (p.expected_revision !== undefined) assertPageRevision(stored,engineMutationPrecondition(parseMutationPrecondition(p)));
+  // Wave B: a segmented page within 24 MiB is read back whole and written as a normal put; a larger one refuses.
+  const snapshot = (await wholeBodySnapshot(engine, stored, row.operation))!;
   // #6188 (D19, D20): takes_add / takes_update normalize the stored takes fence in this write; every other
   // takes write refuses typed `target_fence_malformed` (location only) while the fence does not compile.
   const appends = row.operation === 'takes_add' || row.operation === 'takes_update';
@@ -211,6 +215,7 @@ async function prepare(engine: BrainEngine, row: WriteRequest, config: GBrainCon
       result={slug:row.slug,row_num:number,...(row.operation==='takes_resolve'?{quality:p.quality,resolved_by:p.resolved_by}:{})};
     }
   }
+  if (editBody) next = editBody(next);
   // #6450 post-condition: never publish a fence the next write would refuse.
   const republished = parseTakesFence(next);
   if (republished.warnings.length) throw takesRefusal('invalid_params',`The write would publish a takes fence the next write would refuse: ${republished.warnings[0]}`,row,

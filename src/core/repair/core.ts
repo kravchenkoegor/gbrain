@@ -12,12 +12,22 @@
  * `op_checkpoints` under a fingerprint of (kind, brain, sources): a rerun with
  * the same scope resumes after it, and a finished scan clears it.
  *
- * An item whose apply refuses `invalid_params` or `source_changed` is a
- * per-item verdict, not a run failure: it is recorded in `failed[]`, left as
- * it was, and the loop continues without a cursor write for it. A later
- * success writes a higher cursor, so a resumed run does not retry it; the next
- * full scan (a run with no stored cursor, which every completed run leaves
- * behind) does, the same way a `revision_conflict` item is retried.
+ * Every item failure is classified by `classifyItemFailure` (item-failure.ts,
+ * GBRA-130) through one `ItemRun` per run. An accepted, still pending write is
+ * progress and is checked first; a held writer stops the run with its writer
+ * status; any other run-scoped failure (a lost connection, a failed
+ * transaction, an abort) is rethrown. Every item-scoped failure is a per-item
+ * verdict: it is recorded in `failed[]` with the kind's preview as its fix,
+ * left as it was, and the loop continues without a cursor write for it. A
+ * later success writes a higher cursor, so a resumed run does not retry it;
+ * the next full scan (a run with no stored cursor, which every completed run
+ * leaves behind, and so does a limited run that ended with only item
+ * failures) does, the same way a `revision_conflict` item is retried. When
+ * most items fail the breaker stops the run with `item_failures_systemic` and
+ * the kind's `onItemFailures` hook is not called. An apply bound to an
+ * approved preview (`--expect`) is the operator's answer to one exact set:
+ * only `REPAIR_ITEM_FAILURE_CODES` continue it, and any other failure is
+ * thrown with its own code (a refused choice, a conflict, a crash).
  */
 import { withAdmissionOrigin } from '../persistence/admission-origin.ts';
 import { randomUUID } from 'node:crypto';
@@ -36,8 +46,12 @@ import type { RepairKindSpec } from './registry.ts';
 import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
 import { repairAdmissionWindow, repairPublicationOwner, settleRepairReceipts, type PendingRepair } from './settle.ts';
 import { RECEIPT_RESERVATION_FLOOR } from '../persistence/receipt-bytes.ts';
+import { readFix } from '../ops/op-fix.ts';
+import { classifyItemFailure, ItemRun, type ItemFailure } from '../item-failure.ts';
+import type { ProgressReporter } from '../progress.ts';
+import type { GenerationsSelection } from '../generations/repair.ts';
 
-export const REPAIR_KINDS = ['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'accepted-takes', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats', 'google-file-modes', 'stale-atoms', 'extractor-facts', 'conversation-labels', 'captured-facts', 'loop-facts', 'ontology-facts', 'orphan-children', 'failed-writes', 'split-facts', 'frontmatter', 'fences', 'slug-conflicts', 'timeline-comments', 'managed-sync-orphans', 'frontmatter-keys', 'file-drift', 'stuck-recovery', 'ghost-pages', 'receipt-compaction', 'aliases', 'rename-identity'] as const;
+export const REPAIR_KINDS = ['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'accepted-takes', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats', 'google-file-modes', 'stale-atoms', 'atoms-restore', 'extractor-facts', 'conversation-labels', 'captured-facts', 'redacted-facts', 'loop-facts', 'ontology-facts', 'facts-rehome', 'consolidate-ties', 'duplicate-facts', 'orphan-children', 'failed-writes', 'split-facts', 'frontmatter', 'fences', 'slug-conflicts', 'timeline-comments', 'timeline-order', 'managed-sync-orphans', 'content-receipt-root', 'frontmatter-keys', 'file-drift', 'stuck-recovery', 'ghost-pages', 'origin-twins', 'receipt-compaction', 'aliases', 'rename-identity', 'overwritten-edits', 'legacy-twins', 'missing-tables', 'url-clone-fences', 'segmented-mirror', 'uncommitted-deletions', 'generations', 'fact-claim-dates'] as const;
 export type RepairKind = typeof REPAIR_KINDS[number];
 
 export interface RepairScope { brain_id: string; source_ids: string[] }
@@ -86,6 +100,8 @@ export interface RepairListing { item: string; class: string; detail?: string }
  * the run's paid-model allowance (it only lowers the kind's own cap). `deadline` (epoch ms) bounds a discovery scan.
  */
 export interface RepairPlanOptions { apply: boolean; expect?: string; includeAmbiguous?: boolean; only?: string[]; skip?: string[]; slugs?: string[];
+  /** `duplicate-facts` (#7043): also retire copies of a claim that sit on other entities than the kept row. */
+  includeCrossEntity?: boolean;
   noLlm?: boolean; maxLlmUsd?: number; deadline?: number;
   /** `ctx.remote !== false` of the run: a remote caller's plan never names a local path (unset reads as remote). */
   remote?: boolean;
@@ -93,12 +109,26 @@ export interface RepairPlanOptions { apply: boolean; expect?: string; includeAmb
   prefer?: 'file' | 'database'; requests?: string[]; allDrifted?: boolean; driftClass?: string;
   /** #6712 PR 2 `file-drift`: only pages whose newest drift conflict is at or after this concrete instant (ISO; `--since`, parsed by `since.ts`). */
   since?: string;
+  /** #6712 PR 4b `file-drift`: the source's held `file_drift` pages, of one side and (for `deleted`) one state. */
+  held?: boolean; side?: string; state?: string;
+  /** GBRA-133 `file-drift --held --side deleted --state file_gone`: only holds of this deletion provenance (`--provenance`). */
+  provenance?: string;
+  /** `file-drift --held`: the window starts after the held file this `next_cursor` names (`--cursor`); `progress` reports the preview's pages, and an apply's items, on stderr. */
+  cursor?: string; progress?: ProgressReporter;
   /** `stuck-recovery`: the version an apply keeps, and the one request a run selects. */
-  keep?: 'prior' | 'disk'; requestId?: string;
+  keep?: 'prior' | 'disk' | 'withdrawn'; requestId?: string;
   /** `receipt-compaction` (#6696 A9): the age (`72h`, `30d`), failures too, and compaction inside the retention window. */
   olderThan?: string; includeFailures?: boolean; force?: boolean;
   /** `rename-identity` (#6729): the old slug that disambiguates a pair (`--from`), and the close disposition (`--close`). */
-  from?: string; close?: boolean }
+  from?: string; close?: boolean;
+  /** `uncommitted-deletions` (#7130): the preview window starts below this page id (`--after`). */
+  afterPage?: number;
+  /** `visibility`: the preview window's size (`--limit`); an apply still stops after `--limit` items. */
+  limit?: number;
+  /** `generations` (GBRA-161): the ledger kind, mode and selectors (`--kind`, `--mode`, `--run`/`--since`/`--key`/`--generation`/`--held`). */
+  generations?: GenerationsSelection;
+  /** `fact-claim-dates` (#7247): the bulk-loaded UTC day to repair (`--day`) instead of the detected ones. */
+  day?: string }
 
 export interface RepairHandler {
   kind: RepairKind;
@@ -126,6 +156,11 @@ export interface RepairHandler {
    * of the selected scope). Runs only when the run ended without an exception.
    */
   report?(ctx: OperationContext, scope: RepairScope, result: RepairResult, opts: RepairPlanOptions): Promise<Partial<Pick<RepairResult, 'repaired' | 'remaining' | 'verification' | 'stopped'>>>;
+  /**
+   * The items whose apply threw an item-scoped failure this run, with the classified failure. Called once before the
+   * result is reported, never for a run the breaker stopped (`item_failures_systemic`) or one a run-scoped error ended.
+   */
+  onItemFailures?(ctx: OperationContext, failures: ReadonlyArray<{ item: RepairItem; failure: ItemFailure }>): Promise<void>;
 }
 
 /**
@@ -134,13 +169,23 @@ export interface RepairHandler {
  * with the reason, message and fix the result reports.
  */
 export interface RepairItemOutcome { applied: boolean; outcome: string; reason?: string; detail?: Record<string, unknown>; llm_usd?: number;
-  stop?: { reason: string; message: string; fix?: Action } }
+  stop?: { reason: string; message: string; fix?: Action };
+  /** The item-scoped error behind a held outcome: counted by the run's breaker like a thrown item failure. */
+  failure?: unknown }
 
-/** Refusal codes that are one item's verdict: the item is recorded in `failed[]` and the run goes on. */
-export const REPAIR_ITEM_FAILURE_CODES: ReadonlySet<string> = new Set(['invalid_params', 'source_changed']);
+/**
+ * Refusal codes a kind may treat as one item's verdict inside its own apply (ghost-pages extends them). The core records
+ * every item-scoped failure the same way (`classifyItemFailure`); these codes are a subset of that, and the only
+ * failures an apply bound to `--expect` continues past.
+ * `page_body_segmented`: the item's page stores its body in segments and the kind rewrites the whole body as one string.
+ */
+export const REPAIR_ITEM_FAILURE_CODES: ReadonlySet<string> = new Set(['invalid_params', 'source_changed', 'page_body_segmented']);
 
-/** An item whose apply refused with a per-item code; its page, file and rows are exactly as before. The next full scan retries it. */
-export interface RepairFailedItem { item: string; source_id: string; slug: string; reason: string; message: string; retry: 'next_full_scan' }
+/**
+ * An item whose apply failed item-scoped; its page, file and rows are exactly as before. The next full scan retries it.
+ * `fix` previews the kind for the item's source (read-only), which lists the item again with its current state.
+ */
+export interface RepairFailedItem { item: string; source_id: string; slug: string; reason: string; message: string; retry: 'next_full_scan'; fix?: Action }
 
 export interface RepairResult {
   kind: RepairKind;
@@ -159,10 +204,11 @@ export interface RepairResult {
   resumed_from: RepairCursor | null;
   applied: number;
   skipped: number;
-  /** Items refused per item (`REPAIR_ITEM_FAILURE_CODES`) and left unchanged; `complete` still means every pending item was attempted. */
+  /** Items that failed item-scoped and were left unchanged; `complete` still means every pending item was attempted. */
   failed: RepairFailedItem[];
   complete: boolean;
-  stopped?: { reason: string; message: string; fix?: Action };
+  /** `code`: with reason `error` (a kind that threw inside a multi-kind loop), the classified error code. */
+  stopped?: { reason: string; message: string; fix?: Action; code?: string };
   /** #6543 (D1): accepted repairs still unpublished when the run stopped; the cursor stays before the first, and a rerun replays the same requests. */
   pending?: Array<{ item: string; request_id: string }>;
   apply_command: string;
@@ -246,12 +292,17 @@ function embeddingUsd(chars: number, model: string | undefined): number | null {
  * Deterministic per-item request id: a rerun after a crash replays the same
  * admission (and waits for it if still pending). An attempt that ended in a
  * terminal failure is not replayed forever; the next attempt gets a new id.
+ * An item's cursor is part of the id, so two items that write the same page at
+ * the same revision (two facts of one page) never share one: the second item
+ * of a run is admitted while the first is still pending, and reusing the
+ * first's id for a different write is refused as idempotency_conflict.
  */
-export async function repairRequestId(ctx: OperationContext, kind: RepairKind, item: Pick<RepairItem, 'source_id' | 'slug'>, revision: string): Promise<string> {
+export async function repairRequestId(ctx: OperationContext, kind: RepairKind, item: Pick<RepairItem, 'source_id' | 'slug'> & { cursor?: RepairCursor }, revision: string): Promise<string> {
   await initializeLocalPersistence(ctx);
   const principal = await requestPrincipalForContext(ctx);
   for (let attempt = 0; ; attempt++) {
-    const h = digest(['repair-request-v1', kind, item.source_id, item.slug, revision, attempt]);
+    const h = digest(item.cursor ? ['repair-request-v2', kind, item.source_id, item.slug, revision, item.cursor.phase, item.cursor.id, attempt]
+      : ['repair-request-v1', kind, item.source_id, item.slug, revision, attempt]);
     const id = `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
     const prior = await getWriteRequest(ctx.engine, principal, id);
     if (!prior || !isTerminal(prior) || prior.state === 'committed') return id;
@@ -276,10 +327,15 @@ function writerHeld(error: unknown): error is OperationError {
  */
 export async function runRepair(ctx: OperationContext, handler: RepairHandler, scope: RepairScope,
   opts: { apply: boolean; limit?: number; embeddingModel?: string; sourceFlag?: string; embed?: boolean; applyArgs?: string[];
-    explicit?: boolean; expect?: string; includeAmbiguous?: boolean; only?: string[]; skip?: string[]; slugs?: string[]; noLlm?: boolean;
-    prefer?: 'file' | 'database'; requests?: string[]; allDrifted?: boolean; driftClass?: string; since?: string;
-    keep?: 'prior' | 'disk'; requestId?: string; olderThan?: string; includeFailures?: boolean; force?: boolean; from?: string; close?: boolean;
+    explicit?: boolean; expect?: string; includeAmbiguous?: boolean; includeCrossEntity?: boolean; only?: string[]; skip?: string[]; slugs?: string[]; noLlm?: boolean;
+    prefer?: 'file' | 'database'; requests?: string[]; allDrifted?: boolean; driftClass?: string; since?: string; held?: boolean; side?: string; state?: string;
+    provenance?: string; cursor?: string; progress?: ProgressReporter;
+    keep?: 'prior' | 'disk' | 'withdrawn'; requestId?: string; olderThan?: string; includeFailures?: boolean; force?: boolean; from?: string; close?: boolean; afterPage?: number; generations?: GenerationsSelection; day?: string;
     spec?: Pick<RepairKindSpec, 'explicit_only' | 'consent' | 'spends'>; maxLlmUsd?: number; deadline?: number; now?: () => number;
+    /** GBRA-133: the CLI's termination signal; the apply stops before the next item with a result instead of dying mid-run. */
+    stop?: AbortSignal;
+    /** GBRA-133: the CLI's apply records a database refusal as a stop with a result; other callers (cycle, remediation) keep the rethrow. */
+    recordDatabaseStops?: boolean;
     /** Test seam: who publishes this run's admissions (default: this process's consumer, else a live full one on this host). */
     publicationOwner?: () => Promise<{ alive: boolean; owner: string }> }): Promise<RepairResult> {
   // #6696 (A5): an approved local repair is the operator's own write; a maintenance cycle's background scope still wins.
@@ -295,13 +351,18 @@ async function runRepairScoped(ctx: OperationContext, handler: RepairHandler, sc
   const { cursor: resumed, runId: storedRunId } = await readCursor(ctx.engine, handler.kind, scope, opts.apply ? opts.expect : undefined);
   const now = opts.now ?? Date.now;
   const planOpts: RepairPlanOptions = { apply: opts.apply, expect: opts.expect, includeAmbiguous: opts.includeAmbiguous, only: opts.only, skip: opts.skip,
+    ...(opts.includeCrossEntity ? { includeCrossEntity: true } : {}),
     ...(opts.slugs?.length ? { slugs: opts.slugs } : {}), ...(opts.noLlm ? { noLlm: true } : {}), ...(opts.maxLlmUsd !== undefined ? { maxLlmUsd: opts.maxLlmUsd } : {}),
     ...(opts.deadline !== undefined ? { deadline: opts.deadline } : {}), remote: ctx.remote !== false,
     ...(opts.prefer ? { prefer: opts.prefer } : {}), ...(opts.requests?.length ? { requests: opts.requests } : {}),
     ...(opts.allDrifted ? { allDrifted: true } : {}), ...(opts.driftClass ? { driftClass: opts.driftClass } : {}), ...(opts.since ? { since: opts.since } : {}),
+    ...(opts.held ? { held: true } : {}), ...(opts.side ? { side: opts.side } : {}), ...(opts.state ? { state: opts.state } : {}),
+    ...(opts.provenance ? { provenance: opts.provenance } : {}), ...(opts.cursor ? { cursor: opts.cursor } : {}), ...(opts.progress ? { progress: opts.progress } : {}),
     ...(opts.keep ? { keep: opts.keep } : {}), ...(opts.requestId ? { requestId: opts.requestId } : {}),
     ...(opts.olderThan ? { olderThan: opts.olderThan } : {}), ...(opts.includeFailures ? { includeFailures: true } : {}), ...(opts.force ? { force: true } : {}),
-    ...(opts.from ? { from: opts.from } : {}), ...(opts.close ? { close: true } : {}) };
+    ...(opts.from ? { from: opts.from } : {}), ...(opts.close ? { close: true } : {}), ...(opts.afterPage !== undefined ? { afterPage: opts.afterPage } : {}),
+    ...(opts.limit !== undefined ? { limit: opts.limit } : {}), ...(opts.generations ? { generations: opts.generations } : {}),
+    ...(opts.day ? { day: opts.day } : {}) };
   const plan = await handler.plan(ctx.engine, scope, resumed, planOpts);
   const pending = opts.limit !== undefined ? plan.items.slice(0, opts.limit) : plan.items;
   const counters = await capacity(ctx);
@@ -327,13 +388,19 @@ async function runRepairScoped(ctx: OperationContext, handler: RepairHandler, sc
         ...(opts.slugs ?? []).flatMap(slug => ['--slug', slug]), ...(opts.from ? ['--from', opts.from] : []), ...(opts.close ? ['--close'] : []),
         ...(opts.requests ?? []).flatMap(id => ['--request', id]),
         ...(opts.allDrifted ? ['--all-drifted'] : []), ...(opts.driftClass ? ['--class', opts.driftClass] : []), ...(opts.since ? ['--since', opts.since] : []),
+        ...(opts.held ? ['--held'] : []), ...(opts.side ? ['--side', opts.side] : []), ...(opts.state ? ['--state', opts.state] : []),
+        ...(opts.provenance ? ['--provenance', opts.provenance] : []), ...(opts.cursor ? ['--cursor', opts.cursor] : []),
         ...(opts.prefer ? ['--prefer', opts.prefer] : [])].map(arg => ` ${shellQuote([arg])}`).join('')}`
-      + `${opts.includeAmbiguous ? ' --include-ambiguous' : ''}${llm && opts.noLlm ? ' --no-llm' : ''}${llm && opts.maxLlmUsd !== undefined ? ` --max-usd ${opts.maxLlmUsd}` : ''}`
+      + `${opts.includeAmbiguous ? ' --include-ambiguous' : ''}${opts.includeCrossEntity ? ' --include-cross-entity' : ''}${llm && opts.noLlm ? ' --no-llm' : ''}${llm && opts.maxLlmUsd !== undefined ? ` --max-usd ${opts.maxLlmUsd}` : ''}`
       + ` --apply${plan.preview_hash ? ` --expect ${plan.preview_hash}` : ''}${spec?.consent === 'destructive' ? ' --yes' : ''}`,
     ...(plan.scan ? { scan: plan.scan } : {}),
   };
+  const items = new ItemRun('repair.apply_items');
+  const failedItems: Array<{ item: RepairItem; failure: ItemFailure }> = [];
   const finish = async (): Promise<RepairResult> => {
+    if (failedItems.length && handler.onItemFailures && result.stopped?.reason !== 'item_failures_systemic') await handler.onItemFailures(ctx, failedItems);
     if (handler.report) Object.assign(result, await handler.report(ctx, scope, result, planOpts));
+    if (opts.apply) opts.progress?.finish();
     return result;
   };
   if (!opts.apply) {
@@ -379,13 +446,21 @@ async function runRepairScoped(ctx: OperationContext, handler: RepairHandler, sc
     result.stopped = stopped;
     return finish();
   };
+  if (opts.apply) opts.progress?.start(`repair.${handler.kind}.apply`, pending.length);
   for (const [index, item] of pending.entries()) {
     const remaining = pending.length - index;
+    opts.progress?.tick(1, `${item.source_id}:${item.slug}`);
     // A preview-bound kind may retire its approved set with its last item, so every earlier receipt settles before that item runs.
     const lastApproved = !!opts.expect && index === plan.items.length - 1;
-    if (unresolved.length && (unresolved.length >= window || lastApproved) && !await settle(lastApproved ? 0 : window - 1)) {
+    // An item on a page this run's pending write is still changing waits for it, so it writes the page's new revision.
+    const samePage = unresolved.some(open => open.item.source_id === item.source_id && open.item.slug === item.slug);
+    if (unresolved.length && (unresolved.length >= window || lastApproved || samePage) && !await settle(lastApproved || samePage ? 0 : window - 1)) {
       result.stopped = pendingStop(settleMs ? `; nothing published for ${Math.round(settleMs / 1000)}s` : '');
       return finish();
+    }
+    if (opts.stop?.aborted) {
+      return stopAfterSettle({ reason: 'interrupted', message: `Stopped before ${item.source_id}:${item.slug}: this process received ${String(opts.stop.reason ?? 'a termination signal')} `
+        + `(${remaining} item(s) still pending; the items before it stay applied). Rerun \`${result.apply_command}\` to resume.` });
     }
     if (opts.deadline !== undefined && now() >= opts.deadline) {
       return stopAfterSettle({ reason: 'time_budget', message: `Stopped before ${item.source_id}:${item.slug}: this run reached its time budget (${remaining} item(s) still pending). `
@@ -419,26 +494,23 @@ async function runRepairScoped(ctx: OperationContext, handler: RepairHandler, sc
             ...(applied.detail ? { detail: applied.detail } : {}), ...(applied.llm_usd ? { llm_usd: applied.llm_usd } : {}) });
         }
       }
+      if (typeof applied === 'object' && applied.failure !== undefined) {
+        const { systemic: heldStop } = items.record(`${item.source_id}:${item.slug}`, applied.failure);
+        if (heldStop) {
+          return stopAfterSettle({ reason: heldStop.code, message: redactConnectionInfo(`${heldStop.message} Fix the shared cause, then rerun \`${result.apply_command}\` to resume.`),
+            fix: readFix(`Previews ${handler.kind} again (read-only) to show whether the shared cause is gone.`, { argv: ['gbrain', 'repair', handler.kind, ...(opts.sourceFlag ? ['--source', opts.sourceFlag] : []), '--json'] }) });
+        }
+      } else items.succeed();
       if (typeof applied === 'object' ? applied.applied : applied) result.applied++;
       else result.skipped++;
       if (typeof applied === 'object' && applied.stop) {
         await advance(item.cursor);
         return stopAfterSettle(applied.stop);
       }
+      if (typeof applied === 'object' && applied.failure !== undefined) continue;
     } catch (error) {
       // A page edited since planning is left for the next full scan.
       if (error instanceof OperationError && error.code === 'revision_conflict') { result.skipped++; continue; }
-      // A per-item refusal: recorded, nothing written, no cursor for it; the next full scan retries it (PR #6459).
-      if (error instanceof OperationError && REPAIR_ITEM_FAILURE_CODES.has(error.code)) {
-        const message = redactConnectionInfo(error.message);
-        const failedItem = `${item.source_id}:${item.slug}`;
-        result.failed.push({ item: failedItem, source_id: item.source_id, slug: item.slug, reason: error.code, message, retry: 'next_full_scan' });
-        result.outcomes = { ...result.outcomes, failed: (result.outcomes?.failed ?? 0) + 1 };
-        if ((result.outcome_items ??= []).length < (handler.outcomeItemsLimit ?? SAMPLE * 2)) {
-          result.outcome_items.push({ item: failedItem, outcome: 'failed', reason: error.code, detail: { message } });
-        }
-        continue;
-      }
       const receipt = acceptedPendingReceipt(error);
       if (receipt) {
         // #6543 (D1): an accepted write publishes whether or not this run waits; keep going while a consumer here publishes.
@@ -456,9 +528,39 @@ async function runRepairScoped(ctx: OperationContext, handler: RepairHandler, sc
           + `Rerun \`${result.apply_command}\` to resume; the same request is replayed.` };
         return finish();
       }
-      if (!writerHeld(error)) throw error;
-      return stopAfterSettle({ reason: error.code, message: `The canonical writer for source '${item.source_id}' is held (${error.code}). `
-        + `Inspect it with: gbrain sources writer status ${item.source_id} — then rerun \`${result.apply_command}\` to resume.` });
+      if (writerHeld(error)) {
+        return stopAfterSettle({ reason: error.code, message: `The canonical writer for source '${item.source_id}' is held (${error.code}). `
+          + `Inspect it with: gbrain sources writer status ${item.source_id} — then rerun \`${result.apply_command}\` to resume.` });
+      }
+      // GBRA-133: a deadlock, a serialization failure or a lost database connection stops the run with what it applied and
+      // the resume command in the result (the cursor stays before this item), instead of ending the command with no record.
+      const database = opts.recordDatabaseStops ? classifyItemFailure(error) : null;
+      if (database && database.scope === 'run' && (database.code === 'database_contention' || database.code === 'connection_lost')) {
+        const sqlstate = (error as { code?: unknown } | null)?.code;
+        return stopAfterSettle({ reason: database.code, message: redactConnectionInfo(`Stopped at ${item.source_id}:${item.slug}: the database refused this item`
+          + `${typeof sqlstate === 'string' ? ` (${sqlstate})` : ''}: ${database.message.slice(0, 300)}. The items before it stay applied `
+          + `(${remaining} item(s) still pending). Rerun \`${result.apply_command}\` to resume from this item.`),
+          fix: readFix(`Previews ${handler.kind} again (read-only) to show whether the database accepts work again.`, { argv: ['gbrain', 'repair', handler.kind, ...(opts.sourceFlag ? ['--source', opts.sourceFlag] : []), '--json'] }) });
+      }
+      // An apply bound to an approved preview (`--expect`) applies that set or answers why not; only the kinds' own refusals continue it.
+      if (opts.expect && !(error instanceof OperationError && REPAIR_ITEM_FAILURE_CODES.has(error.code))) throw error;
+      const { failure, systemic: stop } = items.record(`${item.source_id}:${item.slug}`, error);
+      if (stop) {
+        return stopAfterSettle({ reason: stop.code, message: redactConnectionInfo(`${stop.message} Fix the shared cause, then rerun \`${result.apply_command}\` to resume.`),
+          fix: readFix(`Previews ${handler.kind} again (read-only) to show whether the shared cause is gone.`, { argv: ['gbrain', 'repair', handler.kind, ...(opts.sourceFlag ? ['--source', opts.sourceFlag] : []), '--json'] }) });
+      }
+      // A per-item failure: recorded, nothing written, no cursor for it; the next full scan retries it (PR #6459, GBRA-130).
+      const message = redactConnectionInfo(failure.message);
+      const failedItem = `${item.source_id}:${item.slug}`;
+      result.failed.push({ item: failedItem, source_id: item.source_id, slug: item.slug, reason: failure.code, message, retry: 'next_full_scan',
+        fix: readFix(`Previews ${handler.kind} for source ${item.source_id} (read-only); it lists ${item.slug} again with its current state. A run with no stored cursor retries it.`,
+          { argv: ['gbrain', 'repair', handler.kind, '--source', item.source_id, '--json'] }) });
+      failedItems.push({ item, failure });
+      result.outcomes = { ...result.outcomes, failed: (result.outcomes?.failed ?? 0) + 1 };
+      if ((result.outcome_items ??= []).length < (handler.outcomeItemsLimit ?? SAMPLE * 2)) {
+        result.outcome_items.push({ item: failedItem, outcome: 'failed', reason: failure.code, detail: { message } });
+      }
+      continue;
     }
     await advance(item.cursor);
   }
@@ -467,7 +569,8 @@ async function runRepairScoped(ctx: OperationContext, handler: RepairHandler, sc
     return finish();
   }
   result.complete = pending.length === plan.items.length;
-  if (result.complete) await writeCursor(ctx.engine, handler.kind, scope, null, null, opts.expect);
+  // A limited run whose attempted items all failed keeps no cursor either: the next run is a full scan, not a resume past them.
+  if (result.complete || (latest === null && result.failed.length > 0)) await writeCursor(ctx.engine, handler.kind, scope, null, null, opts.expect);
   return finish();
 }
 

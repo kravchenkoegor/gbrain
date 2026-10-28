@@ -42,12 +42,14 @@ import { estimatePageEmbedUsd, holdPageEmbedding } from './page-embedding-budget
 import { currentEmbeddingSignature } from './embedding.ts';
 import { budgetLimitedReport } from './held-embedding.ts';
 import type { PageType } from './types.ts';
+import { materializedSnapshot } from './persistence/segmented-apply.ts';
 
 /** The `page_embedding_budget.reason` a backfilled large page waits under. */
 export const BACKFILL_HOLD_REASON = 'upgrade_backfill';
 
 const OVERSIZED_MARKER_SQL = `p.deleted_at IS NULL AND p.frontmatter->'${EMBED_SKIP_KEY}'->>'reason' = 'oversized'`;
-const PAGE_BYTES_SQL = `(octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')))`;
+/** A segmented page (Wave B) has no body columns: its size is `body_bytes`. */
+const PAGE_BYTES_SQL = `(CASE WHEN p.body_storage = 'segmented' THEN p.body_bytes ELSE octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')) END)`;
 /** Under the block (marker removed), or over it, under the ceiling and chunkless (re-chunked, marker kept). $1 is the block. */
 const CANDIDATE_SQL = `(${PAGE_BYTES_SQL} <= $1 OR (${PAGE_BYTES_SQL} <= ${PAGE_MAX_BYTES} AND NOT EXISTS (SELECT 1 FROM content_chunks cc WHERE cc.page_id = p.id)))`;
 
@@ -98,15 +100,31 @@ async function countMarked(engine: BrainEngine, block: number, sourceId: string 
 
 /** Rewrite one page re-chunked with no embedding: without its size-gate markers under the block, with them kept over it. */
 async function reindexPage(engine: BrainEngine, page: Candidate, managed: boolean, overBlock: boolean): Promise<void> {
-  const snapshot = await engine.readPageSnapshot(page.slug, { sourceId: page.source_id });
+  // Every candidate is within the single-string ceiling, so a segmented body is read back whole and rewritten through the segmented write path.
+  const snapshot = await materializedSnapshot(engine, await engine.readPageSnapshot(page.slug, { sourceId: page.source_id }));
   if (!snapshot || snapshot.page.id !== page.id) return;
   const fm = { ...((snapshot.page.frontmatter ?? {}) as Record<string, unknown>) };
   if ((fm[EMBED_SKIP_KEY] as { reason?: unknown } | undefined)?.reason !== 'oversized') return;
+  let prior: { state: string; reason: string | null } | null | undefined;
   if (!overBlock) {
     delete fm[EMBED_SKIP_KEY];
     if ((fm[CONTENT_FLAG_KEY] as { reason?: unknown } | undefined)?.reason === 'oversized') delete fm[CONTENT_FLAG_KEY];
-    if (isLargePageBytes(page.bytes)) await holdPageEmbedding(engine, page.id, BACKFILL_HOLD_REASON);
+    if (isLargePageBytes(page.bytes)) {
+      [prior = null] = await engine.executeRaw<{ state: string; reason: string | null }>('SELECT state, reason FROM page_embedding_budget WHERE page_id = $1', [page.id]);
+      await holdPageEmbedding(engine, page.id, BACKFILL_HOLD_REASON);
+    }
   }
+  try {
+    await rewritePage(engine, page, snapshot, fm, managed);
+  } catch (error) {
+    // #7185: a rewrite that did not land keeps the marker, so the hold placed for it would wait on nothing; put the row back.
+    if (prior === null) await engine.executeRaw('DELETE FROM page_embedding_budget WHERE page_id = $1', [page.id]);
+    else if (prior) await engine.executeRaw('UPDATE page_embedding_budget SET state = $2, reason = $3, updated_at = now() WHERE page_id = $1', [page.id, prior.state, prior.reason]);
+    throw error;
+  }
+}
+
+async function rewritePage(engine: BrainEngine, page: Candidate, snapshot: NonNullable<Awaited<ReturnType<typeof materializedSnapshot>>>, fm: Record<string, unknown>, managed: boolean): Promise<void> {
   const markdown = serializeMarkdown(fm, snapshot.page.compiled_truth ?? '', snapshot.page.timeline ?? '', {
     type: (snapshot.page.type as PageType) ?? 'note', title: snapshot.page.title ?? '', tags: snapshot.tags,
   });

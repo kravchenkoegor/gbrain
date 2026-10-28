@@ -289,6 +289,26 @@ describe('maybeDelegateManagedSyncToServe (the Postgres ladder, client half)', (
     expect(ownConsumerForcedReason()).toBeNull();
   }), 120_000);
 
+  test('#7167: a dry run that is not delegated says it previews in this process and writes nothing, and never forces a consumer of its own', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+    const f = await fixture(1);
+    const dead = join(home, `dead-${randomUUID().slice(0, 8)}.sock`);
+    writeFileSync(dead, '');
+    resetOwnConsumerForTest();
+    captureStderr();
+    const dry = { ...baseOpts(f.id), dryRun: true };
+    const noSock = await maybeDelegateManagedSyncToServe(engine, ['--dry-run'], dry, deps({ sock: null }));
+    const silent = await maybeDelegateManagedSyncToServe(engine, ['--dry-run'], dry, deps({ sock: dead }));
+    releaseStderr();
+    for (const outcome of [noSock, silent]) {
+      expect(outcome).toMatchObject({ kind: 'own_consumer', reason: 'no_socket' });
+      const line = outcome.kind === 'own_consumer' ? outcome.line ?? '' : '';
+      expect(line).toMatch(/; this dry run previews in this process instead of the serve \(PID 4242\) and writes nothing\.$/);
+      expect(line).not.toMatch(/admits|own consumer/);
+    }
+    expect(captured).toHaveLength(2);
+    expect(ownConsumerForcedReason()).toBeNull();
+  }), 120_000);
+
   test('#6543: a serve whose IPC socket does not answer cannot take the run, so this process consumes itself (forced past single_consumer)', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     const f = await fixture(1);
     const dead = join(home, `dead-${randomUUID().slice(0, 8)}.sock`);
@@ -401,7 +421,9 @@ describe('maybeDelegateManagedSyncToServe (the Postgres ladder, client half)', (
     expect(outcome.pid).toBe(4242);
     expect(outcome.result).toMatchObject({ status: 'first_sync', added: 5, pagesAffected: expect.any(Array) });
     expect(outcome.result.drain).toMatchObject({ outcome: 'synced', written: 5, remaining: 0 });
-    expect(outcome.result.managedCursor).toMatchObject({ index: 5, total: 5 });
+    // #6712 PR 4b: the serve drains a live pass (no cursor); its summary rides the SyncResult back.
+    expect(outcome.result.pass).toMatchObject({ outcome: 'synced', stop_reason: null, candidates: 5, settled: 5, remaining: 0 });
+    expect(outcome.result.managedCursor).toBeUndefined();
     expect(captured.some(l => l.includes('running the managed catch-up inside it as this CLI\'s writer'))).toBe(true);
     expect(captured.some(l => l.startsWith('[sync] managed catch-up: 5 entries frozen'))).toBe(true);
     // Every request the drain admitted carries this CLI's registration, so the in-process grant and revocation checks applied.

@@ -173,9 +173,26 @@ header never presents when a fact was written as when it became true. An open
 validity end reads `unknown`. The setting
 applies to `search`, `query`, `recall`, `think` and `assemble_evidence`.
 
+### Tail trim
+
+With `search.evidence_tail_trim` on (default off), an `auto` delivery for
+`search` or `query` drops whole-conversation blocks past the top 3 whose
+search score is under half of rank one's. A block that holds the query's terms
+nearly as fully as rank one (at least 80% of rank one's share of them) is kept:
+a low-scoring session can restate the asked fact with an earlier value, which
+an update question needs. Ranked chunks, saved facts and long pages are never
+dropped, and a delivery without a usable score on every row is unchanged.
+`delivery.tail_trim` reports `{ dropped, kept_by_query_terms }` and
+`dropped_reasons.tail_trim` counts the dropped blocks. On LongMemEval-S
+(development evidence), the trim cut delivered tokens by about 36% on the
+questions it touched, with no measurable loss on three reader models
+([gbrain-evals#185](https://github.com/garrytan/gbrain-evals/pull/185)). The
+library `assembleEvidenceForHits` runs it when the call passes `query` and
+each hit's `score`.
+
 Config keys: `search.return_unit`, `search.return_window`,
 `search.return_budget_default`, `search.return_budget_conversation`,
-`search.return_budget_max_remote`, `search.evidence_date_header`, `search.auto_packing`,
+`search.return_budget_max_remote`, `search.evidence_date_header`, `search.evidence_tail_trim`, `search.auto_packing`,
 `search.page_rank_cut`, `search.page_rank_cut_factor`, `think.return_unit`. Kill switch:
 `gbrain config set search.return_unit chunk` and
 `gbrain config set think.return_unit chunk` (or pass `return_unit: "chunk"`
@@ -413,6 +430,7 @@ Response meta (`_meta.retrieval.delivery` over MCP; top-level `delivery` on
   "fallbacks": ["budget_clamped"], // distinct non-fatal problem codes, never silent
   "budget_clamped": { "requested": 50000, "max": 32000 },
   "date_header": true,             // only when search.evidence_date_header is on
+  "tail_trim": { "dropped": 1, "kept_by_query_terms": 0 }, // only when search.evidence_tail_trim ran
   "auto_packing": "cap_only"       // explicit auto budgets only: the packing that ran
 }
 ```
@@ -431,6 +449,7 @@ delivered text and each result gains `delivered`.
 | `no_section_structure` | `section` found no headings or speaker turns. | A `window` block (`delivered.unit: "window"`). |
 | `no_text_chunks` / `anchor_not_located` | No hit could be placed in the page text: no text chunk was in reach and the hit text itself was not found, or none of the located chunks overlap a hit. | The hit chunk (a code chunk without its synthesized header line), `fallback_reason` set. |
 | `page_missing` | A hit carried no page id (cannot be re-authorized by id). | The hit chunk (live hits only), `fallback_reason` set. |
+| `segment_read_failed` | A page stored in segments could not be read around its hits (its stored projection metadata was unusable, or a segment read failed). | The hit chunk (live hits only; cached hits are dropped as `not_readable`), `fallback_reason` set. |
 | `redaction_unmapped` | Secret redaction changed a block. | Redacted block; its spans move to `unmapped_chunk_ids`. |
 | `image_query_unsupported` | `query` with `image`: image hits are never expanded. | Plain image results; meta says so. |
 | `snippet_cap` | An explicit `snippet_chars` cut a block. | Capped block, `truncated: true`. |

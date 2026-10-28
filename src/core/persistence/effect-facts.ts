@@ -1,5 +1,6 @@
 import type { BrainEngine } from '../engine.ts';
 import type { ParsedPage } from '../import-file.ts';
+import { factsAbsorbWriteKey } from '../facts/dead-absorb-retry.ts';
 import { isFactsBackstopEligible } from '../facts/eligibility.ts';
 import { isFactsExtractionEnabled } from '../facts/extract.ts';
 import { resolvePageWriteNotabilityFilter } from '../facts/notability-filter.ts';
@@ -13,8 +14,7 @@ import { authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { completeEffect } from './effect-journal.ts';
 import { guardEffectSource } from './effect-recovery.ts';
 import { derivedExtractionSkip } from './derived-extraction-gate.ts';
-import { bodyStorageOf, stringWriteStorage } from './segmented-apply.ts';
-import { isSegmentedPage, pageBodyBytes } from '../page-body/page-shape.ts';
+import { bodyUnread, isSegmentedPage } from '../page-body/page-shape.ts';
 import type { PersistenceEffect } from './effect-model.ts';
 import type { WriteRequest } from './model.ts';
 
@@ -80,7 +80,8 @@ async function extractionCompletedForPage(engine: BrainEngine, pageId: number): 
  */
 async function bodyAlreadyOffered(engine: BrainEngine, slug: string, page: ParsedPage, before: PageSnapshot | null): Promise<boolean> {
   const live = before && !before.page.deleted_at ? before.page : null;
-  if (!live || live.compiled_truth !== page.compiled_truth) return false;
+  // A segmented prior body is not compared; the extraction's watermark finds nothing appended and calls no model.
+  if (!live || isSegmentedPage(live) || bodyUnread(page) || live.compiled_truth !== page.compiled_truth) return false;
   if (!isFactsBackstopEligible(slug, live).ok) return false;
   if (!(await extractionCompletedForPage(engine, live.id))) return false;
   return !(await extractionPendingForPage(engine, live.id));
@@ -96,7 +97,6 @@ export async function prepareFactsBackstop(engine: BrainEngine, row: WriteReques
   if (!(await isFactsExtractionEnabled(engine))) return { skipped: 'extraction_disabled' };
   const eligible = isFactsBackstopEligible(row.slug, page);
   if (!eligible.ok) return { skipped: eligible.reason };
-  if ((await stringWriteStorage(engine, pageBodyBytes(page), bodyStorageOf(before?.page))).storage === 'segmented') return { skipped: 'page_body_segmented' };
   if (await bodyAlreadyOffered(engine, row.slug, page, before)) return { skipped: 'body_unchanged' };
   return { queued: true };
 }
@@ -120,7 +120,6 @@ export async function readFactsBackstopJobPage(engine: BrainEngine, data: Record
       throw error;
     }
   }
-  if (isSegmentedPage(snapshot.page)) return { skipped: 'page_body_segmented' } as const;
   return { page: snapshot.page };
 }
 
@@ -153,7 +152,7 @@ export async function dispatchFactsBackstopEffect(engine: BrainEngine, effect: P
       slug: effect.data.slug, sourceId: effect.source_id, source: 'mcp:put_page', sessionId: `put_page:${effect.data.slug}`, notabilityFilter,
       visibility: effect.data.visibility === 'world' ? 'world' : 'private',
       persistence_request_id: effect.request_id, page_id: effect.data.page_id, revision: effect.revision,
-    }, { queue: 'default', idempotency_key: `facts-absorb:write:${effect.request_id}`, max_attempts: 5, backoff_delay: 60_000 });
+    }, { queue: 'default', idempotency_key: factsAbsorbWriteKey(effect.request_id), max_attempts: 5, backoff_delay: 60_000 });
     await completeEffect(tx, effect, { facts: 'queued', job_id: job.id });
   });
 }

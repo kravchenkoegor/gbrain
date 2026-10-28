@@ -13,6 +13,7 @@ import { __setBeliefEmitterFaultForTests, markBeliefCommits, type BeliefEventDra
 import { currentStateHash, readLedgerSource, withBeliefBatch } from '../src/core/belief/ledger.ts';
 import { deleteSourceRow } from '../src/core/source-delete.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { enableBeliefLedger, disableBeliefLedger, latestCoverage } from '../src/core/belief/coverage.ts';
 import { renamePageOntoSlug } from '../src/commands/sync/rename-collision.ts';
 import { runBeliefs } from '../src/commands/beliefs.ts';
@@ -314,6 +315,7 @@ for (const engineCase of testBackends().map(beliefEngineCase)) {
     test('probe 16: activation after large-page version pruning baselines the page per subject at its current state', async () => {
       await brain(async b => {
         const big = (n: number) => page({ prose: `Edit ${n}. ${'Long prose. '.repeat(100_000)}` });
+        await b.engine.setConfig('pages.segmented_storage', 'off');
         await b.put('people/alice-example', beliefPage({ type: 'person', title: 'Alice Example' }));
         for (let n = 0; n < 7; n++) await b.put('companies/huge-example', big(n));
         const [{ versions }] = await b.engine.executeRaw<{ versions: number }>(`SELECT count(*)::int AS versions FROM page_versions v JOIN pages p ON p.id = v.page_id
@@ -341,6 +343,7 @@ for (const engineCase of testBackends().map(beliefEngineCase)) {
         await seeded(b);
         const old = (await readLedgerSource(b.engine, b.sourceId))!;
         const oldEvents = await b.events();
+        await disposePersistenceConsumer(b.engine);
         expect(await deleteSourceRow(b.engine, b.sourceId)).toBe(true);
         await b.engine.executeRaw('INSERT INTO sources(id,name,local_path) VALUES($1,$1,$2)', [b.sourceId, b.root]);
         rmSync(join(b.root, 'companies'), { recursive: true, force: true });

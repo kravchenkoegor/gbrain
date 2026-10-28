@@ -13,11 +13,12 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { VERSION } from '../version.ts';
-import { OperationError, __registerOperationErrorRenderer, type WithdrawnDetail } from './ops/contract.ts';
+import { OperationError, __registerOperationErrorRenderer, provesNotAdmitted, type WithdrawnDetail } from './ops/contract.ts';
 import { StructuredAgentError } from './errors.ts';
 import { canonicalCodeFor, codeEntry, codeClass, codeRetryable, exitCodeForCode } from './error-catalogue.ts';
 import { VERB_NAMES } from './verbs.ts';
 import { classifyPgAccessError, formatDbAccessMarker } from './pg-access-classify.ts';
+import { isReadOnlyTransactionError } from './postgres-engine/read-write-transactions.ts';
 import { redactConnectionInfo } from './audit/redact-connection-info.ts';
 import { redactUrlsInText } from './url-redact.ts';
 import { parseRepoBase } from './repo-base.ts';
@@ -85,6 +86,12 @@ export interface Notice {
    * alone. renderNotice never copies it, so it never reaches the wire.
    */
   dedupe_key?: string;
+  /**
+   * Unrendered (#7165): a coverage notice whose repeat of the same state is
+   * suppressed per session (NoticeLedger) and per one-shot CLI window, until
+   * `level` rises materially or the `key` (code, sources, kinds) is new.
+   */
+  escalation?: { key: string; level: number };
 }
 export interface RenderedNotice extends Omit<Notice, 'fix'> { fix?: RenderedAction; contract_version: 1 }
 
@@ -433,8 +440,8 @@ export function buildEnvelope(p: EnvelopeParts, ctx: RenderContext): AgentEnvelo
     ...(p.why !== undefined ? { why: p.why } : {}),
     ...(fix ? { fix } : {}),
     docs_cmd: ['gbrain', 'errors', p.code],
-    class: codeClass(p.code),
-    retryable: p.retryable ?? codeRetryable(p.code),
+    class: codeClass(p.code, p.reason),
+    retryable: p.retryable ?? codeRetryable(p.code, p.reason),
     ...(notices ? { notices } : {}),
     contract_version: CONTRACT_VERSION,
   };
@@ -582,6 +589,11 @@ const ROWS: Row[] = [
       error: e.envelope.code, code: canonicalCodeFor(e.envelope.code), message: e.envelope.message,
       suggestion: e.envelope.hint, docs: e.envelope.docs_url,
     }),
+  },
+  {
+    match: isReadOnlyTransactionError,
+    map: (e: Error) => ({ error: 'connection_inherited_read_only', code: 'connection_inherited_read_only', message: e.message,
+      fix: registryTemplateFix('connection_inherited_read_only', {}) }),
   },
   {
     match: e => e instanceof Error && (e as { tag?: unknown }).tag === 'BUDGET_EXHAUSTED',
@@ -825,7 +837,7 @@ export function toAgentError(e: unknown, ctx: AgentErrorContext): AgentEnvelope 
     if (!parts.fix && (codeClass(parts.code) === 'server' || codeClass(parts.code) === 'unavailable')) {
       parts = { ...parts, fix: diagnosticFix(ctx, 'Doctor reports what is missing or failing on the brain host.') };
     }
-    if (ctx.mutating === true && ctx.idempotent !== true) parts = { ...parts, retryable: false };
+    if (ctx.mutating === true && ctx.idempotent !== true && !provesNotAdmitted(e)) parts = { ...parts, retryable: false };
     const env = buildEnvelope(parts, ctx.render);
     if (env.code === 'internal_error' || env.code === 'internal' || !env.suggestion) {
       recordAgentContractEvent({ transport: ctx.transport, op: ctx.op, command: ctx.command, code: env.code, has_suggestion: !!env.suggestion, outcome: ctx.outcome });
@@ -850,7 +862,7 @@ export function projectionConflictLine(e: unknown, command: string): string | nu
 /** Pure: callers write the strings. TTY order: `Error [code]: msg` / `Fix:` / `Why:` / `Docs:`. */
 export function renderCliError(e: unknown, opts: { json: boolean; command: string; tty: boolean }): CliErrorRender {
   const env = toAgentError(e, { transport: 'cli', command: opts.command, render: cliRenderContext() });
-  const exitCode = exitCodeForCode(env.code);
+  const exitCode = exitCodeForCode(env.code, env.reason);
   if (opts.json) return { stdout: `${JSON.stringify(env, null, 2)}\n`, exitCode };
   const lines = [`Error [${env.code}]: ${env.message}`];
   const relay = env.fix && !env.fix.command && env.fix.mcp ? `call ${env.fix.mcp.tool} over MCP with ${JSON.stringify(env.fix.mcp.arguments)}` : undefined;

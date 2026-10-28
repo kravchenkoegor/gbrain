@@ -79,6 +79,8 @@ export class OperationError extends Error {
   public protocolVersion?: number;
   public writeRequest?: WriteReceipt;
   public writeError?: WriteErrorCode;
+  /** #6989: the request ID of a write that may have committed although its reply was not delivered (`response_too_large`); never invented for a read. */
+  public requestId?: string;
   /** Agent contract v1 (A1): which cause, when one code covers several. */
   public reason?: string;
   /** Agent contract v1: why it happened, for the agent to explain and weigh. */
@@ -151,6 +153,7 @@ export class OperationError extends Error {
       detail: this.detail,
       protocol_version: this.protocolVersion,
       ...(this.writeRequest ? { write_request: publicWriteReceipt(this.writeRequest) } : {}),
+      ...(this.requestId ? { request_id: this.requestId } : {}),
       ...(this.writeError ? { write_error: this.writeError } : {}),
       ...(this.reason !== undefined ? { reason: this.reason } : {}),
       ...(this.why !== undefined ? { why: this.why } : {}),
@@ -185,6 +188,14 @@ export interface OpErrorOpts {
  * positional and required. Use `OperationError.bare()` only when no next step
  * can be named at the throw site.
  */
+const notAdmittedWrites = new WeakSet<OperationError>();
+/**
+ * A write refusal raised after its admission transaction rolled back, so nothing was admitted: the agent contract's
+ * safe-recovery rule (only idempotent mutations read retryable) gives way for it. Only write admission marks errors.
+ */
+export function markNotAdmitted(error: OperationError): OperationError { notAdmittedWrites.add(error); return error; }
+export function provesNotAdmitted(error: unknown): boolean { return error instanceof OperationError && notAdmittedWrites.has(error); }
+
 export function opError(code: RegistryCode, message: string, suggestion: string, opts: OpErrorOpts = {}): OperationError {
   const e = new OperationError(opts.legacy_error ?? code, message, suggestion, opts.docs);
   if (opts.legacy_error !== undefined) e.canonical = code;
@@ -253,6 +264,10 @@ export interface ParamDef {
   properties?: Record<string, ParamDef>;
   /** Advertised on the full MCP surface only (keeps the starter tool list inside its size budget). */
   fullSurfaceOnly?: boolean;
+  /** An object param the CLI takes as repeated `--flag key=value` (`key=a,b` is a list); MCP passes the object. */
+  cliKeyValue?: boolean;
+  /** An object window the CLI also takes as `N-M` (inclusive) or `N`: the [start, length] member names. */
+  cliRange?: readonly [string, string];
 }
 
 export interface Logger {
@@ -458,6 +473,12 @@ export interface OperationContext {
    * (network transports), independent of the remote trust flag.
    */
   transport?: 'stdio' | 'http';
+  /**
+   * Largest request frame this connection reads, in bytes, set by the transport that built the context (legacy HTTP:
+   * GBRAIN_HTTP_MAX_BODY_BYTES; OAuth /mcp: the SDK's 4 MiB; stdio: its message buffer). Sizes upload parts
+   * (persistence/page-upload.ts partMaxFrameBytes); never a trust input.
+   */
+  inboundFrameBytes?: number;
   /**
    * WP2/D3: response-meta side channel. Handlers that compute out-of-band
    * result metadata (retrieval degradation, strict-mode warnings) publish it

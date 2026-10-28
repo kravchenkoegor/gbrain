@@ -40,7 +40,10 @@ import { rankingLinkSql } from '../link-ranking-policy.ts';
  *   1. If `raw` is already a page slug shape (contains a "/" or matches an
  *      exact pages.slug row in this source), return it untouched. A mention
  *      that is exactly one live page's own name (slug basename) resolves to
- *      it next, before any other page's alias.
+ *      it next, before any other page's alias, and so does (#6925) a
+ *      slug-shaped organization reference's one live page under another
+ *      organization directory (`companies/x` → `orgs/x`). Then an
+ *      unambiguous alias.
  *   2. Resolve a bare name only when prefix expansion finds one candidate,
  *      or one candidate whose title is exactly that name.
  *   3. For multi-token input, take a fuzzy candidate within the source only
@@ -80,6 +83,9 @@ export async function resolveEntitySlug(
   //      page_aliases hit resolves BEFORE prefix expansion / fuzzy — the
   //      alias table is curated ground truth ("saoirse" → people/saoirse-x)
   //      while fuzzy is a guess. Live-page verified (page_aliases has no FK).
+  const orgVariant = await tryOrgDirVariant(engine, source_id, trimmed);
+  if (orgVariant) return orgVariant;
+
   const aliased = await tryAliasExact(engine, source_id, trimmed);
   if (aliased) return aliased;
 
@@ -131,6 +137,31 @@ function fallbackSegment(segment: string): string {
 
 const IDENTITY_TYPES = new Set(['person', 'company', 'fund', 'organization']);
 const IDENTITY_DIRS = ['people/', 'companies/', 'funds/', 'orgs/', 'organizations/'];
+/** #6925: directories that hold the same organization pages, so `companies/x`, `orgs/x` and `organizations/x` name one org. */
+const ORG_DIRS = ['companies', 'orgs', 'organizations'];
+
+function sameEntityDir(a: string | null, b: string | null): boolean {
+  return a === b || (a !== null && b !== null && ORG_DIRS.includes(a) && ORG_DIRS.includes(b));
+}
+
+/** #6925: the same slug under the other organization directories; empty for any other slug. */
+function orgDirVariants(raw: string): string[] {
+  const slug = fallbackSlugify(raw.trim());
+  const [dir, name, ...rest] = slug?.split('/') ?? [];
+  if (!name || rest.length || !ORG_DIRS.includes(dir)) return [];
+  return ORG_DIRS.filter(d => d !== dir).map(d => `${d}/${name}`);
+}
+
+/** #6925: the one live page a slug-shaped organization reference names under another organization directory. */
+async function tryOrgDirVariant(engine: BrainEngine, source_id: string, raw: string): Promise<string | null> {
+  const variants = orgDirVariants(raw);
+  if (!variants.length) return null;
+  const rows = await engine.executeRaw<{ slug: string }>(
+    'SELECT slug FROM pages WHERE source_id = $1 AND deleted_at IS NULL AND slug = ANY($2::text[])', [source_id, variants]);
+  const live = await canonicalPages(engine, source_id, rows.map(r => r.slug));
+  return live.length === 1 ? live[0].slug : null;
+}
+
 const NAME_NOISE_TOKENS = new Set(['the', 'inc', 'llc', 'ltd', 'co', 'corp', 'corporation', 'plc', 'gmbh']);
 
 /** True for pages that name one real-world person, company, fund or organization. */
@@ -182,7 +213,7 @@ export function retiredPageSql(p: string): string {
     OR lower(COALESCE(${p}.frontmatter->>'status', '')) ~ '(^|[^a-z])(alias|redirect|redirected)([^a-z]|$)')`;
 }
 
-const MAX_RETIREMENT_HOPS = 5;
+export const MAX_RETIREMENT_HOPS = 5;
 
 /** A frontmatter redirect value as a slug: `[[people/x|X]]`, `people/x.md` and `/people/x` are `people/x`. */
 function redirectSlug(value: string): string | null {
@@ -200,7 +231,7 @@ function redirectSlug(value: string): string | null {
  * so it is followed whatever its type; the strict resolver still applies its
  * fact-entity check to the page it lands on.
  */
-async function followRetirement(
+export async function followRetirement(
   engine: BrainEngine,
   source_id: string,
   slug: string,
@@ -259,7 +290,9 @@ function aliasSpellings(raw: string): { literal: string; folded: string[]; dir: 
  * Slugs of the pages whose page_aliases row carries the reference: the
  * literal spelling's hits when it has any, else the separator-folded
  * spellings'. A folded hit for a slug-shaped reference must sit in the same
- * directory (`projects/acme-example` never lands on a `companies/` alias).
+ * directory (`projects/acme-example` never lands on a `companies/` alias);
+ * the organization directories count as one (#6925: `companies/acme-example`
+ * reaches an `orgs/` page's `acme example` alias).
  * Throws what resolveAliases throws.
  */
 async function aliasHitSlugs(engine: BrainEngine, source_id: string, raw: string): Promise<string[]> {
@@ -269,7 +302,7 @@ async function aliasHitSlugs(engine: BrainEngine, source_id: string, raw: string
   const exact = (hits.get(literal) ?? []).map(h => h.slug);
   if (exact.length) return exact;
   const parentDir = (slug: string) => slug.split('/').slice(-2, -1)[0] ?? null;
-  return folded.flatMap(s => hits.get(s) ?? []).map(h => h.slug).filter(slug => dir === null || parentDir(slug) === dir);
+  return folded.flatMap(s => hits.get(s) ?? []).map(h => h.slug).filter(slug => dir === null || sameEntityDir(parentDir(slug), dir));
 }
 
 /**
@@ -324,6 +357,8 @@ function isBareName(raw: string): boolean {
 // analysis/runbook documents (`infra/hive-dependency-audit-…`), and any such
 // doc would trip the ambiguity gate and re-break bare-token resolution.
 const PREFIX_EXPANSION_DIRS = ['people', 'companies', 'hosts', 'projects'] as const;
+/** Directories a bare entity name resolves under (findExactBasenameCandidates); factEntitySlugs reads the same set. */
+export const BASENAME_DIRS = [...PREFIX_EXPANSION_DIRS, 'concepts'] as const;
 
 async function findExactBasenameCandidates(
   engine: BrainEngine,
@@ -338,7 +373,7 @@ async function findExactBasenameCandidates(
       `SELECT slug FROM pages
         WHERE source_id = $1 AND deleted_at IS NULL AND slug = ANY($2::text[])
         LIMIT 2`,
-      [source_id, [...PREFIX_EXPANSION_DIRS, 'concepts'].map(dir => `${dir}/${token}`)],
+      [source_id, BASENAME_DIRS.map(dir => `${dir}/${token}`)],
     );
   } catch {
     return [];
@@ -393,6 +428,9 @@ export async function resolveEntitySlugWithSource(
 
   const basenames = await findExactBasenameCandidates(engine, source_id, trimmed);
   if (basenames.length === 1) return { slug: basenames[0].slug, source: 'fuzzy_match' };
+
+  const orgVariant = await tryOrgDirVariant(engine, source_id, trimmed);
+  if (orgVariant) return { slug: orgVariant, source: 'fuzzy_match' };
 
   const aliased = await tryAliasExact(engine, source_id, trimmed);
   if (aliased) return { slug: aliased, source: 'alias_exact' };
@@ -483,9 +521,11 @@ export async function resolveStrictEntityReference(
   }
   const token = slugify(trimmed);
   if (!trimmed.includes('/') && token.includes('-')) {
-    const basename = await pick(await live([...PREFIX_EXPANSION_DIRS, 'concepts'].map(dir => `${dir}/${token}`)), 'basename');
+    const basename = await pick(await live(BASENAME_DIRS.map(dir => `${dir}/${token}`)), 'basename');
     if (basename) return basename;
   }
+  const orgVariant = await pick(await live(orgDirVariants(trimmed)), 'basename');
+  if (orgVariant) return orgVariant;
   try {
     const aliased = await pick(await live(await aliasHitSlugs(engine, source_id, trimmed)), 'alias_exact');
     if (aliased) return aliased;
@@ -514,6 +554,45 @@ export async function resolveStrictEntityReference(
     if ((opts.excludePrivate ? await live(prefixed) : prefixed).length > 0) return { slug: null, miss: 'unverified' };
   }
   return { slug: null, miss: 'no_page' };
+}
+
+/**
+ * #7248: up to five readable live pages a reference could mean, sorted by
+ * slug, for a refusal to name: the entity-directory basenames, organization
+ * variants, alias hits and bare-name prefix expansions, else the nearest
+ * entity pages by title or slug similarity that share the reference's first
+ * name token. Never a slugified guess.
+ */
+export async function entityReferenceCandidates(
+  engine: BrainEngine,
+  source_id: string,
+  raw: string,
+  opts: { excludePrivate?: boolean } = {},
+): Promise<string[]> {
+  const trimmed = raw.trim();
+  const token = slugify(trimmed);
+  if (!token) return [];
+  const privacy = opts.excludePrivate ? `AND ${privatePagesFilterFragment('p')}` : '';
+  const aliases = await aliasHitSlugs(engine, source_id, trimmed).catch(() => [] as string[]);
+  const prefixed = (await findPrefixCandidates(engine, source_id, token)).map(c => c.slug);
+  const named = await engine.executeRaw<{ slug: string }>(
+    `SELECT p.slug FROM pages p
+      WHERE p.source_id = $1 AND p.deleted_at IS NULL AND NOT ${retiredPageSql('p')} AND p.slug = ANY($2::text[]) ${privacy}
+      ORDER BY p.slug LIMIT 5`,
+    [source_id, [...new Set([...BASENAME_DIRS.map(dir => `${dir}/${token}`), ...orgDirVariants(trimmed), ...aliases, ...prefixed])]],
+  );
+  if (named.length) return named.map(r => r.slug);
+  const near = await engine.executeRaw<{ slug: string; title: string; type: string | null }>(
+    `SELECT p.slug, p.title, p.type FROM pages p
+      WHERE p.source_id = $1 AND p.deleted_at IS NULL AND NOT ${retiredPageSql('p')} ${privacy}
+        AND (lower(p.title) % $2 OR p.slug ILIKE '%' || $3 || '%')
+      ORDER BY GREATEST(similarity(lower(p.title), $2), similarity(p.slug, $3)) DESC, p.slug ASC
+      LIMIT 20`,
+    [source_id, trimmed.toLowerCase(), token],
+  ).catch(err => { if (isMissingTrigramError(err)) return []; throw err; });
+  const lead = token.split('-')[0]!;
+  const sharesLead = (r: { slug: string; title: string }) => slugify(r.title).split('-')[0] === lead || (r.slug.split('/').pop() ?? '').split('-')[0] === lead;
+  return near.filter(r => isFactEntityPage(r.slug, r.type) && sharesLead(r)).slice(0, 5).map(r => r.slug).sort();
 }
 
 /**

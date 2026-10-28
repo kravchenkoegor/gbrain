@@ -72,6 +72,18 @@ export interface ChunkOptions {
   maxTokens?: number;
   /** Record each chunk's projected UTF-8 byte span (TextChunk.byte_start/byte_end). Chunk text is unchanged. */
   spans?: boolean;
+  /**
+   * A Markdown heading line (or a run of them) joins the running chunk only together with the piece after it;
+   * when that piece starts the next chunk, the headings start it too. Segmented pages only (segment-chunks.ts):
+   * a section appended after a full last chunk then leaves that chunk's text, and its vector, unchanged.
+   */
+  headingsLead?: boolean;
+  /**
+   * The hard cap's forced cuts (capByChars) land on a sentence end, else a line end, else whitespace, else a code point,
+   * searched backward from the bound over at most CUT_LOOKBACK_CHARS, and the next window starts one overlap before
+   * that cut. Segmented pages only (segment-chunks.ts, SEGMENTED_CHUNKER_VERSION): inline chunks are unchanged.
+   */
+  boundaryCuts?: boolean;
 }
 
 export interface TextChunk {
@@ -131,17 +143,18 @@ export function chunkProjectedText(stripped: string, opts?: ChunkOptions): TextC
     : DEFAULT_MAX_CHUNK_TOKENS;
 
   if (!stripped || stripped.trim().length === 0) return [];
+  const boundaryCuts = opts?.boundaryCuts === true;
 
   const wordCount = countWords(stripped);
   if (wordCount <= chunkSize) {
     // Single-chunk path: still apply the maxChars cap.
     const whole = trimmedRun({ text: stripped, segs: [{ t: 0, s: 0, n: stripped.length }] });
-    return finish(stripped, capByChars(whole.text, maxChars, maxTokens).map(c => placed(whole, c)), opts?.spans === true);
+    return finish(stripped, capByChars(whole.text, maxChars, maxTokens, undefined, boundaryCuts).map(c => placed(whole, c)), opts?.spans === true);
   }
 
   // Recursively split, then greedily merge to target size
   const pieces = recursiveSplit(stripped, 0, chunkSize, 0);
-  const merged = greedyMerge(pieces, chunkSize);
+  const merged = greedyMerge(pieces, chunkSize, opts?.headingsLead === true);
   const withOverlap = applyOverlap(merged, chunkOverlap);
   // v0.32.7: hard char cap. Catches pathological CJK + whitespace-less text
   // that the word-level pipeline can't bound (a single Chinese paragraph can
@@ -149,7 +162,7 @@ export function chunkProjectedText(stripped: string, opts?: ChunkOptions): TextC
   const capped: Placed[] = [];
   for (const chunk of withOverlap) {
     const run = trimmedRun(chunk);
-    for (const c of capByChars(run.text, maxChars, maxTokens)) capped.push(placed(run, c));
+    for (const c of capByChars(run.text, maxChars, maxTokens, undefined, boundaryCuts)) capped.push(placed(run, c));
   }
   return finish(stripped, capped, opts?.spans === true);
 }
@@ -280,6 +293,7 @@ function capByChars(
   maxChars: number,
   maxTokens: number = DEFAULT_MAX_CHUNK_TOKENS,
   knownEst?: number,
+  boundaryCuts = false,
 ): Slice[] {
   if (text.length === 0) return [];
   if (knownEst === undefined && text.length <= maxChars && fitsEmbedTokens(text, maxTokens)) return [{ text, at: 0 }];
@@ -293,7 +307,7 @@ function capByChars(
     // a sparse ASCII head can under-read a dense CJK tail.
     if (knownEst !== undefined || text.length <= DENSITY_PROBE_CHARS) return [{ text, at: 0 }];
     const exact = estimateEmbedTokens(text);
-    return exact <= maxTokens ? [{ text, at: 0 }] : capByChars(text, maxChars, maxTokens, exact);
+    return exact <= maxTokens ? [{ text, at: 0 }] : capByChars(text, maxChars, maxTokens, exact, boundaryCuts);
   }
   // The stride keeps its nominal window-minus-overlap value. Evening the
   // windows out (as the header-budget hard split does) is WRONG here: that
@@ -304,10 +318,12 @@ function capByChars(
   // that trade and is the behavior this loop has always had.
   const overlap = Math.min(500, Math.floor(window / 10));
   const stride = Math.max(1, window - overlap);
+  const lookback = Math.min(CUT_LOOKBACK_CHARS, Math.floor(window / 4));
   const out: Slice[] = [];
   let i = 0;
   while (i < text.length) {
-    const end = safeSplitIndex(text, Math.min(text.length, i + window));
+    const bound = safeSplitIndex(text, Math.min(text.length, i + window));
+    const end = boundaryCuts && bound < text.length ? forcedCut(text, bound, lookback) : bound;
     const raw = text.slice(i, end);
     const slice = raw.trim();
     const at = i + raw.length - raw.trimStart().length;
@@ -317,16 +333,48 @@ function capByChars(
         // Denser than the text average — re-derive locally, reusing the exact
         // figure just measured (it also guarantees window < slice.length, so
         // the recursion strictly shrinks).
-        for (const part of capByChars(slice, maxChars, maxTokens, sliceEst)) out.push({ text: part.text, at: at + part.at });
+        for (const part of capByChars(slice, maxChars, maxTokens, sliceEst, boundaryCuts)) out.push({ text: part.text, at: at + part.at });
       } else {
         out.push({ text: slice, at });
       }
     }
     if (end >= text.length) break;
-    const next = safeSplitIndex(text, Math.min(text.length, i + stride));
+    const next = safeSplitIndex(text, Math.min(text.length, boundaryCuts ? end - overlap : i + stride));
     i = next > i ? next : i + 1;
   }
   return out;
+}
+
+/**
+ * Chars a forced cut may move back from the hard bound to reach a sentence or line end. A constant, so the cut search
+ * adds at most this much work per window and chunking stays linear; capped at a quarter of the window, so a window
+ * keeps three quarters of its length and the next one (one overlap, at most a tenth, before the cut) moves forward.
+ */
+export const CUT_LOOKBACK_CHARS = 512;
+
+/** @internal Code units the forced-cut search visits, for the linearity test (counts, not time). */
+export const cutWork = { scanned: 0 };
+
+const SENTENCE_END_CHARS = new Set(['.', '!', '?']);
+const CJK_SENTENCE_END_CHARS = new Set(CJK_SENTENCE_DELIMITERS);
+const isSpace = (c: string | undefined) => c !== undefined && /\s/.test(c);
+
+/**
+ * Where a forced cut at `bound` lands: after the last sentence end at most `lookback` code units back, else after the
+ * last line end, else at the last whitespace, else at `bound` (already a code-point boundary). One backward pass.
+ * Every candidate sits between code points (a delimiter or whitespace is one BMP unit) and never between CR and LF.
+ */
+function forcedCut(text: string, bound: number, lookback: number): number {
+  let line = -1, space = -1;
+  for (let c = bound; c > bound - lookback && c > 0; c--) {
+    cutWork.scanned++;
+    const before = text[c - 1]!, at = text[c];
+    if (before === '\r' && at === '\n') continue;
+    if (CJK_SENTENCE_END_CHARS.has(before) || (isSpace(at) && SENTENCE_END_CHARS.has(before))) return c;
+    if (line < 0 && (before === '\n' || at === '\n' || at === '\r')) line = c;
+    if (space < 0 && (isSpace(before) || isSpace(at))) space = c;
+  }
+  return line >= 0 ? line : space >= 0 ? space : bound;
 }
 
 /**
@@ -474,7 +522,10 @@ function splitOnWhitespace(text: string, target: number, base: number): Piece[] 
  * stats grow with it (concatWordStats), so each piece is counted once instead
  * of recounting the whole chunk on every merge.
  */
-function greedyMerge(pieces: Piece[], target: number): Run[] {
+const HEADING_PIECE = /^#{1,6}[ \t][^\n]*$/;
+const isHeadingPiece = (p: Piece) => HEADING_PIECE.test(p.text.trim());
+
+function greedyMerge(pieces: Piece[], target: number, headingsLead = false): Run[] {
   if (pieces.length === 0) return [];
 
   const result: Run[] = [];
@@ -486,7 +537,16 @@ function greedyMerge(pieces: Piece[], target: number): Run[] {
   for (let i = 1; i < pieces.length; i++) {
     const pieceStats = wordStats(pieces[i].text);
     const combinedStats = concatWordStats(currentStats, pieceStats);
-    if (wordCountOf(combinedStats) <= limit) {
+    // A run of heading pieces is checked once, at its first piece, together with the piece after the run.
+    let leads = false;
+    if (headingsLead && isHeadingPiece(pieces[i]) && !isHeadingPiece(pieces[i - 1])) {
+      let runStats = combinedStats;
+      let j = i + 1;
+      for (; j < pieces.length && isHeadingPiece(pieces[j]); j++) runStats = concatWordStats(runStats, wordStats(pieces[j].text));
+      if (j < pieces.length) runStats = concatWordStats(runStats, wordStats(pieces[j].text));
+      leads = j < pieces.length && wordCountOf(runStats) > limit;
+    }
+    if (!leads && wordCountOf(combinedStats) <= limit) {
       // `current` is this loop's own run: extend it in place (copying its segs per merge is quadratic in
       // pieces per chunk), and grow the last seg when the piece follows it directly in the projected text.
       const last = current.segs[current.segs.length - 1];

@@ -10,8 +10,9 @@ import { assertSourceFilesystemActive } from '../minions/source-filesystem.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { submissionAuthority, authorizeWrite } from './authority.ts';
-import { currentVerifiedLocalWriter, registerLocalWriter } from './identity.ts';
-import { readManagedMode } from './managed-mode.ts';
+import { currentVerifiedLocalWriter, withRegisteredLocalWriter } from './identity.ts';
+import { readManagedMode, readPersistenceBrain } from './managed-mode.ts';
+import { dispatchManagedMode, syncDispatchRow } from '../sync-dispatch-read.ts';
 import type { WriteAuthority } from './model.ts';
 import { writerAdminState } from './admin-intent.ts';
 
@@ -41,10 +42,12 @@ export function assertSyncDispatchActive(): void {
   throwIfAborted(currentJobSignal());
 }
 export async function resolveSyncPersistenceMode(engine: BrainEngine, opts: SyncOpts): Promise<boolean> {
-  const managed = await readManagedMode(engine);
+  // GBRA-133: inside a CLI sync's routing scope the source's routing row answers the mode and the claim (sync-dispatch-read.ts).
+  const routing = await syncDispatchRow(engine, opts.sourceId ?? 'default');
+  const managed = routing ? dispatchManagedMode(routing) : await readManagedMode(engine);
   assertSyncDispatchActive();
   if (managed || opts.signal?.aborted) return managed;
-  const [source] = await engine.executeRaw<{ claimed: boolean }>(`SELECT
+  const [source] = routing ? [routing.id === null ? undefined : routing] : await engine.executeRaw<{ claimed: boolean }>(`SELECT
     EXISTS(SELECT 1 FROM persistence_source_bindings WHERE source_id=s.id AND source_incarnation=s.incarnation) AS claimed
     FROM sources s WHERE s.id=$1`, [opts.sourceId ?? 'default']);
   if (source?.claimed) throw await preActivationClaimRefusal(engine, opts.sourceId ?? 'default');
@@ -67,11 +70,18 @@ async function preActivationClaimRefusal(engine: BrainEngine, sourceId: string):
       user_message: `Source ${sourceId} was claimed for managed writes, but managed persistence was never turned on, so sync is blocked. Release the claim and go back to classic sync, or turn managed persistence on?`,
       verify: { argv: ['gbrain', 'sources', 'status', sourceId, '--json'] }, docs: 'docs/architecture/topologies.md#deactivate-runbook' } });
 }
+const inactiveCoordinator = () => new OperationError('writer_coordinator_required', 'Sync cannot publish through an inactive persistence coordinator.',
+  'Stop older writers and review gbrain sources writer status, then explicitly activate persistence before retrying. Claiming a source alone does not exclude running legacy writers.');
 export async function assertManagedSyncActive(engine: BrainEngine, lock = false): Promise<void> {
-  if (!await readManagedMode(engine, lock ? { lock: 'share' } : {})) throw new OperationError('writer_coordinator_required', 'Sync cannot publish through an inactive persistence coordinator.',
-    'Stop older writers and review gbrain sources writer status, then explicitly activate persistence before retrying. Claiming a source alone does not exclude running legacy writers.');
+  if (!await readManagedMode(engine, lock ? { lock: 'share' } : {})) throw inactiveCoordinator();
 }
-export async function managedSyncAuthority(engine: BrainEngine, sourceId: string, incarnation: string, repoPath: string): Promise<SyncAuthority> {
+/** #6712 PR 4b: `assertManagedSyncActive` that also returns the persistence identity (`managedSyncAuthority`'s `brainId`), one read. */
+export async function activeManagedBrainId(engine: BrainEngine): Promise<string> {
+  const brain = await readPersistenceBrain(engine);
+  if (!brain.enabled) throw inactiveCoordinator();
+  return brain.brain_id;
+}
+export async function managedSyncAuthority(engine: BrainEngine, sourceId: string, incarnation: string, repoPath: string, brainId?: string): Promise<SyncAuthority> {
   assertDurableSyncCaller();
   const current = currentSubmissionAuthority();
   if (current?.kind === 'remote_agent') throw opError('permission_denied', 'Agent jobs cannot run bulk filesystem sync.',
@@ -90,9 +100,10 @@ export async function managedSyncAuthority(engine: BrainEngine, sourceId: string
   if (verified?.remote) throw opError('permission_denied', 'Bulk sync requires the local CLI or an authenticated source-scoped admin job.',
     `This stdio MCP writer cannot run bulk filesystem sync of source ${sourceId}, so nothing was synced. The user runs the command in fix in a terminal on this machine.`,
     { fix: hostSyncFix(sourceId, 'user') });
-  if (!verified) await registerLocalWriter(engine, 'cli');
-  const writer = await submissionAuthority({ engine, remote: verified?.remote ?? false, sourceId } as OperationContext,
+  const authorize = () => submissionAuthority({ engine, remote: verified?.remote ?? false, sourceId } as OperationContext,
     'submit_job', sourceId, incarnation, '__managed_sync_checkpoint__');
+  // An unverified CLI caller registers its writer (if needed) and is verified from the same read.
+  const writer = verified ? await authorize() : await withRegisteredLocalWriter(engine, 'cli', authorize, brainId);
   if (writer.slugPrefixes !== null) throw opError('permission_denied', 'Bulk sync requires a source-wide local grant.',
     `This CLI writer's grant covers only some slug prefixes of source ${sourceId}, and bulk sync can touch any page, so nothing was synced. Review the grant with the command in fix; widening it (gbrain auth local-writer register cli --replace with the complete intended grant) is the user's decision.`,
     { fix: readFix('Lists the local writer registrations with their sources, operations and slug-prefix grants, read-only.', { argv: ['gbrain', 'auth', 'local-writer', 'list', '--json'] }) });

@@ -12,17 +12,31 @@
 
 | Symptom | Next step | Who acts | Consent | Verify |
 |---|---|---|---|---|
+| A withdrawal committed but a large page's file still shows the withdrawn row; writer status lists its mirror parked with [`segmented_mirror_writer_gate`](write-refusals.md#segmented_mirror_writer_gate), or an effect retrying with [`recovery_version_unsupported`](write-refusals.md#recovery_version_unsupported) (or `effect_unavailable` on v0.60.290.0) holds every write on the worktree | `gbrain upgrade` on the hosts the refusal or a doctor `segmented_storage` warning names (for `recovery_version_unsupported`, the owner host; doctor's information case, this host's own superseded pre-upgrade writes, does not hold the mirror), then restart their serve, sync and worker processes. A gated mirror resumes by itself once the older writes are 7 days old; never delete a recovery record or its staging file | brain host | none | `gbrain sources writer status --source <source> --json` shows no parked or retrying mirror |
+| The dream cycle's purge phase fails every night with `managed_purge_failed` (`42P01`, relation `query_cache` does not exist), or doctor `schema_missing_tables` warns | upgrade (#6911: the purge skips a missing rebuildable cache), then preview recreating it: `gbrain repair missing-tables` ([missing tables](repair.md#missing-tables)); apply the printed `--apply --expect <hash>` command. Pages parked by the earlier failures: `gbrain pages purge-deleted --retry-parked --dry-run`, then without `--dry-run` | agent, after the user agrees | `destructive` (the parked-page retry purges them) | `gbrain doctor --only schema_missing_tables --json` reports ok |
 | A managed source's autopilot freshness `sync` jobs each land about one page, or `sources status` says `parked` while a sync job runs | upgrade (#6706: sync jobs drain to their deadline and count as the source's live drain), then restart `gbrain jobs work` / the supervisor so the worker loads the handler; a job result with `incomplete: true` names its follow-up (`continuation_job_id`) or the next step in `next` | agent | none | `gbrain sync status --source <id> --json` shows `live_job_id` or a cursor at `done`; `gbrain jobs get <id> --json` shows `outcome` |
+| A classic `gbrain sync` with pull returns `partial` / `pull_failed` on every run after the upstream was force-pushed, and doctor `sync_failures` names `upstream_rewritten`, `upstream_unknown` or `upstream_diverged` | follow the check's `fix` ([upstream rewritten](#upstream-rewritten)): `upstream_diverged` runs `gbrain git commit-push --pull --path <checkout>`; `upstream_rewritten` and `upstream_unknown` preview `gbrain sources reset-upstream <id> --expect-local <sha> --expect-upstream <sha> --dry-run`, then run it without `--dry-run`; then `gbrain sync --source <id>` | agent; the reset after the user agrees | `destructive` (the reset; the old history is kept under a backup ref) | `gbrain doctor --only sync_failures --json` no longer names the source |
 | Doctor `sync_freshness` says a source has "no successful sync recorded" or "first sync running" | follow the check's `fix`: `first sync running` (code `sync_first_run_in_progress`, warn) means wait; `no successful sync recorded` (code `sync_no_successful_sync`, fail) names the last attempt and its `reason`: wait for a queued job, inspect holds (`gbrain sync status --source <id> --json`), or retry (`gbrain sync --source <id>`) ([details](#sync-freshness-no-successful-sync)) | agent | none | `gbrain doctor --only sync_freshness --json` |
 | Recall returns conversation facts like "Date said …", "Attendees said …" or "Summary said …" | `gbrain repair conversation-labels` previews them ([conversation labels](repair.md#conversation-labels)); apply the printed command with `--yes` | agent, after the user agrees | `destructive` | `gbrain doctor --only conversation_label_facts --json` is ok |
 | Conversation facts are dated 1970-01-01 | same preview: `gbrain repair conversation-labels` (an undated page's pre-fix facts carry a `segment 1970-01-01` context); add a `date:` to the page frontmatter before re-extracting it | agent, after the user agrees | `destructive` | `gbrain doctor --only conversation_label_facts --json` is ok |
 | `remember` or `put_page` refused `source_changed` "The canonical file contains an uncoordinated local edit" on many pages nobody edited, or doctor `lost_caller_writes` warns | upgrade to v0.60.157.0 or later (a database-only v0.13.1 `validate: false` stamp was read as a file edit, #6429); then `gbrain repair failed-writes --source <id>` previews the refused writes and prints the apply command ([failed writes](repair.md#failed-writes)) | agent; the apply after the user agrees | none to preview | `gbrain doctor --only lost_caller_writes --json` is ok |
 | A write (`add_timeline_entry`, `put_page`, `remember`, any `mutating` tool) refused `invalid_params` "unknown parameter … write operations always reject unknown parameters; nothing was written" | the call named a parameter the tool does not declare (for example `content` instead of `detail`); the `suggestion` names the submitted key and the declared one; resend with the declared name. Reads keep the `mcp.strict_params` warn grace period | agent | none | the resent call returns no `invalid_params` and no `unknown_param` warning |
+| `gbrain config set chat_model` (or `expansion_model`) printed `[config] WARN: … outranks it, so the model in use does not change`, or its `--json` says `effective: false` | the value is stored in the database, but `shadowed_by` names what wins at runtime (never its value): a `models.*` key (`gbrain config unset <that key>`, after asking: it may select other models too), an environment variable (`GBRAIN_MODEL`, `GBRAIN_CHAT_MODEL`, `GBRAIN_EXPANSION_MODEL`: the user removes it from their shell profile or service environment), or the `config.json` pin (`gbrain config unset chat_model --file` removes only the pin) | agent for the config changes, after the user agrees; user for an environment variable | none | `gbrain config get chat_model` reports `source: db plane`, and a repeat `config set … --json` says `effective: true` |
 | Facts extraction or embedding reports `(cause=AIConfigError model_not_found)` or `gbrain models doctor` says `model_not_found` while the key is valid | the provider refused the model, not the key (a 404, or a 403 "project does not have access to model"): the fix text names the config key that selected the model when the gateway knows it ("Selected via models.tier.reasoning. Fix: gbrain config set …"; an env var or config.json pin says what to clear); otherwise check the model id with `gbrain models`, enable the model for the project in the provider console or set another model (`gbrain config set models.facts <provider:model>`) | user (provider console); agent for the config change, after the user agrees | none | `gbrain models doctor` reports the model `ok` |
 | Doctor `links_extraction_lag` or sync says "N page(s) have un-extracted edges" | `gbrain extract --stale --dry-run --json`, then on the host `gbrain extract --stale --catch-up [--source-id <id>]` | user above 120 s, else agent | none | dry run: `actionable: 0` |
+| Doctor `links_extraction_lag` says "N page(s) failed link extraction 3 runs in a row and are held", or `extract --stale` lists failed pages | Read each page's code (`unknown_source`: the page's source row is gone; restore the source or delete the page), fix the cause, then `gbrain extract --stale [--source-id <id>] --retry-held` | agent | none | `gbrain extract --stale --dry-run --json`: `held: 0` |
+| `gbrain apply-migrations --yes` or `gbrain upgrade` stops with `Migration <N> … exhausted retries` / SQLSTATE 57014 and the schema stays behind (`migrations_pending`, reason `still_behind`) | upgrade first (#7108: long backfills run in committed batches), then follow the error's or doctor `schema_version`'s `fix` ([migration statement timeout](#migration-statement-timeout)) | agent; a longer `--statement-timeout` or ending a session only after the user agrees | none for a rerun | `gbrain doctor --only schema_version --json` |
 | A gbrain call failed with a code you don't recognize | follow `fix.next` ([protocol](../protocol/AGENT_OPERATOR_v1.md)); `gbrain errors <code>` | agent | as the fix's `consent` | the fix's `verify` |
 | A graph read omits a relationship you know existed, or says someone still works somewhere they left | the default read returns relationships true today: repeat with `status: "all"` or `as_of`; to record an end, add a dated timeline line (`Ended works_at [[companies/x]]`) or `add_link ... valid_until` ([temporal edges](temporal-edges.md)) | agent | none | `gbrain doctor --only edge_validity --json` |
 | A command exited 3 (`confirmation_required`) | relay `user_message`; run `fix.command` only after the user agrees | agent, after the user agrees | the payload's `effects` | the fix's `verify` |
+| A scheduled job, workspace script or hook finds nothing in the brain (every lookup empty), or its log shows `no_brain` or `GBRAIN_DB_ACCESS no_url`, while the same command works by hand | the job runs without the brain's config: call gbrain through one wrapper that sets `GBRAIN_HOME` and loads the brain's env file, and stop discarding its stderr ([the wrapper](cron-schedule.md#calling-gbrain-unattended)); `gbrain doctor --only cron_gbrain_home --json` names crontab lines that skip it | agent | none | the job's log shows results, and `gbrain engine status --json` run through the wrapper names the expected `db_url_source` |
+| `gbrain sources refresh` refuses `refresh_not_owner` from cron or a script but works by hand | the caller resolves another gbrain home, so it is another host; the refusal names the identity file, `HOME` and `GBRAIN_HOME` it read. Set the owner's `GBRAIN_HOME` in the wrapper (not `HOME`, which also swaps git credentials); never copy or delete a `host.json` | agent | none | `gbrain sources refresh <id> --dry-run` through the wrapper |
+| `gbrain sources refresh` refuses `refresh_diverged` on every run | something commits into the managed checkout outside gbrain, usually a script that writes files and runs `git commit` without pushing. `git log @{upstream}..HEAD` names the commits; move that writer to `gbrain git commit-push -- <paths>`, then publish the stray commits merged with the upstream (`gbrain git commit-push --push-only --keep-checkout --path <checkout>`) and retry, as the [refusal](write-refusals.md#refresh_diverged) says; never force ([scripts and the managed checkout](shared-checkout-git.md#scripts-and-the-managed-checkout)) | agent; reconciling after the user agrees | `destructive` when reconciling drops local commits | `gbrain sources refresh <id> --dry-run` |
+| A `--json` caller fails to parse gbrain's output | something other than gbrain wrote to stdout, usually a wrapper or a hook it runs; send that output to a log file or stderr (gbrain's own notices already go to stderr) | agent | none | the same call piped to `jq .` parses |
+| gbrain calls time out from a script or language runtime but finish by hand, or each search takes several seconds | a cold CLI start takes 3–6 s on a pooled Postgres brain: set caller timeouts of at least 10 s in both the shell and the runtime (a runtime exec timeout can override the shell's), and turn on the [warm CLI socket](cli-socket.md). If warm searches stay slow, measure the round trip to the database; one in another region dominates search time | agent; moving the database after the user agrees | none | `GBRAIN_DEBUG=1 gbrain search <query>` prints a `[cli-socket] warm:` line |
+| After a database change some processes still use the old server, or a URL variable silently keeps its old value | a shell-sourced env file has an unquoted `&` (the assignment ends there), or a process kept the environment it started with. Quote every value, keep Postgres URLs to `?sslmode=require` (driver options as variables, such as `GBRAIN_PREPARE=false`), update every URL variable the tooling reads, restart every gbrain process, and prove the switch from the database side ([switching a database](../../INSTALL_FOR_AGENTS.md#switching-a-database)). Never paste `env` output into a transcript while debugging | agent, after the user agrees | none | a row written after the restart appears on the new server |
+| Doctor `parked_effects` lists `git_target_ignored` effects | a `.gitignore` rule excludes those pages' files, so their Git effects cannot commit. The user decides: un-ignore (narrow the rule, commit it, then `gbrain sources writer retry-effects <source> --parked-code git_target_ignored`) or keep the pages database-only and leave the effects parked ([gitignored paths](shared-checkout-git.md#scripts-and-the-managed-checkout)) | agent, after the user decides | none | `gbrain sources writer status --source <id> --json` |
+| Sync and the maintenance cycle re-read a whole source on every run after its Git history was rewritten (force-push, `git filter-repo`) | the recorded base commit no longer exists. Move the checkout onto the new history ([upstream rewritten](#upstream-rewritten)); before the next rewrite, run `gbrain sources set-sync <id> off` and `gbrain sources mirror-readonly <id>` first | agent; the reset after the user agrees | `destructive` (the reset keeps a backup ref) | `gbrain doctor --only sync_failures --json` |
 | [Database unreachable or `GBRAIN_DB_ACCESS <reason>`](#database-unreachable) | `gbrain engine status --probe`, then `gbrain db-repair` (diagnose); `gbrain db-repair --yes` applies safe fixes | agent; `--yes` after the user agrees | none to diagnose; `--apply-rewrites` rewrites the config URL (undoable) | `gbrain engine status --probe --json` |
 | [PGLite `RuntimeError: Aborted()` at startup](#pglite-aborted) | automatic repair on the next command; else `gbrain pglite-repair --dry-run`, then `gbrain pglite-repair --yes` | agent; `--yes` after the user agrees | `destructive` (a WAL backup is kept and the restore command printed) | `gbrain doctor --only connection --json` |
 | [`expected N dimensions, not M` on import](#embedding-dimensions) | `gbrain doctor` prints the exact `gbrain config set …` or `gbrain migrate embeddings --to <provider:model>` command | agent, after the user agrees | `migrate embeddings`: `paid`, needs the brain's writer lock | `gbrain doctor --only embeddings,embedding_width_consistency --json` |
@@ -45,22 +59,25 @@
 | [Doctor warns `two_consumers_on_host`](#two-consumers-on-host) | `gbrain sources writer status --json` lists the consumers alive on this host (`host.consumers`: pid, kind, mode, age); let the shorter-lived one finish (a `gbrain sync` run ends on its own) or restart it so it defers to the resident one | agent; a restart after the user agrees | none to inspect | `gbrain doctor --only two_consumers_on_host --json` |
 | [Doctor warns `consumers_without_heartbeat`](#consumers-without-heartbeat) | upgrade and restart the process whose pid and kind the check names (it predates the heartbeat table and never defers) | brain host, after the user agrees | `persistent_install` when it rewrites services | `gbrain doctor --only consumers_without_heartbeat --json` |
 | [Doctor warns `serve_build_drift`: serve is running an older build than this checkout](#serve-build-drift) | restart serve with the command the check prints (`systemctl --user restart gbrain-serve.service`, `launchctl kickstart -k gui/<uid>/com.gbrain.serve`, or stop the named pid and start it again), then restart each other listed worker | brain host, after the user agrees | none | `gbrain doctor --only serve_build_drift --json` is ok |
+| [Doctor fails `runtime_build_skew`: serve, the jobs supervisor, workers and job children run different builds](#runtime-build-skew) | `gbrain upgrade --restart-only` restarts every listed process onto the installed build and verifies one build runs; it refuses with the exact step for a process it cannot restart (the check also prints the manual restart) | brain host, after the user agrees | none | `gbrain doctor --only runtime_build_skew --json` is ok |
 | [Doctor warns `host_identity_mismatch`, or maintenance jobs report `owner_unavailable` / `host_mismatch` for weeks](#host-identity-mismatch) | set `GBRAIN_HOME` on that process's supervisor to the value the check prints (the owner's home; config appends `.gbrain` itself) and restart it; never edit or delete a `host.json` | brain host, after the user agrees | `persistent_install` when it rewrites a service definition | `gbrain doctor --only host_identity_mismatch --json` |
 | [`fence_repair` or chronicle refused `owner_unavailable`, reason `host_mismatch`](#owner-unavailable) | `gbrain sources writer status --source <id> --json` on the brain host (the owner host id); run the step there, or give the worker and the shell one `GBRAIN_HOME`. Never copy or regenerate `host.json`. Do not retry from the same host | brain host | none | `gbrain sources writer status --source <id> --json` shows this host's id as the owner |
 | [`owner_unavailable`, reason `transfer_in_progress` or `clone_in_progress`](#owner-unavailable) | wait 30 s and retry the same step; the worktree is draining for a writer transfer or recovering from a topology clone | agent | none | `gbrain sources writer status --source <id> --json` shows state `active` |
 | [A page write refused `owner_unavailable`, detail `unbound_source`, on a classic Postgres brain](write-refusals.md#unbound-sources-on-postgres) | don't retry; write the page as `<slug>.md` in the source's checkout, commit it, and run `gbrain sync --source <id>` (a remote agent gives those steps to the user); database-only pages or managed mode are the user's choice | agent, after the user agrees (remote: user) | none | `gbrain get <slug> --source <id>` |
 | [`owner_unavailable`, reason `binding_missing`, `incarnation_changed`, `local_path_missing` or `coordination_path_missing`](#owner-unavailable) | `gbrain sources writer status --source <id> --json`; the registration is missing or outdated and re-binding or re-registering the checkout is the host administrator's decision | brain host | none | the same status read shows an active binding for this host |
 | Background work (autopilot, jobs, connector syncs) refused `owner_unavailable` "Background writes to source <id> are paused: its canonical owner could not be verified" or "its worktree is recovering" | run the fix, `gbrain sources writer status --source <id> --json`, which names what the source waits on; a deleted owner marker (`.gbrain-owner.json`) is repaired by a writer self-transfer, the user's decision. Nothing was submitted and no request id was used; interactive writes are unaffected | agent; the self-transfer after the user agrees | none to inspect | the same status read shows an active binding; the next background run admits |
-| Doctor warns `purge_parked_pages` | fix the cause each page's last error names, preview `gbrain pages purge-deleted --retry-parked --dry-run --json`, then with the user's agreement run `gbrain pages purge-deleted --retry-parked --yes` | agent, after the user agrees | `destructive` | `gbrain doctor --only purge_parked_pages --json` |
+| Doctor warns `purge_parked_pages` | a park an older gbrain wrote is retried once by the next purge run after an upgrade and is not counted; for the rest, fix the cause each page's last error names, preview `gbrain pages purge-deleted --retry-parked --dry-run --json`, then with the user's agreement run `gbrain pages purge-deleted --retry-parked --yes` | agent, after the user agrees | `destructive` | `gbrain doctor --only purge_parked_pages --json` |
 | [`gbrain repair fences` skipped a file `sync_in_progress` while a sync runs](repair.md#fence-repair-during-a-sync) | nothing: a write in flight or the running sync's frozen manifest still names that file; every other candidate repairs now and the next run picks this one up (`gbrain sync --source <id> --no-pull` finishes the sync) | agent | none | `gbrain doctor --only fence_integrity --json` |
 | [A Google or GitHub item is held (`connector_held_items`)](#held-connector-items) | `gbrain sources status <id>`, fix the cause, then `gbrain sources retry-held <id>` and `gbrain sync --source <id>` | agent, after the user agrees | `egress` (fetches from the provider again) | `gbrain doctor --only connector_held_items --json` |
 | `gbrain google status` exits 1 naming `calendar_unreadable`, doctor warns `google_calendar_readable`, or the sync log prints `[google] calendar_unreadable` (calendar pages stop arriving) | `gbrain google calendars --account <email>` lists the calendars the account can read; then `gbrain sources set-calendar <source> <calendar-id>` and `gbrain sync --source <source>` ([unreadable calendar](google-connect.md#unreadable-calendar)) | agent, after the user agrees which calendar | none (on a managed brain whose source also syncs Gmail or Contacts, the change re-reads their history: `confirmation_required`, re-run with `--yes` after the user agrees) | `gbrain doctor --only google_calendar_readable --json` is ok |
+| `gbrain google setup` stops with `api_access_blocked`, `gbrain google status` exits 1 listing `api_access.problems`, or doctor warns `google_api_access` (a Google API disabled for the OAuth project, or a scope not granted) | enable each API at the link the report names (the Google Cloud project is in the report), or `gbrain google connect --reauth <email>` for a missing scope; then `gbrain sync --source <source>` ([API access](google-connect.md#api-access)) | user (only the project owner can enable an API) | none | `gbrain google status --json` shows no `api_access.problems` |
 | `gbrain waiting` lists bank, payment or shipping alerts as people waiting on you | upgrade (#5012: mail with `Precedence: bulk/list/junk`, a `List-Id` or a no-reply `Reply-To` opens no reply-owed loop); for loops opened before the upgrade, `gbrain waiting` prints `gbrain loops drop sender <email> --source <id> --dry-run` per sender; preview, then run it without `--dry-run` (cannot be undone), or `gbrain loops mute sender <email>` for a reversible stop ([open loops](open-loops.md#the-surfaces)) | agent, after the user agrees | none to preview | `gbrain waiting --json` no longer lists the sender |
 | [`gbrain migrate --to` refused with `writer_coordinator_required`](../ENGINES.md#engine-migration-refused) | follow the refusal's `fix`: relay its `user_message` (stay on PGLite and share with `gbrain mcp expose`, or leave the brain as it is) | agent, after the user agrees | `persistent_install`, `egress` (for `gbrain mcp expose`) | `gbrain doctor --no-migrate --json` |
 | [A write was refused with a named reason](#write-refused) | the reason's recovery in [write refusal reasons](write-refusals.md) | as the refusal's `fix` | as the refusal's `fix` | the refusal's `verify` |
 | [`gbrain sync` refused `managed_sync_flag_refused`](write-refusals.md#managed_sync_flag_refused) | rerun the same command without the flag `detail` names (`--skip-failed` or `--include-gitignored`); fix a failed file and rerun the plain sync (`--retry-failed` is a deprecated alias), or commit an ignored file | agent | none | `gbrain sources status --json` |
 | [Sync with the deprecated `--retry-failed` alias says failures "belong to a run with different sync options"](#retry-other-options) | run the command printed on each line: `resumable (replay …)` or `resumable (fresh discovery …)` reruns under the failed run's options, `safely orphaned` previews `gbrain repair managed-sync-orphans --source <id>` (apply with its hash), `unresolved` names what has to finish first | agent; the repair apply after the user agrees | the repair retires bookkeeping rows only | `gbrain sync status --source <id> --json` |
 | [Managed sync blocked with `checkpoint_validation_timeout`](#checkpoint-validation-timeout) | `gbrain repair request-indexes --apply` when an index is missing or INVALID, then the printed `gbrain sync --source <id> --no-pull …` | brain host | none | `gbrain doctor --only persistence_request_indexes --json` |
+| Writes fail with `connection_inherited_read_only` (SQLSTATE 25006) | [reset the pooler's server connections, stop session-level `SET`, check role defaults](write-refusals.md#connection_inherited_read_only) | brain host | none | `gbrain doctor --json` |
 | [Doctor warns `persistence_session_timeouts` (`session_timeouts_not_applied`)](#session-timeouts-not-applied) | `ALTER ROLE <gbrain role> SET statement_timeout = '5min'` on the database, or accept it: preparation reads carry their own bound | brain host | none (a role default; `destructive` only in that it changes a server setting) | `gbrain doctor --only persistence_session_timeouts --json` |
 | `gbrain init` or `gbrain upgrade` stops with `schema_lock_blocked` naming a pid (or, before #5227, sat in `wait_event_type=Lock` with no output) | let the named session finish, or with the user's agreement end it on the database host: `SELECT pg_terminate_backend(<pid>)`; then rerun the same command ([ENGINES.md](../ENGINES.md#schema-lock-blocked)) | brain host, after the user agrees | `destructive` when it ends another session | the rerun completes; `gbrain doctor --json` shows the schema at head |
 | [`queue_capacity`, `persistence_capacity` or `persistence_request_growth`](#write-capacity) | run the printed `gbrain config set persistence.limits.<limit> <value>` | brain host | none | `gbrain doctor --only persistence_capacity,persistence_request_growth --json` |
@@ -116,9 +133,11 @@ Turning the `preparation_deadlines` switch off (`gbrain config set persistence.p
 
 <a id="embedding-dimensions"></a>**`gbrain import` fails with `expected N dimensions, not M`?** Run `gbrain doctor`. It will print the exact `gbrain config set ...` or `gbrain migrate embeddings` command to repair the mismatch (`migrate embeddings` re-embeds through the provider: effect `paid`, ask the user first). You should not need to delete `~/.gbrain`. Fresh `gbrain init --pglite` auto-detects your embedding provider from API keys: set `VOYAGE_API_KEY` (or `OPENAI_API_KEY` / another provider key) in the environment — or in `~/.gbrain/config.json`, which init also reads — before running init, or pass `--embedding-model <provider>:<model>` explicitly. With multiple keys set, init fires an interactive picker (non-TTY auto-picks the Voyage default when its key is present). With no keys at all, init continues keyless (keyword-only search) with a loud notice; add a key later and re-run `gbrain init --force --embedding-model voyage:voyage-4` to enable embeddings (effects: `credentials` and `paid`, since every page is embedded through the provider; it needs the brain's writer lock, so stop a running `gbrain serve` first; pages and facts are kept), or pass `--no-embedding` up front to make keyless explicit. `gbrain config get embedding_disabled` reports whether embedding is off and which plane says so (the config file and the database setting; `true` on either turns it off); `gbrain config set embedding_disabled true|false` and `gbrain config unset embedding_disabled` change both, and the `init --force --embedding-model` enable path clears both. See [`docs/integrations/embedding-providers.md`](../integrations/embedding-providers.md) for the full provider matrix and [`docs/operations/headless-install.md`](../operations/headless-install.md) for Docker/CI sequencing.
 
-**`gbrain doctor` warns `default_source_local_path`?** Your `default` source has no `local_path` AND that null pointer is provably breaking write-through (the repo fallback is another source's own working tree, or file-backed default pages have no resolvable root). A null `local_path` on its own is the designed fallback topology and reports ok. The repair is a pointer update, never a file move: `gbrain sources set-path default <path>` prints the prior value before changing it and refuses a path that nests inside or swallows another source's tree (exit 6; `--force` bypasses). **Say to your agent:** *"Run a brain health check and fix what you find"* — the maintain skill runs `gbrain doctor` and applies the printed repair.
+<a id="embed-backfill-skipped"></a>**A sync job or `embed-backfill` job reports `embed_backfill_skipped` (reason `embedding_disabled`)?** Nothing is wrong: the brain is keyless by choice (`embedding_disabled`), so sync queues no embed-backfill and a backfill already queued ends on its first attempt without reading a page. Search stays keyword-only. The notice appears once per brain state (the first skip after the brain became keyless); its fix is the optional step that turns embedding on and names the provider key it needs (effects `credentials` and `paid`: ask the user first).
 
-**A Gmail, Calendar or GitHub connector source still has an old `local_path`?** Connector sources sync from their provider, so autopilot ignores their `local_path`: once a connector has synced (or tried to) at least once, autopilot syncs it on every interval and runs its database phases with no checkout. A connector that has never synced stays idle until you run `gbrain sync --source <id>` once; autopilot prints that command the first time it skips one. To remove the stale pointer, run `gbrain sources set-path <id> --clear` (connector sources only; it refuses a filesystem source and a connector bound to a canonical owner). `config.syncEnabled=false` still opts a source out. **Say to your agent:** *"My Gmail source points at an old folder. Clear it and keep it syncing."*
+**`gbrain doctor` warns `default_source_local_path`?** Your `default` source has no `local_path` AND that null pointer is provably breaking write-through (the repo fallback is another source's own working tree, or file-backed default pages have no resolvable root). A null `local_path` on its own is the designed fallback topology and reports ok. The repair is a pointer update, never a file move: `gbrain sources set-path default <path>` prints the prior value before changing it and refuses a path that nests inside or swallows another source's tree (exit 6; `--force` bypasses). The check also warns when any source's `local_path` is a relative path such as `.`, or when a `default` source with no path falls back to a relative `sync.repo_path`, because sync refuses those (`sync_anchor_relative`); see [relative source path](#relative-source-path). **Say to your agent:** *"Run a brain health check and fix what you find"* — the maintain skill runs `gbrain doctor` and applies the printed repair.
+
+**A Gmail, Calendar or GitHub connector source still has an old `local_path`?** Connector sources sync from their provider, so autopilot ignores their `local_path`: once a connector has synced (or tried to) at least once, autopilot syncs it on every interval and runs its database phases with no checkout. A connector that has never synced stays idle until you run `gbrain sync --source <id>` once; autopilot prints that command the first time it skips one. To remove the stale pointer, run `gbrain sources set-path <id> --clear` (connector sources, or any source whose `local_path` is relative; it refuses a filesystem source with an absolute path and any source bound to a canonical owner). `config.syncEnabled=false` still opts a source out. **Say to your agent:** *"My Gmail source points at an old folder. Clear it and keep it syncing."*
 
 <a id="write-refused"></a>**A save, sync or background effect was refused with a named reason?** Reasons such as `file_database_drift`, `ambiguous_source_path`, `physical_root_device_changed`, `cursor_processing_options_conflict`, `take_row_collision`, `invalid_source_uri`, `queue_capacity` and parked effects (`targets_parked`, doctor `parked_effects`) each come with a recovery step in the error's `suggestion`. [Write refusal reasons](write-refusals.md) explains each one and its recovery. **Say to your agent:** *"My save was refused. Explain the reason and show me the fix before you run it."*
 
@@ -148,7 +167,7 @@ Turning the `preparation_deadlines` switch off (`gbrain config set persistence.p
 
 <a id="session-timeouts-not-applied"></a>**Doctor warns `persistence_session_timeouts` with `session_timeouts_not_applied`?** gbrain sets `statement_timeout` (`GBRAIN_STATEMENT_TIMEOUT`, default 5min) and `idle_in_transaction_session_timeout` as connection startup parameters, and a transaction-mode pooler (PgBouncer with `ignore_startup_parameters`, Supavisor) drops them: `SHOW statement_timeout` through the configured URL reads `0`, so a statement outside a transaction has no server-side bound and a relation lock held in another session (a migration's `ALTER TABLE pages` queued behind a long transaction, for example) holds it for as long as the lock lasts. Managed write *preparation* reads are not affected since v0.60.108: they run under a transaction-local `statement_timeout` of the write's remaining preparation budget, so a lock-blocked read ends at the budget and the member is released `preparation_deadline` with no statement left on the server (#6278). For every other autocommit statement, set the default on the role instead of the connection: `ALTER ROLE <gbrain role> SET statement_timeout = '5min'` (read-only to check: `gbrain doctor --only persistence_session_timeouts --json`). Setting `GBRAIN_STATEMENT_TIMEOUT` has no effect through such a pooler.
 
-<a id="managed-sync-blocked"></a>**A managed sync run is blocked (doctor `managed_sync_blocked`, a freshness `sync` job ended `dead`, or get_brain_health reports `sync_blocked`)?** The source's unfinished run stopped on a page request that did not commit and recorded the stop, so it resumes nothing by itself while the other sources keep syncing (#6858: one source stopped for 21 hours while every freshness job reported `completed`). Such a job now ends `dead`: its error names the stop and the run's `next` command, and `gbrain jobs get <id> --json` carries `outcome`, `drain` and `next` in its progress. Doctor warns as soon as a run is blocked and fails once it has been blocked for more than an hour; get_brain_health turns to `attention` past the same hour, with a count band and no source names. Run `gbrain sync status --source <id> --json` (read-only): it names the page, its fault class and its exit. Clear the cause it names and run the step it prints; the next freshness job resumes the run once the cause is gone. A page publication that `gbrain repair stuck-recovery --keep disk` abandoned is not a blocker: the next plain sync retries that page after the rest of its run, imports it when the kept file is committed, and holds it `worktree_dirty` otherwise.
+<a id="managed-sync-blocked"></a>**A managed sync run is blocked (doctor `managed_sync_blocked`, a freshness `sync` job ended `dead`, or get_brain_health reports `sync_blocked`)?** The source's unfinished run stopped on a page request that did not commit and recorded the stop, so it resumes nothing by itself while the other sources keep syncing (#6858: one source stopped for 21 hours while every freshness job reported `completed`). Such a job now ends `dead`: its error names the stop and the run's `next` command, and `gbrain jobs get <id> --json` carries `outcome`, `drain` and `next` in its progress. Doctor warns as soon as a run is blocked and fails once it has been blocked for more than an hour; get_brain_health turns to `attention` past the same hour, with a count band and no source names. A sync pass that stopped before it finished (in discovery, path `<discovery>`, or on one file) counts as blocked too, until a later sync of the source succeeds. So does an open pass whose process was killed or crashed with no process left holding its drain lease (code `pass_interrupted`, aged from the pass row's last write), and passes that keep stopping that way (`pass_abandoned`). Run `gbrain sync status --source <id> --json` (read-only): it names the page, its fault class and its exit. Clear the cause it names and run the step it prints; the next freshness job resumes the run once the cause is gone. A page publication that `gbrain repair stuck-recovery --keep disk` abandoned is not a blocker: the next plain sync retries that page after the rest of its run, imports it when the kept file is committed, and holds it `worktree_dirty` otherwise.
 
 <a id="managed-sync-not-moving"></a>**The catch-up is parked (`sources status --json` says `data_moving: false`, doctor warns `managed_sync_not_moving`, `gbrain sources writer movement` exited 1), or the drain stopped `drain_stalled` with `cause: owner_wedged_here`?** Liveness is not movement: `/health` can be ok, the pid alive and `sync_running: true` while no page has committed for weeks. A managed source is *not moving* when an unfinished `managed-sync` cursor has had neither a committed `managed_sync_*` receipt nor a head step advance for longer than `persistence.preparation_ceiling_ms` (600 s) while a drain or a full consumer is live on the owner host; with nothing live it is `movement_state: parked` (a cursor left between cron runs; informational, not scored). A parked cursor whose write queue still holds admitted requests while no consumer runs and nothing has moved for longer than that ceiling is stranded: nothing will ever drain it, so doctor `managed_sync_not_moving` fails (#6552, #6712 PR 2) and its fix is the resume sync with the cursor's stored options (`gbrain sync --source <id> …`), which consumes the queue itself; `details.stranded` counts such sources. When the sync backlog itself cannot be read, every surface says `movement_state: unknown` (`unknown.reason: backlog_read_failed`) instead of `nothing_pending`: doctor warns with `details.health: unknown`, `sources status` prints a `movement UNKNOWN` line, and `gbrain sources writer movement` exits 1 with code `movement_unknown` (`--warn-only` exits 0); rerun the movement command, and run `gbrain doctor --json` if the read keeps failing. Every surface routes to the same two read-only calls, so the agent reaches the owner, the step and the next action without SQL:
 
@@ -163,6 +182,8 @@ A `drain_stalled` stop with `cause: owner_wedged_here` is the same situation see
 <a id="consumers-without-heartbeat"></a>**Doctor warns `consumers_without_heartbeat`?** A running claim on this host is stamped by a process (`claim_phase.owner`: kind, pid, gbrain version) that has no `persistence_consumers` row. Every full consumer on this release renews its row every 10 s, so an owner without one runs a gbrain release from before the heartbeat table: it never defers to the resident consumer and the host runs two full consumers until it is upgraded. The check names the pid, kind and version from the stamp; upgrade and restart that process (after the user agrees). A new sync CLI beside an older `serve` says so on its start line (`owner row missing: older serve or no serve; running own consumer`).
 
 <a id="serve-build-drift"></a>**Doctor warns `serve_build_drift` ("serve is running an older build than this checkout; restart serve and workers")?** Upgrading or pulling the checkout does not restart the processes already running from it. Every live consumer on this host writes its gbrain version into its `persistence_consumers` heartbeat row, and the check compares the live `serve`, `sync`, `jobs`, `autopilot` and `mcp` rows with this binary's version in one read. Until they restart, one-shot commands from the checkout (`gbrain sync`, `bun run src/cli.ts …`) run newer code against an older consumer. The check prints the restart for the serve: `systemctl --user restart gbrain-serve.service` or `launchctl kickstart -k gui/<uid>/com.gbrain.serve` when that service is installed, otherwise the pid to stop and start again the way it was launched. Restart each other listed process (the jobs worker, autopilot) the same way, after the user agrees; nothing restarts automatically. A serve older than the heartbeat table writes no row, so this check reads ok beside it and [`consumers_without_heartbeat`](#consumers-without-heartbeat) names it once it holds claims. A serve newer than this checkout is reported, not warned: upgrade the checkout before running one-shot commands from it. Verify with `gbrain doctor --only serve_build_drift --json`; on PGLite there is one process and the check reads ok.
+
+<a id="runtime-build-skew"></a>**Doctor fails `runtime_build_skew` (several gbrain builds are running on this host)?** Run `gbrain upgrade --restart-only` after the user agrees: it restarts every gbrain process on this host onto the installed build and verifies one build runs and the warm CLI socket accepts it ([restart](upgrades-auto-update.md#restart)); `--dry-run --json` previews it. Each long-running process keeps the build it loaded when it started, but `gbrain jobs run-child` starts a fresh process from the install on disk for every job, so after a checkout reset, a pull or an upgrade on disk one host can run serve, the supervisor and its workers, and their job children on different builds. The check reads each process's own record: serve and the other resident consumers from their heartbeat rows (Postgres), the supervisor from its PID file, each `gbrain jobs work` from its worker-registry entry, and the job children from the `job_build_skew:` line a child writes into a job's history (`gbrain jobs get <id>`) when its build differs from its worker's. It fails when the running builds differ, warns when only a process's install holds another build, and lists every process with its pid and version (never a path). By hand, the message names one restart, serve first, then the supervisor, then a worker: restart serve with its service command, stop the supervisor with `gbrain jobs supervisor stop` and start it again with `gbrain jobs supervisor start --detach`, or stop a worker's pid (SIGTERM drains its jobs, and its supervisor starts a fresh one). A job child whose worker needs a readiness protocol or feature the child lacks refuses the job: the job is released without counting an attempt and the worker stops on a configuration block until it is restarted on one build. A process started before builds were recorded is named as unrecorded; restarting it makes it report one. `/health` on `gbrain serve --http` carries `build` (`version`, `installed_version`, `restart_pending`) on every 200. Verify with `gbrain doctor --only runtime_build_skew --json`.
 
 <a id="host-identity-mismatch"></a>**Doctor warns `host_identity_mismatch`, or fence repair, chronicle and other maintenance jobs have reported `owner_unavailable` with reason `host_mismatch` for days?** Host identity is a file, `host.json` under the persistence home (`GBRAIN_HOME`, else `$HOME/.gbrain`). A job worker or container launched with a different `HOME` or without `GBRAIN_HOME` mints a new identity after every restart and sees the binding as another host's, so its writes never reach the owner while every health signal stays green. Doctor flags it when this process's identity differs from the binding owner's and the owner's checkout resolves on this filesystem (same machine id or volume), or, for a container without a stable machine id, when the checkout is present at the binding's path and this `host.json` was minted after the binding under a different `HOME`/`GBRAIN_HOME`. The check names both files, the environment each was minted under (`minted_under: {home, gbrain_home, hostname, machine_id}`; `unknown` for a file minted before it was recorded) and the one-line fix: set `GBRAIN_HOME` on that process's supervisor to the owner's home (the printed value; config appends `.gbrain` itself) and restart it. Nothing re-derives or rewrites an existing `host.json`: re-owning the binding would break every other host sharing the brain. Verify with `gbrain doctor --only host_identity_mismatch --json`.
 
@@ -219,7 +240,7 @@ Two calls, no SQL: the doctor or `sources status` row names the command, and `wr
 <a id="terminal-write-failures"></a>**Doctor warns `persistence_terminal_failures`, or `gbrain sync status` reports terminal write failures?** Every write leaves a receipt, and a receipt that ended `failed`, `conflict` or `cancelled` stays in `persistence_requests` until compaction. gbrain reads them at query time and sorts each one into a category with a class, safe actions, whether a person decides, and a structured fix (nothing new is stored). Most rows need no action, so the check separates three things:
 
 - **Active blockers** hold work now: a receipt still holding a publication recovery record (it blocks every queued write on its root), or a receipt that blocks a managed sync's checkpoint. Doctor warns whenever one exists, whatever the trend, and its `fix.command` is the next step (for a recovery record, `gbrain sync --source <id> --no-pull`, which runs the owner pass that clears it; a `recovery_blocked` record names the file to inspect instead).
-- **Unresolved rows** are terminal receipts in the window (`persistence.terminal_failures.window_days`, default 7, never longer than `persistence.receipt_retention_days`) that no later write superseded. Doctor warns when any of them is a gbrain-defect class (`owner_exception`, `database_refusal`, `writer_guard`, `outside_fence`, `gbrain_defect`): report those with the receipt ids. The rest are ordinary refusals the caller already received (`caller_conflict`, `caller_refusal`, `operator_cancelled`) or sync faults a rerun retries.
+- **Unresolved rows** are terminal receipts in the window (`persistence.terminal_failures.window_days`, default 7, never longer than `persistence.receipt_retention_days`) that no later write superseded. Doctor warns when any of them is a gbrain-defect class (`owner_exception`, `database_refusal`, `writer_guard`, `outside_fence`, `gbrain_defect`): report those with the receipt ids. The rest are ordinary refusals the caller already received (`caller_conflict`, `caller_refusal`, `operator_cancelled`) or sync faults a rerun retries. A `schema_missing` row (#6904) is a write that met a missing table or column: when the schema is behind, its fix is `gbrain apply-migrations --yes` as the database role that owns the gbrain tables, then resubmit; at head, it asks the user and points at doctor's `schema_missing_tables` check and the `gbrain repair missing-tables` preview.
 - **Historical rows** do not block: a later write superseded them (`superseded`, `already_written`, `duplicate`), or they came from a build older than the release that fixed their cause (sync knock-on cancels before 0.60.216.0, the `Publication failed (P0001)` refusal before 0.60.40.0). Doctor counts them and never warns on them.
 
 A spike warns only on its own: when at least `persistence.terminal_failures.spike_min` (default 25) receipts ended in the last 24 h and that is more than `persistence.terminal_failures.spike_factor` (default 3) times the median of the 7 days before. When most of those receipts were written by a gbrain build older than the release that fixed their class, the warning says an older write owner is still producing them and names the build; its fix is the read-only `gbrain sources writer status --source <id> --json` that names the owner, so upgrade or restart that process. A `file_database_drift` row is the page-drift class: [file drift](repair.md#file-drift) resolves it with `gbrain repair file-drift`. A read that does not finish within its deadline (5 s per statement, 2 s to get a connection) reports `unknown`, never a clean pile; rerun it.
@@ -227,7 +248,7 @@ A spike warns only on its own: when at least `persistence.terminal_failures.spik
 ```bash
 gbrain doctor --only persistence_terminal_failures --json      # blockers, unresolved, historical, the fix
 gbrain sync status --source <id>                               # the same summary for one source, with BLOCKING lines
-gbrain sources writer failures <id> --group-by category        # groups on code + origin + category, each with its drill-down
+gbrain sources writer failures <id> --group-by category        # groups on code + origin + category (+ operation for a sync_fault), each with its drill-down
 gbrain sources writer failures <id> --category owner_exception --code storage_error --origin owner_exception --json
 gbrain write-request <request> --json                          # one receipt: write_error_reason, suggestion, diagnosis.fix
 ```
@@ -247,7 +268,7 @@ Refused writes a caller never saw land (`lost_caller_writes`) have their own rep
 | `reason` | What it means | Next |
 |---|---|---|
 | `host_mismatch` | Another host id owns the checkout. The message prints both ids' first 8 characters and, to a local caller, the `host.json` this process read (`<GBRAIN_HOME>/.gbrain/persistence/host.json`). A maintenance worker (launchd, cron, autopilot) started with a different `GBRAIN_HOME` or user than the shell that ran the sync reads a different identity file and is, to the brain, a different host. `retryable: false`: a retry from the same environment cannot change the answer. | Run the step on the owner host writer status names, or make both environments use one `GBRAIN_HOME`. Never copy or regenerate `host.json`: a new identity orphans the ownership and pending writes recorded for the old one. |
-| `transfer_in_progress` | The worktree is `draining`: a writer transfer was prepared and not yet accepted or cancelled. | `fix.next` is `wait`: retry after 30 s; the status read shows the state. |
+| `transfer_in_progress` | The worktree is `draining`: a writer transfer was prepared and not yet accepted or cancelled. | `fix.next` is `wait`: retry after 30 s; the status read shows the state. A transfer prepared more than 30 minutes ago never ends on its own, so its refusal reads `ask_user` and names both exits: `gbrain sources writer transfer accept` on the successor, or `gbrain sources writer transfer cancel <source> --expected-epoch <n>` on the owner host (`--dry-run` previews; the worktree returns to active at the same epoch and the prepared manifest is cleared). A drain an older release prepared records no time and keeps the wait, whose `why` names the cancel. |
 | `clone_in_progress` | The worktree is `recovering`: a topology clone or reclone is in progress. | `wait`: retry after 30 s; it is `active` when the clone finishes. |
 | `binding_missing` | The source has no canonical worktree binding at all. | Claiming a checkout is the host administrator's decision. |
 | `incarnation_changed` | The binding belongs to an earlier incarnation of the source (removed and re-added, or restored). | Re-bind the checkout on the brain host. |
@@ -376,9 +397,8 @@ runs its phases in-process rather than spawning a child `gbrain init
 --migrate-only` per phase; a spawned child is what dies on
 Windows + bun + Supabase pooler with a DNS-resolution failure even
 though the parent connects fine, and running in-process removes the
-spawn entirely. The grandfather migration runs as a chunked bulk SQL
-pass (keyed on the page PK, soft-delete-filtered, source-safe) and
-completes in seconds on an 80K-page PGLite brain.
+spawn entirely. The v0.13.1 grandfather migration writes nothing since #7814: it
+records completion and leaves every page as it was.
 
 <a id="ghost-pages"></a>**A write refuses `source_changed` with "The canonical file was removed outside coordinated publication." (`canonical_file_missing`), or doctor `ghost_pages` warns?** The page is a ghost: its canonical file is gone on the owner host but the database page is live, so every write refuses and no sync can import a file that is not there. On the owner host, list them with `gbrain pages ghosts --source <id>` (read-only). For each, the user decides: to keep the page, restore its file at the recorded path (from Git or a backup; gbrain has no automated file restore) and run `gbrain sync --source <id>`; to remove it, preview `gbrain repair ghost-pages --source <id>`, show the user the list, and after they agree run the printed `--apply --expect <hash> --yes`. Removed pages are purged after 72 h; `gbrain restore <slug> --force` undoes one until then. Off the owner host it refuses `not_owner_host`; on an unreadable checkout `ghost_storage_unknown`; when ghosts are more than half of the source's file-backed pages `ghost_mass_delete_refused` (check the checkout first). See [ghost pages](repair.md#ghost-pages). **Say to your agent:** *"Which pages lost their files? Show me the list before you remove anything."*
 
@@ -406,7 +426,7 @@ derived from the rows against the active embedding column (no stored status):
 | `quarantined` | The content-quality gate hid the page as junk; it has no searchable chunks. Doctor `quarantined_pages` owns its warning. | Review with `gbrain quarantine list --json`; clear a false positive with `gbrain quarantine clear <slug> --source-id <id> --force` (the owner's call). |
 | `empty` | A live page with no body text: nothing to index. | Write content to it, or delete the stub (`gbrain delete <slug> --source <id> --force`, restorable) after the user agrees. |
 | `deleted_page_chunks` | Chunks of a soft-deleted page. Search never reads them; the purge lifecycle removes them after 72 h (info until then, a warning past it, code `deleted_page_chunks_overdue`). | `gbrain pages purge-deleted --dry-run --json`, then `gbrain pages purge-deleted --yes` once the user agrees (brain-wide, irreversible). |
-| `chunkless_healable` | A live page with body text but no chunk rows (written without the chunking step). Doctor warns on a keyed brain (code `chunkless_pages_healable`). | `gbrain embed --stale --catch-up --source <id> --yes` chunks and embeds it (paid). |
+| `chunkless_healable` | A live page with body text but no chunk rows (written without the chunking step, or an `embed_skip` page an older gbrain stored without chunks or whose `reindex --oversized` rewrite failed). Keyword search cannot find it. Doctor warns on a keyed brain (code `chunkless_pages_healable`). | `gbrain embed --stale --catch-up --source <id> --yes` chunks and embeds it (paid); an `embed_skip` page gets chunks and no vectors. The cycle's embed phase runs the same safety net. |
 
 `unsearchable` sums `pending`, `quarantined`, `empty` and `chunkless_healable`;
 `keyword_only` and `deleted_page_chunks` never count. The doctor's ops tier
@@ -546,6 +566,76 @@ since the previous timeout, last timeout time), never one per search, and
 `details.negative_cache`. Postgres only: PGLite has no keyword statement
 timeout.
 
+## Migration statement timeout
+
+<a id="migration-statement-timeout"></a>
+
+**Symptom.** `gbrain apply-migrations --yes` (or `gbrain upgrade`) prints
+`Migration <N> (<name>) exhausted retries` or `hit statement_timeout (SQLSTATE
+57014)`, exits 1 with `migrations_pending` (reason `still_behind`), and the
+schema stays below head. Doctor's `schema_version` check names the migration.
+
+**Why.** Each migration's SQL runs in one transaction under a 10-minute
+statement budget, which overrides a lower server default (Supabase enforces
+about 2 minutes). A lock wait stops much sooner, at the schema lock timeout
+(`schema_lock_blocked`), so a statement timeout means the migration's own work
+outlasted the budget. Every attempt then rolls back.
+
+**What gbrain does about it.** Before some published migrations, gbrain runs
+their backfill in committed batches of 5,000 rows, using the migration's own
+predicate. An interrupted run keeps every committed batch, and
+`gbrain apply-migrations --yes` continues from the rows still left. The
+published migration then runs unchanged and has little or nothing left to
+write.
+
+| Migration | Done in batches first |
+|---|---|
+| v011 `links_provenance_columns` | `link_source = 'markdown'` on legacy links |
+| v028 `cathedral_ii_chunk_fts_backfill` | chunk keyword vectors |
+| v033 `admin_dashboard_columns_v0_26_3` | request-log agent names. A row with no token resolves to NULL, so the migration still rewrites those rows itself. |
+| v116 `code_edges_source_backfill_and_callee_index` | `source_id` on code edges |
+| v161 `index_pending_text_projections` | its partial pages index, built concurrently under the migration statement budget (Postgres), because the migration caps its own build at 30 seconds |
+| v221 `chunk_embedding_pending_since` | `embedding_pending_since` on chunks without a vector, with the same active-column choice and `embedding_pending_since_backfilled_at` provenance (#7108) |
+
+The other migrations whose work grows with a table are either bounded
+differently or can't be split without editing a published migration:
+
+- v153 rewrites every page row and queues one projection job per live page. It
+  grows with the page count, not the chunk count.
+- v189 scans page bodies for private-key markers. The scan only reads, and it
+  writes only the matching pages.
+- v123's handler rewrites keyword vectors only when the configured keyword
+  language changes. It runs outside the migration transaction.
+- Index builds and constraint validations inside a migration (v011's unique
+  constraint, v174, v226 and similar) are single statements that can't be
+  split. Apart from the build itself, they only read.
+- v160 (ANALYZE samples `pages`), v200 (a partial index on `op_checkpoints`)
+  and v234 (a column on `persistence_host_bindings`) cap themselves at 30
+  seconds. They touch a sample, a small table or only the catalog.
+
+**When it still happens.** gbrain records the timed-out migration (config
+`schema_migration_timeout`, deleted once a run reaches head). Apply-migrations
+and doctor then name it and give the fix for the case:
+
+1. **This release batches a migration that timed out without batching.** Run
+   `gbrain apply-migrations --yes`.
+2. **Idle-in-transaction sessions were open.** They may hold locks on the
+   table. Check them with `gbrain doctor --locks`. With the user's agreement,
+   end the ones that are still open on the database host
+   (`SELECT pg_terminate_backend(<pid>)`), then run
+   `gbrain apply-migrations --yes`.
+3. **No idle session was seen.** A plain rerun fails the same way. With the
+   user's agreement, run it once with a longer budget:
+   `gbrain apply-migrations --yes --statement-timeout 120` (whole minutes;
+   `0` removes the limit). While it runs, the migration holds its table locks,
+   so writes to that table wait. Please also report it, so the migration can be
+   batched.
+
+`--statement-timeout` is operator-only and applies to that run only. It sets
+the budget for migration SQL and for the batches above. It doesn't lift the
+30-second caps that v160, v200 and v234 set on themselves, or the timeouts of
+migration handlers.
+
 ## Global maintenance timeouts
 
 **Doctor warns `global_maintenance_timeouts`, or late maintenance phases
@@ -575,6 +665,83 @@ maintenance job completed (the phase records a partial result). Raise that
 child's timeout with `gbrain config set dream.<phase>.subagent_timeout_ms <ms>`;
 `gbrain dream --phase <phase>` reruns it and spends model tokens, so ask the
 user first. The warning clears once that phase's next child completes.
+
+## Global maintenance stalled
+
+**Doctor reports `global_maintenance_stalled`, or `gbrain autopilot --status`
+exits 1 with a `Global maintenance:` line?** A brain-wide maintenance pass
+stamps `autopilot.last_global_at` only when no phase blocked it. Each blocking
+phase keeps a streak in `autopilot.global_maintenance.progress`, keyed by why
+it blocked: `fail:<code>` (the phase failed), `budget`, `child:<outcome>` or
+`deferred`. After a phase fails with the same code in three passes in a row,
+later passes stamp past it (the job result lists it under
+`pass_completed_with_failing_phase`) and the phase backs off: it is skipped
+for two global intervals, then four, up to a day. A `deferred` streak
+(synthesize triage left transcripts for the next pass) lets a pass stamp past
+it once the deferred count has not shrunk for three passes in a row; while the
+count keeps shrinking, the stamp waits. Budget and child blockers never let a
+pass stamp past them; child failures back off too. A phase that fails with a
+run-scoped code (a missing table, `permission_denied`, `write_quota_exhausted`,
+`recovery_required`) is a `fail:<code>` streak like any other failure, and
+the pass goes on to the next phase. A lost connection or contention stops the
+job and the next job retries that phase first, at most three jobs in a row;
+after that it is the phase's streak and the pass goes on. A phase skipped for
+`insufficient_cycle_budget` after another phase ran in the same job moves to
+the next job instead of counting as a `budget` streak.
+
+Doctor warns when the stamp is older than three global intervals
+(`autopilot.global_floor_min`, 60 minutes by default) while maintenance jobs
+failed or a phase streak is active, fails once it is a week old, and also
+warns while passes stamp past a phase that keeps failing. The message names
+the phase, its blocker key and back-off, or the last failed job.
+
+1. Run the named phase in the foreground to see its error:
+   `gbrain dream --phase <name>`. LLM and embedding phases spend tokens, so
+   ask the user first. With no phase named, read the failed job:
+   `gbrain jobs get <id>`. For a `deferred` streak, doctor names
+   `gbrain dream retriage` instead: preview with
+   `gbrain dream retriage --dry-run`, then run it to judge the whole backlog in
+   one pass without the `dream.triage.max_ms` window (paid; it asks before
+   spending more than a few dollars). It reads conversation pages too, so it
+   works on `dream.synthesize.conversation_pages` brains.
+2. Fix the cause the error names, then end the back-off so the next pass
+   runs the phase again: `gbrain autopilot --retry-global --phase <name>`
+   (without `--phase`, every backed-off phase). The streak count stays, so a
+   phase that still fails backs off again. Upgrading gbrain drops every
+   streak, and a phase that fails for a different reason starts a new one.
+3. Confirm with `gbrain doctor --only global_maintenance_stalled`: it is `ok`
+   after a pass completes with the phase passing.
+
+## Content-drift sweep
+
+**Doctor reports `content_drift_sweep` as a warning, or an embed run prints
+`content-drift sweep ... FAILED`?** Every `embed --stale` run, embed job and
+embed-backfill job runs the content-drift sweep: it re-queues chunks whose text
+changed after their vector was computed (`embedded_text_hash` no longer
+matches `md5(chunk_text)`). The sweep examines 5,000 chunk rows per statement
+in id order and commits its cursor with each batch, in the config row
+`embed.content_drift_sweep.<column>.<scope>`, so a pass spans as many runs as
+it needs; one run sweeps for at most 60 seconds. After a pass completes, the
+next starts once `embed.content_drift.pass_interval_hours` have passed (24 by
+default; 0 repeats it every run). A pass that fits in one batch repeats on
+every run. The run's result carries `content_drift` (`contentDrift` on
+embed-backfill): rows checked and invalidated, the cursor, and `state`
+(`complete`, `partial`, `waiting`, `stopped`, `failed`, or `unsupported`
+on a schema before migration v133).
+
+A failed batch commits nothing and leaves the cursor before it; the embed run
+goes on with the rest of its work and the next run retries the batch. Search
+already ignores a vector whose text changed, so a stalled sweep delays
+re-embedding, not answers.
+
+1. Read the error: `gbrain doctor --only content_drift_sweep --json` names the
+   scope, the chunk id and the message.
+2. Fix what it names (a lock held by another session, a statement timeout far
+   below one batch, a database error), then run `gbrain embed --stale`. It
+   spends embedding tokens, so ask the user first.
+3. Confirm with `gbrain doctor --only content_drift_sweep`: it is `ok` once a
+   batch commits.
+
 ## auto_chronicle has no effect
 
 **Say to your agent:** *"Why aren't my meetings showing up as timeline events?"*
@@ -584,6 +751,46 @@ Automatic event extraction is on by default. See the
 three-step check, and the skip codes. `gbrain doctor` reports it as the
 `auto_chronicle` check. To turn it off, run
 `gbrain config set auto_chronicle false`.
+
+## Upstream rewritten
+
+<a id="upstream-rewritten"></a>
+
+**Say to your agent:** *"My brain repo's remote was force-pushed and sync keeps saying the pull failed. Fix it without losing anything."*
+
+A classic source that syncs with pull fast-forwards its checkout to the
+upstream. When that is impossible, the sync still imports local HEAD (nothing
+is blocked) and records what it found; the sync result (`upstream` in
+`gbrain sync --json`), `gbrain sources status <id> --json` and doctor
+`sync_failures` report it with the next step. It is never a sync-failure ledger
+row, and the next pull that fast-forwards (or finds nothing to do) clears it.
+Before every fetch the sync records the upstream commit the checkout contains,
+so the cases are told apart:
+
+- `upstream_rewritten`: the upstream commit the checkout last contained is not in
+  the new upstream history, so someone force-pushed. A merge would bring back
+  the commits that push removed, so the fix is a reset after the user agrees:
+  preview `gbrain sources reset-upstream <id> --expect-local <sha> --expect-upstream <sha> --dry-run`
+  (doctor prints the exact command), then run it without `--dry-run` and
+  `gbrain sync --source <id>`.
+- `upstream_unknown`: the checkout and upstream diverged and nothing usable was
+  recorded (the first pull after an upgrade, after an earlier fetch already
+  brought the rewrite in). Same fix; the preview names any local commit that
+  was never on the upstream.
+- `upstream_diverged`: the checkout has its own commits and the upstream moved
+  forward normally. Run `gbrain git commit-push --pull --path <checkout>`, then
+  `gbrain sync --source <id>`.
+
+Nothing is classified while a rebase, merge, cherry-pick or revert is in
+progress in the checkout. `reset-upstream` takes the checkout's commit lock
+and changes nothing (`reset_upstream_refused`) when HEAD or the upstream moved
+since the command was printed (`expect_mismatch`: sync again for a fresh
+command), when tracked files have uncommitted edits (`dirty_tree`), or when a
+local commit was never on the upstream (`local_commits`: it names them and the
+backup ref a reset would create; push or re-apply them first). Otherwise it
+keeps the old HEAD under `refs/gbrain/backup/<UTC stamp>-<sha>`, runs
+`git reset --keep` to the upstream and verifies HEAD before it reports
+`reset`. To get the old history back: `git log <backup ref>`.
 
 ## Sync freshness: no successful sync recorded
 
@@ -612,3 +819,70 @@ syncs keep ending `partial` or failing has none, however many pages it imported.
   - `last_attempt_unsuccessful`: read the job (`gbrain jobs get <id> --json`)
     or the managed failure, then retry.
   - `no_attempt`: run `gbrain sync --source <id>` (`--no-pull` on a managed brain).
+
+## Relative source path
+
+<a id="relative-source-path"></a>
+
+**Say to your agent:** *"Sync refused with `sync_anchor_relative`, or doctor warns that my default source's local_path is relative."*
+
+A source's stored directory (`sources.local_path`, or the legacy `sync.repo_path`)
+must be an absolute path. A relative one such as `.` names whatever directory
+gbrain runs from, so it cannot say which folder is the brain. Before #7630, a
+`gbrain sync --source default` or `gbrain sync --all` run from an unrelated
+folder treated that folder as the brain repo: it ran `git init`, committed
+everything in it and imported its markdown. Sync now refuses
+`sync_anchor_relative` (exit 3) before any Git probe, cost estimate or import,
+and nothing is changed. Doctor's `default_source_local_path` check warns on
+every source with a relative path, and on a relative `sync.repo_path` behind a
+default source with no path.
+
+Ask the user which directory holds the source, then do one of:
+
+- `gbrain sources set-path <id> <absolute-directory>` points the source at that
+  directory (non-destructive; it only updates the pointer).
+- `gbrain sources set-path <id> --clear` clears the relative pointer. It changes
+  no file or page. A `default` source with no path writes through
+  `sync.repo_path` (the designed fallback), and its sync refuses until a path
+  is set again. On a managed brain, a source with a canonical owner refuses
+  `--clear` (`writer_transfer_required`); point it at its directory instead.
+
+A path that is absolute only on another operating system (a Windows drive path
+such as `C:\brain-example`, set by another host sharing the brain, read on Linux
+or macOS) is refused the same way, as not an absolute path on this host. Use
+`set-path` with this host's directory (or `gbrain config set sync.repo_path` for
+the legacy key); `--clear` refuses such a path. An explicit absolute `--repo`
+passes the refusal, but it never advances the sync position of a source whose
+stored path is relative.
+
+Until the path is absolute, the main readers do not treat the folder gbrain
+runs from as the source either: page and fact writes skip the file and stay in
+the database (`repo_not_found`, `no_repo_configured`), a captured file keeps
+no origin path, matching a folder to its source ignores the path, fence repair
+edits stored pages, managed activation refuses it (`source_changed`, detail
+`source_path_missing`), the dream, autopilot, per-phase and global
+maintenance cycles and `gbrain maintain` run only their database phases
+(a cycle run on a directory that matches no registered source fails its
+sync phase `sync_anchor_relative` while the `default` source's path is
+relative),
+`sources set-path` does not count it as another source's tree, the
+write-through leak guard counts a live source's relative path as owning any
+tree (so every source with no `local_path`, the `default` source and any
+`.sources/<id>` source, saves its pages to the database only, `source_repo_belongs_to_other_source`, until that path is set
+or cleared), `gbrain autopilot
+--install` asks for `--repo`, a remote `submit_job` for the source is
+refused, import does not count the folder as a configured root or stamp it
+fresh, and a managed brain does not record it as a managed root. A few other
+local commands may still read it from the folder they run in, so set the path
+first. A managed brain that ran before this fix may already have recorded the
+folders it ran from as managed roots; those records stay until an operator
+drains them (tracked in #7646).
+
+For `sync.repo_path`: `gbrain config set sync.repo_path <absolute-directory>`.
+`config set` refuses a relative value and writes nothing.
+
+If an earlier sync already initialized and imported the wrong folder, the user
+decides what to undo: the folder's new `.git` directory and the pages imported
+from it are theirs to review before anything is removed.
+Verify with `gbrain sources status <id> --json` and
+`gbrain doctor --only default_source_local_path --json`.

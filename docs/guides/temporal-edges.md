@@ -79,7 +79,9 @@ the page states:
   a dated start stays open until a dated end, whatever the prose says. On one page, a
   present-tense mention wins ("previously at Acme, now runs Acme's EU team" stays live).
 - **Manual edges:** `add_link` accepts `valid_from` and `valid_until` (YYYY-MM-DD).
-  Re-run `add_link` with `valid_until` to record that a relationship ended.
+  Re-run `add_link` with `valid_until` to record that a relationship ended. On a
+  managed brain the edge and its dates are a row of the from page's `## Links` table
+  (`<!--- gbrain:links:begin -->`); editing or deleting that row edits or removes the edge.
 
 Dated evidence beats undated evidence from any page: a closure on a person's timeline
 ends the relationship even if the company page still lists them under `key_people`.
@@ -175,7 +177,9 @@ sections). A link may keep a `mentions` row beside a typed one.
 `all`) and `as_of`; `traverse_graph` walks live relationships (read history with
 `get_links` or `get_backlinks`). When a default read leaves relationships
 out, the response carries a `former_relationships_hidden` notice with the exact call
-that shows them, and `gbrain.temporal` response metadata with the count.
+that shows them, and `gbrain.temporal` response metadata with the count. Both filters run before the
+500-row page cap, so a hidden relationship never takes a row; on a paged read the count
+covers the rows that page spans.
 
 Recipe for "where did alice-example work in 2022":
 

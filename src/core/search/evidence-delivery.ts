@@ -13,7 +13,9 @@
  * protected-body boundary before any slicing (a slice can cut a fence and
  * read as a protected tail), fetched with the hit chunks in one batched
  * `getChunkWindows` call that re-authorizes every page under the caller's
- * current read scope. Chunks only anchor hits in that text.
+ * current read scope. Chunks only anchor hits in that text. A segmented page
+ * has no such text: its windows are read around the hits through the segment
+ * reader (segmented-evidence.ts) and joined as separate runs.
  *
  * The normative algorithm (page text, units, allocation, spans) is specified
  * in docs/evidence-delivery.md; gbrain-evals measures exactly this code.
@@ -27,15 +29,17 @@ import { estimateTokens as heuristicTokens } from './token-budget.ts';
 import { redactRetrievalOutput } from './output-redaction.ts';
 import { buildSnippetMarker } from './snippet-cap.ts';
 import { pageReadFilter } from './read-policy-sql.ts';
-import { chunkGenerationFilter, currentTextProjectionFilter, safeChunksFilter, requiresSafeChunks } from './safe-chunks.ts';
+import { chunkGenerationFilter, chunkManifestReads, currentTextProjectionFilter, safeChunksFilter, requiresSafeChunks } from './safe-chunks.ts';
 import { resolveExcludePrivatePages } from './private-visibility.ts';
 import { safeSplitIndex } from '../text-safe.ts';
 import { loadFenceChunkOverlay, type FenceChunkOverlay } from '../eligibility/fence-overlay.ts';
 import { DEFAULT_INLINE_BODY_BYTES, locateChunksByStoredSpans, projectPageText, TIMELINE_SEPARATOR } from '../page-window/document.ts';
+import { readSegmentedWindows } from './segmented-evidence.ts';
 import { stripChunkHeader } from '../chunkers/code.ts';
 import { OperationError } from '../ops/contract.ts';
 import { blockDateHeaders, evidenceDateHeaderEnabled } from './evidence-date.ts';
 import { cutWholePages, resolvePageRankCut, type PageRankCut, type PageRankCutMeta } from './page-rank-cut.ts';
+import { evidenceTailTrimEnabled, trimEvidenceTail, type TailTrimMeta } from './evidence-tail-trim.ts';
 export { pagePlanHits } from './page-plan-hits.ts';
 import { applyEffectiveDate } from '../utils.ts';
 import { configPacking, MIN_EXPLICIT_AUTO_BUDGET, parseAutoPacking, type AutoPacking } from './evidence-packing.ts';
@@ -116,6 +120,8 @@ export interface DeliveryMeta {
   auto_packing?: AutoPacking;
   /** W5: present when `search.page_rank_cut` cut the page candidates (page-rank-cut.ts). */
   page_rank_cut?: PageRankCutMeta;
+  /** Present when `search.evidence_tail_trim` ran on this delivery (evidence-tail-trim.ts). */
+  tail_trim?: TailTrimMeta;
 }
 
 export type DeliveredSearchResult = SearchResult & { delivered: DeliveredEvidence };
@@ -138,6 +144,8 @@ export interface EvidencePlan {
   longPage?: LongPagePolicy;
   /** W5: page unit + caller budget + `search.page_rank_cut: whole_pages` (page-rank-cut.ts). */
   rankCut?: PageRankCut;
+  /** `auto` with `search.evidence_tail_trim` on: low-scoring conversation blocks past the top 3 are dropped (evidence-tail-trim.ts). */
+  tailTrim?: true;
 }
 
 /** The cap runs only under `auto`, with a budget the caller passed and a packing other than `off`. */
@@ -283,6 +291,7 @@ export async function resolveEvidencePlan(engine: BrainEngine, input: ResolvePla
     ...(budgetClamped ? { budgetClamped } : {}),
     ...(await evidenceDateHeaderEnabled(engine) ? { dateHeader: true as const } : {}),
     ...(rankCut ? { rankCut } : {}),
+    ...(unit === 'auto' && await evidenceTailTrimEnabled(engine) ? { tailTrim: true as const } : {}),
   };
 }
 
@@ -684,12 +693,13 @@ export function pageEvidenceText(page: { compiled_truth: string; timeline: strin
   return projectPageText(page, includeTimeline);
 }
 
-function locateAnchor(doc: Doc, hit: SearchResult, fold: boolean): Anchor {
+/** `placed` (segmented pages): where the hits without a stored span were found; the text is then never searched. */
+function locateAnchor(doc: Doc, hit: SearchResult, fold: boolean, placed?: ReadonlyMap<number, { start: number; end: number }>): Anchor {
   const byId = hit.chunk_id > 0 ? doc.spans.find(x => x.id === hit.chunk_id) : undefined;
   if (byId) return { chunk_id: hit.chunk_id, mapped: true, pieces: piecesOverlapping(doc, byId.start, byId.end), start: byId.start, end: byId.end, chunkIndex: byId.chunk_index };
   const text = hitPageText(hit).trim();
-  if (text.length >= 16) {
-    const found = locateChunks(doc.text, [{ id: hit.chunk_id, chunk_index: hit.chunk_index, chunk_text: text }], fold)[0];
+  if (placed || text.length >= 16) {
+    const found = placed ? placed.get(hit.chunk_id) : locateChunks(doc.text, [{ id: hit.chunk_id, chunk_index: hit.chunk_index, chunk_text: text }], fold)[0];
     if (found) {
       // A fenced_code chunk_index follows every prose chunk, so it says nothing
       // about position: the window grows from the prose chunk holding the fence,
@@ -731,14 +741,19 @@ function sectionCandidates(doc: Doc, anchors: Anchor[], conversation: boolean): 
     if (a.pieces.length === 0) continue;
     const first = a.pieces[0];
     const last = a.pieces[a.pieces.length - 1];
-    let start = 0;
+    // A section never leaves its run (a segmented page's window): the text between runs was not read.
+    let lo = first;
+    while (lo > 0 && doc.pieces[lo - 1].run === doc.pieces[first].run) lo--;
+    let hi = last;
+    while (hi + 1 < doc.pieces.length && doc.pieces[hi + 1].run === doc.pieces[last].run) hi++;
+    let start = lo;
     let level = 0;
-    for (let i = first; i >= 0; i--) {
+    for (let i = first; i >= lo; i--) {
       const p = doc.pieces[i];
       if (conversation ? p.speaker === opener : p.heading > 0) { start = i; level = conversation ? 0 : p.heading; break; }
     }
-    let end = doc.pieces.length - 1;
-    for (let i = last + 1; i < doc.pieces.length; i++) {
+    let end = hi;
+    for (let i = last + 1; i <= hi; i++) {
       const p = doc.pieces[i];
       if (conversation ? p.speaker === opener : p.heading > 0 && (level === 0 || p.heading <= level)) { end = i - 1; break; }
     }
@@ -766,7 +781,34 @@ function planBlock(page: ChunkWindowPage, hits: SearchResult[], requested: Exclu
     ...(timelineAt < 0 ? [] : locateChunks(text.slice(timelineAt), timelineChunks).map(sp => ({ ...sp, start: sp.start + timelineAt, end: sp.end + timelineAt }))),
   ];
   const doc = buildDoc(text, spans);
-  const anchors = hits.map(h => locateAnchor(doc, h, textBytes <= SPAN_ONLY_LOCATE_BYTES));
+  return blockFromDoc(page, hits, doc, hits.map(h => locateAnchor(doc, h, textBytes <= SPAN_ONLY_LOCATE_BYTES)), requested, radius, textBytes > DEFAULT_INLINE_BODY_BYTES);
+}
+
+/**
+ * planBlock for a segmented page (spec 7.4): the same units over the windows readSegmentedWindows reads around the
+ * hits, never a page text, a whole-page projection or a text search. Each window is a run of the document: emission
+ * marks the gap between two runs and a section never crosses one.
+ */
+async function planSegmentedBlock(engine: BrainEngine, page: ChunkWindowPage, hits: SearchResult[], requested: Exclude<ReturnUnit, 'chunk' | 'auto'>, radius: number, includeTimeline: boolean): Promise<PlannedBlock> {
+  const best = hits[0];
+  if (!page.sealed) return fallbackBlock(best, hits, 'unsealed_page');
+  if (page.chunks.length === 0 && page.row_limited) return fallbackBlock(best, hits, 'row_limit');
+  const read = await readSegmentedWindows(engine, page, hits.map(h => ({ chunk_id: h.chunk_id, chunk_index: h.chunk_index, text: hitPageText(h) })),
+    { unit: requested, radius, includeTimeline });
+  const doc: Doc = { text: '', pieces: [], spans: [] };
+  const placed = new Map<number, { start: number; end: number }>();
+  read.runs.forEach((run, k) => {
+    const base = doc.text.length;
+    for (const p of buildDoc(run.text, []).pieces) doc.pieces.push({ ...p, run: k, start: p.start + base, end: p.end + base });
+    for (const sp of run.spans) doc.spans.push({ ...sp, start: sp.start + base, end: sp.end + base });
+    for (const [id, at] of read.placed) if (at.run === k) placed.set(id, { start: at.start + base, end: at.end + base });
+    doc.text += run.text;
+  });
+  return blockFromDoc(page, hits, doc, hits.map(h => locateAnchor(doc, h, false, placed)), requested, radius, read.overInline);
+}
+
+function blockFromDoc(page: ChunkWindowPage, hits: SearchResult[], doc: Doc, anchors: Anchor[], requested: Exclude<ReturnUnit, 'chunk' | 'auto'>, radius: number, overInline: boolean): PlannedBlock {
+  const best = hits[0];
   if (anchors.every(a => a.pieces.length === 0)) {
     return fallbackBlock(best, hits, page.row_limited ? 'row_limit' : page.chunks.length === 0 ? 'no_text_chunks' : 'anchor_not_located');
   }
@@ -777,7 +819,7 @@ function planBlock(page: ChunkWindowPage, hits: SearchResult[], requested: Exclu
   let fallbackReason: string | undefined;
   let candidates: number[];
   // Large pages (T18): a page over the inline read size is never delivered whole; it becomes the window around its hits.
-  if (unit === 'page' && textBytes > DEFAULT_INLINE_BODY_BYTES) { unit = 'window'; fallbackReason = PAGE_OVER_INLINE_BYTES; }
+  if (unit === 'page' && overInline) { unit = 'window'; fallbackReason = PAGE_OVER_INLINE_BYTES; }
   if (unit === 'page') {
     candidates = doc.pieces.map((_, i) => i);
   } else if (unit === 'section') {
@@ -950,7 +992,7 @@ function selectionCost(b: Block, sel: Set<number>, tokenizer: 'cl100k' | 'heuris
   let tokens = 0;
   let chars = 0;
   order.forEach((i, k) => {
-    const gap = k > 0 && order[k - 1] !== i - 1;
+    const gap = k > 0 && !(order[k - 1] === i - 1 && b.doc.pieces[i - 1].run === b.doc.pieces[i].run);
     tokens += tok(b, i, tokenizer) + (gap ? omitTok : 0);
     chars += b.doc.pieces[i].text.length + (gap ? EVIDENCE_OMISSION.length : 0);
   });
@@ -1128,6 +1170,8 @@ export interface DeliverOptions {
   timeoutMs?: number;
   /** F2: the long pages selectLongPages chose for these hits (search/query only). */
   longPages?: LongPageSelection;
+  /** The request's query: the tail trim's query-term guard reads it, and the trim never runs without it. */
+  query?: string;
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -1207,7 +1251,7 @@ export async function deliverEvidence(
         chunkSources: scope.detail === 'low' ? ['compiled_truth'] : ['compiled_truth', 'timeline'],
         maxRows: Math.min(MAX_ROWS, requests.reduce((n, r) => n + (r.to_index - r.from_index + 1), 0)),
       }), timeoutMs);
-      for (const p of rows) p.fenceOverlay = await loadFenceChunkOverlay(engine, { sourceId: p.source_id, slug: p.slug, compiled_truth: p.compiled_truth, timeline: p.timeline });
+      for (const p of rows) if (!p.segmented) p.fenceOverlay = await loadFenceChunkOverlay(engine, { sourceId: p.source_id, slug: p.slug, compiled_truth: p.compiled_truth, timeline: p.timeline });
       return new Map(rows.map(p => [p.page_id, p]));
     } catch (e) {
       return e instanceof EvidenceTimeout ? 'fetch_timeout' : 'fetch_failed';
@@ -1227,6 +1271,11 @@ export async function deliverEvidence(
     for (const h of g.hits) passthrough.push({ rank: hits.indexOf(h), hit: h, reason: 'long_page_chunk' });
   };
 
+  const unit = plan.unit === 'auto' ? 'page' : plan.unit;
+  const segmentedReads = new Map(groups.flatMap(g => {
+    const page = !fetchFailure && g.reason !== 'long_page' && g.pageId !== null ? pages?.get(g.pageId) : undefined;
+    return page?.segmented ? [[g, planSegmentedBlock(engine, page, g.hits, unit, plan.window, scope.detail !== 'low').catch(() => null)] as const] : [];
+  }));
   // C1 date headers: one line per block (passthrough rows included), paid for inside the budget like the title.
   const headerFor = plan.dateHeader ? await blockDateHeaders(engine, hits, () => fallbacks.add('date_header_unavailable')) : () => '';
 
@@ -1251,7 +1300,9 @@ export async function deliverEvidence(
     } else {
       const page = pages?.get(g.pageId);
       if (!page) { dropped.not_readable = (dropped.not_readable ?? 0) + 1; continue; }
-      b = planBlock(page, g.hits, plan.unit === 'auto' ? 'page' : plan.unit, plan.window, scope.detail !== 'low');
+      const read = page.segmented ? await segmentedReads.get(g)! : planBlock(page, g.hits, unit, plan.window, scope.detail !== 'low');
+      if (!read && opts.liveHits === false) { dropped.not_readable = (dropped.not_readable ?? 0) + 1; continue; }
+      b = read ?? fallbackBlock(g.hits[0], g.hits, 'segment_read_failed');
     }
     if (b.fallbackReason) fallbacks.add(b.fallbackReason);
     const title = b.hit.title ?? '';
@@ -1317,6 +1368,11 @@ export async function deliverEvidence(
     results = ranked.sort((a, b) => a.rank - b.rank).map(x => x.r);
   }
 
+  let tailTrim: TailTrimMeta | undefined;
+  if (plan.tailTrim && opts.query) {
+    ({ results, meta: tailTrim } = trimEvidenceTail(results, opts.query));
+    if (tailTrim.dropped > 0) dropped.tail_trim = tailTrim.dropped;
+  }
   const tokensDelivered = results.reduce((n, r) => n + r.delivered.tokens, 0);
   const budgetUsed = tokensDelivered + results.reduce((n, r) => n + countEvidenceTokens(r.title ?? '', tokenizer), 0);
   const droppedTotal = Object.values(dropped).reduce((n, v) => n + v, 0);
@@ -1337,6 +1393,7 @@ export async function deliverEvidence(
     ...(capped ? { auto_packing: plan.packing } : {}),
     ...(plan.dateHeader ? { date_header: true as const } : {}),
     ...(rankCutMeta ? { page_rank_cut: rankCutMeta } : {}),
+    ...(tailTrim ? { tail_trim: tailTrim } : {}),
   };
   return { results: capped ? capEvidenceToBudget(results, delivery) : results, delivery };
 }
@@ -1520,7 +1577,8 @@ export function unsupportedDelivery(plan: EvidencePlan, reason: string): Deliver
 // Frozen-candidate interface (gbrain-evals E1/E3 parity)
 // ---------------------------------------------------------------------------
 
-export interface FrozenHit { source_id: string; slug: string; chunk_id: number }
+/** `score` (library only): the hit's search score, so the tail trim can run on a frozen list. */
+export interface FrozenHit { source_id: string; slug: string; chunk_id: number; score?: number }
 
 export interface AssembleEvidenceInput {
   hits: FrozenHit[];
@@ -1535,6 +1593,8 @@ export interface AssembleEvidenceInput {
    * evaluation can compare packings on one frozen hit list.
    */
   auto_packing?: AutoPacking;
+  /** Library only: the query the hits answered (the tail trim's guard reads it). */
+  query?: string;
 }
 
 export interface AssembleEvidenceOutput {
@@ -1571,7 +1631,7 @@ export async function resolveFrozenHits(
             cc.id AS chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source
        FROM unnest($1::text[], $2::text[], $3::int[], $4::int[]) AS h(source_id, slug, chunk_id, ord)
        JOIN pages p ON p.source_id = h.source_id AND p.slug = h.slug
-       LEFT JOIN content_chunks cc ON cc.page_id = p.id AND ${chunkGenerationFilter('p', 'cc')}
+       LEFT JOIN content_chunks cc ON cc.page_id = p.id AND ${chunkGenerationFilter('p', 'cc', await chunkManifestReads(engine))}
             AND CASE WHEN h.chunk_id > 0 THEN cc.id = h.chunk_id ELSE cc.chunk_index = 0 END
       WHERE ${filter} AND ${currentTextProjectionFilter('p')} ${safe}`,
     params,
@@ -1593,7 +1653,7 @@ export async function resolveFrozenHits(
       chunk_source: (r.chunk_source ?? 'compiled_truth') as SearchResult['chunk_source'],
       chunk_id: r.chunk_id == null ? 0 : Number(r.chunk_id),
       chunk_index: r.chunk_index == null ? 0 : Number(r.chunk_index),
-      score: 0,
+      score: Number.isFinite(h.score) ? h.score! : 0,
       stale: false,
     };
     // The page date, normalized exactly as live search rows are, so frozen
@@ -1640,7 +1700,7 @@ export async function assembleEvidenceForHits(engine: BrainEngine, input: Assemb
     const out = redactRetrievalOutput(rows, {});
     return { results: out.results, delivery: null, unresolved };
   }
-  const d = await deliverEvidence(engine, rows, plan, scope, { liveHits: true });
+  const d = await deliverEvidence(engine, rows, plan, scope, { liveHits: true, ...(input.query ? { query: input.query } : {}) });
   const out = redactRetrievalOutput(d.results, d.delivery);
   return { results: capEvidenceToBudget(out.results, out.meta), delivery: out.meta, unresolved };
 }

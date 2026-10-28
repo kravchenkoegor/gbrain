@@ -14,7 +14,7 @@ import { lagFromContentMs, loadSyncFreshnessSources, resolveStalenessCeilingSeco
 import { resolveHoursEnv } from '../../../core/env-number.ts';
 import { chunkerStamp } from '../../../core/chunkers/code.ts';
 import { smallBrainBacklogNote } from '../../../core/link-extraction-watermark.ts';
-import { extractionLagVerdict, extractionRoutes, readExtractionLag } from '../../../core/extraction-lag.ts';
+import { extractionLagVerdict, extractionRoutes, heldExtractionReport, readExtractionLag } from '../../../core/extraction-lag.ts';
 import { isMissingSchemaObject } from '../../../core/utils.ts';
 import {
   loadStorageConfig,
@@ -96,6 +96,7 @@ export { EXTRACTION_LAG_WARN_PCT_DEFAULT, EXTRACTION_LAG_MIN_PAGES } from '../..
  *
  * `opts.sourceId` scopes both the denominator and the stale count to one
  * source (the explicit-only `--source` parse, like orphan_ratio).
+ * GBRA-130 A-1: held pages (`heldExtractionReport`) are counted apart and warn on any brain size.
  */
 export async function checkLinksExtractionLag(
   engine: BrainEngine,
@@ -107,11 +108,15 @@ export async function checkLinksExtractionLag(
     // #6803 (D1): one statement and one verdict shared with the sync nudge; attendance-blocked pages (#5761: stale
     // only by an unresolved attendee, `extract --stale` cannot clear them) are reported apart from lag.
     const lag = await readExtractionLag(engine, { sourceId });
-    const { total, actionable: stale, attendance_blocked: attendanceBlocked } = lag;
+    const { total, actionable: stale, attendance_blocked: attendanceBlocked, held = 0 } = lag;
     if (total === 0) {
       return { name, status: 'ok', message: 'Extraction lag not applicable (no pages)' };
     }
     const verdict = extractionLagVerdict(lag, sourceId);
+    const { note: heldNote, fix: heldFix } = await heldExtractionReport(engine, held, sourceId);
+    if (verdict.skipped && heldFix) {
+      return { name, status: 'warn', message: `Extraction lag not graded (${total} pages, too few to assess)${heldNote}`, details: { total, stale, held, source_id: sourceId ?? null }, fix: heldFix };
+    }
     if (verdict.skipped) {
       return { name, status: 'ok', message: `Extraction lag not applicable (${total} pages — too few to assess)${await smallBrainBacklogNote(engine)}` };
     }
@@ -121,17 +126,19 @@ export async function checkLinksExtractionLag(
       ? `. ${attendanceBlocked} more page(s) wait on unresolved attendees; the next extraction clears each once its attendee's person page exists in the meeting's source (docs/guides/attendance-evidence.md)`
       : '';
     const mentionNote = lag.mention_due ? `; ${lag.mention_due} page(s) await the mention pass (last pass: ${lag.mention_last_pass_at ?? 'never'})` : '';
-    const details: Record<string, unknown> = { total, stale, attendance_blocked: attendanceBlocked, pct: Number(pctStr), warn_pct: verdict.warn_pct, fail_pct: verdict.fail_pct,
+    const details: Record<string, unknown> = { total, stale, attendance_blocked: attendanceBlocked, held, pct: Number(pctStr), warn_pct: verdict.warn_pct, fail_pct: verdict.fail_pct,
       source_id: sourceId ?? null, mention_due: lag.mention_due, mention_last_pass_at: lag.mention_last_pass_at };
     if (verdict.status === 'ok') {
-      return { name, status: 'ok', message: `Extraction current: ${stale}/${total} pages (${pctStr}%) stale${scope}${mentionNote}${blockedNote}`, details };
+      return { name, status: held ? 'warn' : 'ok', message: `Extraction current: ${stale}/${total} pages (${pctStr}%) stale${scope}${mentionNote}${blockedNote}${heldNote}`, details,
+        ...(heldFix ? { fix: heldFix } : {}) };
     }
     const { fix, decision, routes } = extractionRoutes(lag, { sourceId, remote: opts?.remote });
     details.routes = routes;
     details.decision = decision;
     const fixText = `Run: ${routes.map(route => `${route.argv.join(' ')} (${route.label})`).join(', or ')}`;
     const what = verdict.status === 'fail' ? `need link/timeline extraction (> ${verdict.fail_pct}% fail threshold)` : 'have un-extracted edges';
-    return { name, status: verdict.status, message: `${stale}/${total} pages (${pctStr}%)${scope} ${what}${mentionNote}. ${fixText}${blockedNote}`, details, fix };
+    if (heldFix) details.held_fix = heldFix;
+    return { name, status: verdict.status, message: `${stale}/${total} pages (${pctStr}%)${scope} ${what}${mentionNote}. ${fixText}${blockedNote}${heldNote}`, details, fix };
   } catch (e) {
     // Pre-v112 brain: links_extracted_at column doesn't exist yet. Graceful OK
     // (migration/bootstrap adds it; nothing to assess until then).
@@ -215,8 +222,9 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
         WHERE deleted_at IS NULL AND content_hash IS NOT NULL AND content_hash <> ''
         GROUP BY source_id, content_hash
        HAVING count(*) > 1
-        LIMIT 50`,
+        LIMIT 51`,
     );
+    const capped = rows.length > 50, atLeast = capped ? 'At least ' : ''; // #7145: a 51st group makes the counts floors
     if (rows.length === 0) {
       return { name, status: 'ok', message: 'No same-source content-hash duplicate groups' };
     }
@@ -225,7 +233,7 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
     const samples: string[] = [];
     let otherGroupCount = 0;
     const otherSamples: string[] = [];
-    for (const r of rows) {
+    for (const r of rows.slice(0, 50)) {
       const slugs = String(r.slugs).split('|');
       const bare = slugs.filter(s => !s.includes('/'));
       const prefixed = slugs.filter(s => s.includes('/'));
@@ -250,14 +258,14 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
       const sourceNote = pairSources.size === 1 ? '' : ` (pairs span sources ${[...pairSources].sort().join(', ')}; run it once per pair with that pair's source)`;
       const fix = `Fix: GBRAIN_SOURCE=${source} gbrain delete <bare-slug> --force for each pair${sourceNote}.`;
       parts.push(
-        `${pairCount} content-hash duplicate pair(s) detected (same content, differing slug forms — ` +
+        `${atLeast}${pairCount} content-hash duplicate pair(s) detected (same content, differing slug forms — ` +
         `usually an import run from the wrong root, which drops the path prefix). ` +
         `Sample: ${samples.join('; ')}. ${fix}`,
       );
     }
     if (otherGroupCount > 0) {
       parts.push(
-        `${otherGroupCount} duplicate-content group(s) with distinct slugs (no bare/nested wrong-root shape). ` +
+        `${atLeast}${otherGroupCount} duplicate-content group(s) with distinct slugs (no bare/nested wrong-root shape). ` +
         `Sample: ${otherSamples.join('; ')}. Review which slug is canonical and consolidate manually — ` +
         `no automatic delete hint (either copy may be the one links point at).`,
       );
@@ -265,10 +273,10 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
     return {
       name,
       status: 'warn',
-      message: parts.join(' '),
+      message: parts.join(' ') + (capped ? ' Only the first 50 duplicate groups were read (no setting); fix these and rerun to see the rest.' : ''),
       details: {
         pair_count: pairCount,
-        hash_groups: rows.length,
+        hash_groups: Math.min(rows.length, 50), exact: !capped, ...(capped ? { limit: 50 } : {}),
         sample_pairs: samples,
         distinct_slug_group_count: otherGroupCount,
         sample_distinct_slug_groups: otherSamples,
@@ -1165,10 +1173,10 @@ export async function computeExtractHealthCheck(
 
 export async function checkSyncFreshness(
   engine: BrainEngine,
-  opts?: { nowMs?: number; localOnly?: boolean },
+  opts?: { nowMs?: number; localOnly?: boolean; sourceIds?: string[] },
 ): Promise<Check> {
   try {
-    const sources = await loadSyncFreshnessSources(engine);
+    const sources = await loadSyncFreshnessSources(engine, opts?.sourceIds);
 
     if (sources.length === 0) {
       return {
@@ -1210,7 +1218,7 @@ export async function checkSyncFreshness(
     // #4960: sources with no successful sync carry their own state, fix and wording (no generic "run sync" suffix).
     const outcomes: SyncOutcomeEntry[] = [];
     let ownedContent = new Set<string>();
-    try { ownedContent = new Set((await ownedContentFreshness(engine)).map(source => source.sourceId)); }
+    try { ownedContent = new Set((await ownedContentFreshness(engine, opts?.sourceIds)).map(source => source.sourceId)); }
     catch (error) { if (!isOwnedContentSchemaMissing(error)) throw error; }
     // #6076: an adopted read-only catalog pack (no commit history) has nothing to sync.
     const catalogPacks = await readOnlyCatalogPackSourceIds(engine, sources, localOnly);

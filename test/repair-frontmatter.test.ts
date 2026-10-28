@@ -262,7 +262,7 @@ test('apply refuses while an unfinished managed sync cursor still names a select
   const hash = preview.apply_command.split('--expect ')[1]!.split(' ')[0]!;
   const runId = randomUUID();
   await engine.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('managed-sync',$1,$2::text::jsonb)`,
-    [`fixture-${runId}`, JSON.stringify([{ sourceId: s.id, runId, index: 0, total: 1 }])]);
+    [`fixture-${runId}`, JSON.stringify([{ sourceId: s.id, incarnation: (await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [s.id]))[0]!.incarnation, runId, index: 0, total: 1 }])]);
   await engine.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('managed-sync-manifest',$1,$2::text::jsonb)`,
     [runId, JSON.stringify([{ path: 'notes/roundup.md', sourcePath: 'notes/roundup.md', action: 'import', working: false }])]);
   try {
@@ -392,7 +392,7 @@ test('legacy brain: the apply backs the file up, writes it, imports it, clears i
     expect((await engine.getPage('notes/post', { sourceId: id }))?.title).toBe('alice-example post 4\nsecond line of post 4');
     const detail = applied.outcome_items!.find(o => o.detail?.path === 'notes/roundup.md')!.detail!;
     expect(detail).toMatchObject({ path: 'notes/roundup.md', written: true, imported: 'imported', committed: 'commit_step' });
-    expect(String(detail.commit_step)).toContain(`git -C ${root} add -- notes/roundup.md`);
+    expect(detail.commit_step).toBe(`gbrain git commit-push --path ${root} -m 'fix(frontmatter): repair notes/roundup.md' -- notes/roundup.md`);
     expect(readFileSync(String(detail.backup), 'utf8')).toBe(QUOTABLE);
     expect(s.read('notes/roundup.md')).toContain('author: "alice-example');
     expect((await engine.getPage('notes/roundup', { sourceId: id }))?.frontmatter.author).toBe('alice-example (citing acme-example) (original: https://example.invalid/a)');

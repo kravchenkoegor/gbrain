@@ -294,7 +294,7 @@
         {
           "category": "ops",
           "elapsed_ms": "<volatile>",
-          "message": "Bun <bun-version> (minimum 1.4.0)",
+          "message": "Bun <bun-version> (minimum 1.4.4)",
           "name": "bun_runtime",
           "status": "ok"
         },
@@ -590,6 +590,18 @@
             "docs": "docs/guides/troubleshooting.md#terminal-write-failures",
             "historical_rows": 0,
             "new_last_24h": 0,
+            "ranked": {
+              "blocking": [],
+              "historical": {
+                "rows": 0
+              },
+              "unresolved": {
+                "group_by": [],
+                "groups": [],
+                "pages": 0,
+                "rows": 0
+              }
+            },
             "sources": [],
             "spike": {
               "daily_7d": [
@@ -637,6 +649,20 @@
           "elapsed_ms": "<volatile>",
           "message": "No managed sync run is blocked.",
           "name": "managed_sync_blocked",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "age_seconds": null,
+            "docs": "docs/guides/error-codes.md#sync_admission_restricted",
+            "set_at": null,
+            "stored": null,
+            "value": "normal"
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "sync.admission is normal: managed sync admits everything it classifies.",
+          "name": "sync_admission_restricted",
           "status": "ok"
         },
         {
@@ -770,6 +796,29 @@
           "status": "ok"
         },
         {
+          "category": "brain",
+          "details": {
+            "docs": "docs/guides/resolve-paths.md#synced-but-not-searchable",
+            "sources": [
+              {
+                "after_seconds": 300,
+                "by_state": {},
+                "checked": 0,
+                "complete": true,
+                "gaps": 0,
+                "pages": [],
+                "source_id": "default",
+                "status": "ok",
+                "window_hours": 24
+              }
+            ]
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "Every page managed sync committed past its freshness target in the last 24 h is searchable.",
+          "name": "sync_landing_gaps",
+          "status": "ok"
+        },
+        {
           "category": "ops",
           "elapsed_ms": "<volatile>",
           "message": "Extension installed",
@@ -822,8 +871,10 @@
           "details": {
             "effects": [],
             "exact": true,
+            "git_push_holds": [],
             "inspected": 0,
             "parked_effects": 0,
+            "parked_groups": [],
             "truncated": false
           },
           "elapsed_ms": "<volatile>",
@@ -844,6 +895,7 @@
         {
           "category": "ops",
           "details": {
+            "columns": [],
             "extra_columns": [],
             "page_child_source_columns": [],
             "runbook": "docs/guides/write-refusals.md#managed-guard-page-children"
@@ -882,10 +934,39 @@
           "status": "ok"
         },
         {
+          "category": "brain",
+          "details": {
+            "alias_pages_without_visibility": 0,
+            "count": "exact",
+            "fact_ids_truncated": false,
+            "looser_atoms": 0,
+            "looser_concepts": 0,
+            "looser_events": 0,
+            "remotely_readable_fact_ids": [],
+            "repair": "visibility",
+            "truncated": false,
+            "unstamped_atoms": 0,
+            "unstamped_concepts": 0,
+            "world_facts_from_private_sources": 0,
+            "world_facts_remotely_readable": 0
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "Every derived page and fact carries a visibility no looser than its source, and no page relies on a privacy alias alone.",
+          "name": "derived_visibility",
+          "status": "ok"
+        },
+        {
           "category": "ops",
           "elapsed_ms": "<volatile>",
           "message": "Skipped (PGLite — no PostgREST exposure, RLS not applicable)",
           "name": "rls",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "elapsed_ms": "<volatile>",
+          "message": "Every gbrain function that pins a search_path ends it with pg_temp",
+          "name": "function_search_path",
           "status": "ok"
         },
         {
@@ -898,8 +979,15 @@
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "1243 column(s) verified against live schema",
+          "message": "1388 column(s) verified against live schema",
           "name": "schema_columns",
+          "status": "ok"
+        },
+        {
+          "category": "meta",
+          "elapsed_ms": "<volatile>",
+          "message": "All 162 table(s) the applied migrations create exist.",
+          "name": "schema_missing_tables",
           "status": "ok"
         },
         {
@@ -1122,22 +1210,6 @@
           "category": "brain",
           "details": {
             "count": "exact",
-            "looser_atoms": 0,
-            "looser_concepts": 0,
-            "repair": "visibility",
-            "truncated": false,
-            "unstamped_atoms": 0,
-            "unstamped_concepts": 0
-          },
-          "elapsed_ms": "<volatile>",
-          "message": "Every extracted atom and synthesized concept carries an explicit visibility no looser than its origin.",
-          "name": "derived_visibility",
-          "status": "ok"
-        },
-        {
-          "category": "brain",
-          "details": {
-            "count": "exact",
             "kept_pages": 0,
             "pages_pending": 0,
             "repair": "safe-chunks",
@@ -1198,6 +1270,10 @@
               {
                 "name": "persistence_requests_request_id",
                 "state": "valid"
+              },
+              {
+                "name": "persistence_requests_foreground_committed",
+                "state": "valid"
               }
             ],
             "repair": "request-indexes"
@@ -1256,6 +1332,7 @@
             "preparation_policy": {
               "maintenance_preparation_ms": "<volatile>",
               "max_preparation_attempts": 2,
+              "max_transient_retries": 5,
               "preparation_ceiling_ms": "<volatile>",
               "sync_preparation_ms": "<volatile>"
             },
@@ -1410,6 +1487,23 @@
           "status": "ok"
         },
         {
+          "category": "ops",
+          "details": {
+            "blockers": [],
+            "configured": "unset",
+            "docs": "docs/guides/memory-boundaries.md#segmented-page-storage",
+            "effective": "on",
+            "floor": "<segmented-writer-floor>",
+            "max_bytes": 134217728,
+            "truncated": false,
+            "window_days": 7
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "Segmented page storage is on: pages over 1 MiB are stored in segments, up to 134217728 bytes on this PGLite brain.",
+          "name": "segmented_storage",
+          "status": "ok"
+        },
+        {
           "category": "brain",
           "details": {
             "classified": 0,
@@ -1489,6 +1583,81 @@
           "status": "ok"
         },
         {
+          "category": "ops",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/google-connect.md#api-access",
+            "sources": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No Google source recorded a disabled API or missing scope at its last sync.",
+          "name": "google_api_access",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "by_source": [],
+            "count": 0,
+            "docs": "docs/guides/repair.md#atoms-restore",
+            "hold_until": null,
+            "ledger_covered": 0,
+            "newest_retired_at": null,
+            "oldest_retired_at": null,
+            "origins": 0,
+            "repair": "atoms-restore",
+            "source_ids": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No atom retired by an empty re-extraction is waiting to be restored.",
+          "name": "atom_retirements_restorable",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "by_source": [],
+            "docs": "docs/guides/repair.md#generations",
+            "items": 0,
+            "keys": 0,
+            "repair": "generations",
+            "restore_days": 30
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No live generation retired items in the last 30 day(s).",
+          "name": "generation_retirements",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "by_reason": [],
+            "count": 0,
+            "docs": "docs/guides/repair.md#generations",
+            "releasable": 0,
+            "repair": "generations"
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No derived generation is held.",
+          "name": "generation_held",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "docs": "docs/guides/repair.md#generations",
+            "orphan_candidates": [],
+            "orphans": 0,
+            "pending": 0,
+            "pending_items": [],
+            "retire_pending": 0
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No activated generation waits on a member request, and no orphan candidate exists.",
+          "name": "generation_pending",
+          "status": "ok"
+        },
+        {
           "category": "brain",
           "details": {
             "ambiguous": 0,
@@ -1544,6 +1713,36 @@
           "elapsed_ms": "<volatile>",
           "message": "No active fact from a gbrain self-capture or paste candidate remains. This counts facts in the database; the self_capture check counts corpus files.",
           "name": "captured_facts_active",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "affected": 0,
+            "docs": "docs/guides/repair.md#redacted-facts",
+            "repair": "redacted-facts"
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No active fact holds a redaction marker.",
+          "name": "facts_redaction_marker",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "days": [],
+            "docs": "docs/guides/repair.md#fact-claim-dates",
+            "repair": "fact-claim-dates",
+            "rule": {
+              "min_entities": 20,
+              "min_facts": 200,
+              "min_share": 0.25
+            },
+            "source_ids": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No calendar day holds a bulk-loaded share of any source's facts.",
+          "name": "fact_bulk_dates",
           "status": "ok"
         },
         {
@@ -1819,9 +2018,41 @@
         },
         {
           "category": "ops",
+          "details": {
+            "age_minutes": null,
+            "code": "global_maintenance_stalled",
+            "docs": "docs/guides/troubleshooting.md#global-maintenance-stalled",
+            "fail_after_minutes": 10080,
+            "failed_jobs_since": 0,
+            "last_failed_job": null,
+            "last_global_at": null,
+            "phases": [],
+            "reason": "fresh",
+            "resume_phase": null,
+            "warn_after_minutes": 180
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "Brain-wide maintenance has not run yet.",
+          "name": "global_maintenance_stalled",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
           "elapsed_ms": "<volatile>",
           "message": "No automatic embed-backfill is repeating the same failure.",
           "name": "embed_backfill_stalled",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "code": "content_drift_sweep",
+            "docs": "docs/guides/troubleshooting.md#content-drift-sweep",
+            "scopes": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "The content-drift sweep has not run yet; it runs inside embed --stale and the embed jobs.",
+          "name": "content_drift_sweep",
           "status": "ok"
         },
         {
@@ -1972,6 +2203,7 @@
               "no_remote": 0,
               "pages_at_risk": 0,
               "recoverable_repos": 0,
+              "remote_timeouts": 0,
               "unpushed": 0
             }
           },
@@ -2071,6 +2303,7 @@
             "on_commit": false,
             "sources": [
               {
+                "behind": null,
                 "commit_to_embedded": {
                   "p50_seconds": null,
                   "p95_seconds": null,
@@ -2085,6 +2318,7 @@
                 "commits": 0,
                 "source_id": "default",
                 "unresolved_commits": 0,
+                "waiting_commits": null,
                 "window_hours": 24
               }
             ],
@@ -2093,6 +2327,28 @@
           "elapsed_ms": "<volatile>",
           "message": "No commit→searchable samples in the last 24 h (no managed sync imported a new commit).",
           "name": "managed_sync_latency",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "docs": "docs/guides/on-commit-sync.md",
+            "sources": [
+              {
+                "pending_markers": 0,
+                "reason": null,
+                "resident": null,
+                "source_id": "default",
+                "stalled": false,
+                "state": null
+              }
+            ],
+            "sync_on_commit": false
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "sync.on_commit is off; residents still run explicit sync requests. notifier for default: none running; idle.",
+          "name": "commit_notifier",
+          "severity": "info",
           "status": "ok"
         },
         {
@@ -2388,6 +2644,8 @@
             "facts": {
               "missing": 0,
               "other_model": 0,
+              "oversized": 0,
+              "partially_embedded": 0,
               "stale": 0
             },
             "model": "voyage:voyage-4",
@@ -2608,6 +2866,17 @@
         {
           "category": "brain",
           "details": {
+            "items": [],
+            "total": 0
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No released fact was confirmed with fence-row fields its release preview did not show.",
+          "name": "trust_release_unpreviewed_fields",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
             "bad_config": [],
             "chars_limit": 4000,
             "chars_used": 0,
@@ -2660,6 +2929,35 @@
           "status": "ok"
         },
         {
+          "category": "ops",
+          "details": {
+            "builds": [],
+            "count": 0,
+            "docs": "docs/guides/troubleshooting.md#runtime-build-skew",
+            "earlier_job_children": 0,
+            "job_children": [],
+            "newest": null,
+            "processes": [],
+            "stale": [],
+            "unknown_builds": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No long-running gbrain process (serve, jobs supervisor, worker) is running on this host.",
+          "name": "runtime_build_skew",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "docs": "docs/guides/cli-socket.md",
+            "refusals": 0
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "The warm CLI socket refused no CLI call in the last 24 hours.",
+          "name": "cli_socket_refusals",
+          "status": "ok"
+        },
+        {
           "category": "brain",
           "details": {
             "code": "held_failed",
@@ -2674,11 +2972,32 @@
         {
           "category": "brain",
           "details": {
+            "pages": 0,
+            "samples": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No conversation page is held for an undetected format.",
+          "name": "conversation_detection_ambiguous",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
             "groups": []
           },
           "elapsed_ms": "<volatile>",
           "message": "Every page extraction read all of its input (no head-only, tail-window or size-skip receipts).",
           "name": "extraction_input_truncated",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "models": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No segmented page derivation is held back by a model without a price.",
+          "name": "derivation_unpriced_model",
           "status": "ok"
         },
         {
@@ -2701,6 +3020,40 @@
           "elapsed_ms": "<volatile>",
           "message": "No live page is missing its canonical file (0 page(s) inspected).",
           "name": "ghost_pages",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "docs": "docs/guides/repair.md#origin-twins",
+            "index": "present"
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "pages_live_origin_key is present: no two live pages can record one file.",
+          "name": "origin_twins",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/repair.md#slug-path-mismatch",
+            "file_limit": 200,
+            "files": {
+              "file_missing": 0,
+              "no_checkout": 0,
+              "not_read": 0,
+              "stamped": 0,
+              "unstamped": 0
+            },
+            "inspected": 0,
+            "samples": [],
+            "scan_limit": 20000,
+            "truncated": false
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "Every live page's slug is the one its recorded file path derives (0 candidate(s) inspected).",
+          "name": "slug_path_mismatch",
           "status": "ok"
         },
         {
@@ -2729,6 +3082,16 @@
         {
           "category": "brain",
           "details": {
+            "sweeps": 0
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No fact purge has a sweep of stored derivation results pending or stalled.",
+          "name": "derivation_purge_sweeps",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
             "count": 0,
             "docs": "docs/storage-tiering.md#restoring-a-page-whose-file-is-gone",
             "sources": []
@@ -2738,6 +3101,34 @@
           "name": "missing_recorded_files",
           "readiness_state": "not_applicable",
           "severity": "info",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "by_source": [
+              {
+                "checked": 0,
+                "other_writer": 0,
+                "source_id": "default",
+                "status": "known",
+                "sync_deleted": 0,
+                "tombstones": 0,
+                "truncated": false,
+                "unknown": 0
+              }
+            ],
+            "count": 0,
+            "docs": "docs/guides/repair.md#uncommitted-deletions",
+            "exact": true,
+            "other_writer_count": 0,
+            "purged": "Pages already purged cannot be restored by this command; only a backup (pg_dump, or gbrain backup create taken before the purge) can bring them back.",
+            "samples": [],
+            "truncated": false
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No soft-deleted page was removed by a sync while Git never held its file (0 tombstone(s) checked).",
+          "name": "uncommitted_sync_deletions",
           "status": "ok"
         },
         {
@@ -2817,6 +3208,20 @@
           "status": "ok"
         },
         {
+          "category": "brain",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/repair.md#overwritten-edits",
+            "sources": [],
+            "truncated": false,
+            "unknown": 0
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No page shows a database edit that a sync import overwrote.",
+          "name": "sync_overwritten_db_edits",
+          "status": "ok"
+        },
+        {
           "category": "meta",
           "details": {
             "rollback": [],
@@ -2825,6 +3230,58 @@
           "elapsed_ms": "<volatile>",
           "message": "No retired sync config key is stored on this brain.",
           "name": "sync_config_keys",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "capped": false,
+            "pairs": [],
+            "scanned": 0
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No title-prefixed person page pairs with an unprefixed page (0 titled page(s) examined).",
+          "name": "person_title_duplicates",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "docs": "docs/designs/GIT_CANONICAL_MEMORY.md#the-git-gap-census",
+            "errors": [],
+            "informational": true,
+            "partial_sources": [],
+            "sources": [],
+            "sources_without_git_checkout": 1,
+            "timeout_ms": "<volatile>"
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No source has a Git checkout, so there is no commit to compare the database with.",
+          "name": "db_ahead_of_git",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "docs": "docs/designs/GIT_CANONICAL_MEMORY.md#the-model",
+            "sources": [],
+            "warn_seconds": 900
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No source is strict (git-canonical), so no index trails a commit.",
+          "name": "git_index_lag",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "docs": "docs/guides/repair.md#outside-content-fences",
+            "items": [],
+            "pages": 0
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No fact, take or link is indexed from a fence on an imported email, calendar, GitHub or transcript page.",
+          "name": "outside_content_fences",
           "status": "ok"
         },
         {
@@ -3168,7 +3625,7 @@
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "Active pack gbrain-base-v2@1.4.0+1c5ba903 is current (no successor declared)",
+          "message": "Active pack gbrain-base-v2@1.5.0+4604112a is current (no successor declared)",
           "name": "pack_upgrade_available",
           "status": "ok"
         },
@@ -3218,6 +3675,7 @@
       "unknown_sections": []
     },
     "stderr": [
+      "[gbrain] reading doctor checks; large brains can take minutes. Progress prints here every 10 s; the result prints on stdout when it is ready.",
       "[gbrain doctor] non-interactive run: the check run (not connect or migrations) is capped at 90000 ms (doctor.default_budget_ms); checks past it report health unknown. Off for one run: --budget-ms 0; off for good: gbrain config set doctor.default_budget_ms 0. On PGLite a statement already running cannot be stopped, so a check can finish late."
     ],
     "stdout": "<json>"
