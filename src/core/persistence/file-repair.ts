@@ -64,7 +64,7 @@ import { parseFenceRepairReceipt, type FenceRepairReceipt } from '../fence-repai
 import { parseContentRepairReceipt, type ContentRepairReceipt } from '../content-repair/receipt.ts';
 import { prepareCanonicalProjections } from './canonical-projections.ts';
 import { digest, sha256 } from './digest.ts';
-import { currentVerifiedLocalWriter, localHostId } from './identity.ts';
+import { currentVerifiedLocalWriter, hostIdFor } from './identity.ts';
 import { getWorktreeBinding } from './ownership.ts';
 import { checkOwner, ownerUnavailableError } from './owner-refusal.ts';
 import { loadRepairBusySet, repairBusy, repairBusyError } from './repair-busy.ts';
@@ -216,8 +216,8 @@ export interface RepairPublicationInput {
 
 export type RepairPublication =
   | { status: 'refused'; refusal: ContentRefusal }
-  /** Importing these bytes would store something other than the file says (retained tags, a withdrawal, sanitization). */
-  | { status: 'overlay' }
+  /** Importing these bytes would store something other than the file says (retained tags, a withdrawal, sanitization); `noop`: the page already holds that result. */
+  | { status: 'overlay'; noop: boolean }
   | { status: 'ready'; ready: PreparedContentImport; digest: string; fields: ReturnType<typeof canonicalRepairFields>; renamedType?: string };
 
 /**
@@ -248,7 +248,7 @@ export async function prepareRepairPublication(engine: BrainEngine, input: Repai
   const renamedType = renamed && parsedInput.typeExplicit !== true ? parsedInput.type : undefined;
   const tags = [...new Set([...(input.base?.tags ?? []), ...prepared.parsedPage.tags])].sort();
   const fields = canonicalRepairFields({ ...prepared.parsedPage, type: renamedType ?? prepared.parsedPage.type }, tags);
-  if (digest(canonicalRepairFields(parsed, parsed.tags)) !== digest(fields)) return { status: 'overlay' };
+  if (digest(canonicalRepairFields(parsed, parsed.tags)) !== digest(fields)) return { status: 'overlay', noop: prepared.noop };
   return { status: 'ready', ready: prepared, digest: digest(fields), fields, ...(renamedType ? { renamedType } : {}) };
 }
 
@@ -272,7 +272,7 @@ function assertTrustedRepairCaller(ctx: Pick<OperationContext, 'remote'>): void 
 export async function managedRepairRoot(engine: BrainEngine, sourceId: string, kind: FileRepairKind = 'frontmatter', opts: { remote?: boolean } = {}): Promise<{ root: string; ownerEpoch: string; incarnation: string }> {
   const [source] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [sourceId]);
   const binding = await getWorktreeBinding(engine, sourceId);
-  const hostId = localHostId();
+  const hostId = hostIdFor(engine);
   const owner = checkOwner(binding, source?.incarnation ?? '', hostId);
   if (owner.reason) throw ownerUnavailableError({ sourceId, reason: owner.reason, binding, incarnation: source?.incarnation ?? '', hostId, remote: opts.remote !== false, work: `the ${WORK[kind]} repair` });
   return { root: join(owner.binding.local_path, owner.binding.relative_path), ownerEpoch: String(owner.binding.owner_epoch), incarnation: owner.binding.source_incarnation };

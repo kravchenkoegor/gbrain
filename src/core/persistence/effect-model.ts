@@ -23,18 +23,29 @@ export interface AppendedRange { start: number; end: number; sha256: string }
  * blank line, so `git log --format=%(trailers)` finds every repair commit.
  * Location only, never page text.
  */
-export interface GitCommitNote { subject: string; line: string; trailer?: string }
+export interface GitCommitNote { subject: string; line: string; trailers?: string[] }
 const safe = (path: string) => path.replace(/[\u0000-\u001f\u007f]/g, '?');
 /** A fence-repaired file's note: `fenceRepairCommitSubject` alone, `<path> (<classes>)` as its line in a batched commit, trailer `gbrain-repair: invalid_fence <tier> high`. */
 export function fenceRepairCommit(path: string, classes: readonly string[], tier: FenceRepairReceipt['tier'] = 'deterministic'): GitCommitNote {
-  return { subject: fenceRepairCommitSubject(path, classes), line: `${safe(path)} (${classes.join(', ')})`, trailer: `gbrain-repair: invalid_fence ${tier} high` };
+  return { subject: fenceRepairCommitSubject(path, classes), line: `${safe(path)} (${classes.join(', ')})`, trailers: [`gbrain-repair: invalid_fence ${tier} high`] };
 }
 /** #6377 a slug-conflict repair's note: `gbrain: repair frontmatter slug in <path>`, `<path> (frontmatter_slug_conflict)` in a batch, trailer from the receipt's tier and confidence. */
 export function contentRepairCommit(path: string, receipt: Pick<ContentRepairReceipt, 'tier' | 'confidence'>): GitCommitNote {
-  return { subject: contentRepairCommitSubject(path), line: `${safe(path)} (frontmatter_slug_conflict)`, trailer: contentRepairTrailer(receipt) };
+  return { subject: contentRepairCommitSubject(path), line: `${safe(path)} (frontmatter_slug_conflict)`, trailers: [contentRepairTrailer(receipt)] };
 }
 /** `rule`: for `git_target_ignored`, the .gitignore rule that excludes the file (`<file>:<line>: <pattern>`). */
 export interface ParkedTarget { slug?: string; error_code: string; rule?: string }
+/** #7423 / #7378: a settled target: under a declared db_only dir (`declared`), or its current bytes proved on the fetched remote (effect-settle.ts). */
+export type SettledTarget = { slug: string; declared: string }
+  | { slug: string; path: string; remote_ref: string; remote_commit: string; blob: string; receipt_request_id: string };
+/** #7985: a target of a retired former-binding effect: its page is gone, deleted, replaced or past the revision the effect owed, or its source was replaced. */
+export type RetiredTarget = { slug: string; page: 'source_replaced' | 'absent' | 'deleted' | 'replaced' | 'moved'; owed_revision: string | null; current_revision?: string };
+export type SettlementProof = { kind: 'db_only'; worktree_id: string; targets: SettledTarget[] }
+  | { kind: 'superseded_remote'; former_worktree_id: string; worktree_id: string; targets: SettledTarget[] }
+  | { kind: 'former_binding_retired'; reason: 'source_replaced' | 'page_moved'; former_worktree_id: string | null; former_incarnation: string;
+    worktree_id: string; source_incarnation: string | null; targets: RetiredTarget[] };
+/** The disposition `gbrain sources writer settle-effects` records on a Git effect whose retry can never succeed. */
+export interface EffectSettlement { reason: SettlementProof['kind']; at: string; host_id: string; plan_hash: string; proof: SettlementProof }
 /** `page_body_segmented`: a segmented page an older binary's mirror or Git scan passed by; this one mirrors and commits it. */
 /** `preview_changed`: a `gbrain repair segmented-mirror` target whose file or render no longer has the hash its preview approved (`data.approved_file`). */
 export interface SkippedTarget { slug: string; reason: 'metafile' | 'file_database_drift' | 'page_body_segmented' | 'withdrawal_not_mirrored' | 'preview_changed' }
@@ -79,6 +90,8 @@ export interface PersistenceEffect {
     /** A single-file Git target's GitCommitNote, when its preparer gave one. */
     commit_subject?: string;
     commit_line?: string;
+    /** One Git trailer line each (a repair's and a reason's). An effect an older release queued carries one `commit_trailer`. */
+    commit_trailers?: string[];
     commit_trailer?: string;
     /** G2 (git-door.ts): the file was committed with its publication (a strict source); the effect only pushes. */
     push_only?: boolean;
@@ -103,7 +116,11 @@ export interface PersistenceEffect {
     /** GBRA-130 A-12: pages whose file this withdrawal mirror rewrote, recorded by its recovery with the cursor step. */
     published?: string[];
     /** The SHA-256 of the bytes this mirror wrote to each published page's file, at the page revision it rendered. */
-    published_files?: Record<string, { hash: string; revision: string }> };
+    published_files?: Record<string, { hash: string; revision: string }>;
+    /** #7423 / #7378: present while the effect is settled; every reader of parked and held effects skips it. */
+    settled?: EffectSettlement;
+    /** Every settle and unsettle of this effect, oldest first; never trimmed. */
+    settlements?: Array<Record<string, unknown> & { action: 'settled' | 'unsettled'; at: string; host_id: string; plan_hash: string }> };
   state: 'queued' | 'running' | 'committed' | 'failed';
   execution_token: string | null;
   claim_expires_at: string | Date | null;

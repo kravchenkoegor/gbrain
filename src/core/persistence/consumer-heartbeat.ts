@@ -32,7 +32,7 @@ import { readlinkSync } from 'node:fs';
 import type { BrainEngine } from '../engine.ts';
 import { isProcessAlive, processStartTime, readBootId } from '../pglite-lock.ts';
 import { VERSION } from '../../version.ts';
-import { localHostIdentity } from './identity.ts';
+import { hostIdentityPathsFor } from './identity.ts';
 import type { SqlEngine } from './model.ts';
 
 /** Kinds whose process stays resident: they defer to the first live full consumer of their host (`serve` always starts full). */
@@ -229,7 +229,7 @@ const RENEW_SQL = `WITH purged AS (
 export function startConsumerHeartbeat(engine: DirectEngine, hostId: string, opts: ConsumerHeartbeatOpts): ConsumerHeartbeat {
   if (engine.kind === 'pglite') return { renew: async () => {}, get failures() { return 0; }, stop: async () => {} };
   const self = opts.identity ?? consumerIdentity();
-  const paths = opts.paths ?? (() => { const id = localHostIdentity(); return { host_json_path: id.path, persistence_home: id.persistence_home, minted_under: id.minted_under }; })();
+  const paths = opts.paths ?? hostIdentityPathsFor(engine);
   const execute = (sql: string, params: unknown[], signal: AbortSignal) =>
     engine.executeRawDirect ? engine.executeRawDirect(sql, params, { signal }) : engine.executeRaw(sql, params, { signal });
   const everyMs = opts.everyMs ?? CONSUMER_RENEWAL_MS;
@@ -285,6 +285,12 @@ export function startConsumerHeartbeat(engine: DirectEngine, hostId: string, opt
       const cancel = new AbortController();
       try { await bounded(execute('DELETE FROM persistence_consumers WHERE host_id=$1::uuid AND pid=$2::integer AND nonce=$3', [hostId, self.pid, self.nonce], cancel.signal), cancel, 1_000); }
       catch { /* the row lapses on its own; the next renewal on this host purges it */ }
+      // GBRA-248: the worktrees this host owns keep the time it stopped, so owner-activity.ts can tell a stopped owner from one long gone.
+      // Rows another transaction holds (a transfer) are skipped, in id order, so the stamp neither waits nor deadlocks.
+      const stamp = new AbortController();
+      try { await bounded(execute(`UPDATE persistence_worktrees SET heartbeat_at=now() WHERE id IN
+        (SELECT id FROM persistence_worktrees WHERE owner_host_id=$1::uuid ORDER BY id FOR UPDATE SKIP LOCKED)`, [hostId], stamp.signal), stamp, 1_000); }
+      catch { /* best effort: owner activity falls back to receipts and the last renewal */ }
     },
   };
 }

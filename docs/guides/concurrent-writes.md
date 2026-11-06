@@ -188,7 +188,7 @@ outcomes and reasons, never values), and `classified` counts the batch:
 
 | Classification | Meaning | Next step |
 | --- | --- | --- |
-| `structurally_additive` | Only additive metadata changed: a `contacts` list with entries appended after every stored entry (order and repeats kept), an activity date that moved forward (`updated`, `last_*`, `*_last_used`), or a field present on one side only. | Preview with `--auto-additive`, then apply. |
+| `structurally_additive` | Only additive metadata changed: a `contacts` list with entries appended after every stored entry (order and repeats kept) or whose stored rows changed only by an activity date moving forward (a row's `last_used`), an activity date that moved forward (`updated`, `last_*`, `*_last_used`), or a field present on one side only. | Preview with `--auto-additive`, then apply. |
 | `additive_with_suggestions` | The above, plus body or timeline lines inserted without changing or removing any stored line. | Read the inserted lines, then preview with `--auto-additive --accept-suggested`. |
 | `review_required` | Stored text changed or was removed; or a policy, privacy, title, type, tag, alias or fence change; or a date that moved backward, changed format or is in the future. | Resolve manually as above, after asking the user. |
 | `formatting_only` | The parsed content already agrees. | Preview; the result is the database content. |
@@ -354,8 +354,10 @@ its chunks are built after commit; see
 
 Nonterminal receipts may include a validated `diagnostic` with `age_ms`,
 `assessment` (`pending`, `blocked`, or `stalled`), a closed `reason`, and
-`next_action` (`poll` or `inspect_owner`). An optional `observed_at` is the
-observation time, not the last useful progress time. Older servers may omit
+`next_action` (`poll` or `inspect_owner`). An optional `owner` block (`last_active`)
+appears when the worktree's owner host runs no consumer and has been quiet past
+the stale window ([stale owner](troubleshooting.md#owner-host-stale)). An optional
+`observed_at` is the observation time, not the last useful progress time. Older servers may omit
 diagnostics. A fallback without fresh dependency evidence omits the observation
 timestamp; it does not claim that a cached row is current.
 
@@ -383,7 +385,8 @@ arguments with that UUID. When `next_action` is `inspect_owner`, ask the operato
 to inspect first instead of repeatedly submitting mutations.
 
 `write_pending` means accepted work remains outstanding; the CLI exits 10 for it
-(0 with `--accept-pending`) and waits 30 s by default (`--wait <seconds>`,
+(0 with `--accept-pending`, except for a receipt whose `diagnostic.owner` names a stale
+owner) and waits 30 s by default (`--wait <seconds>`,
 `GBRAIN_WRITE_WAIT_MS`, `persistence.write_wait_ms`); see
 [CLI exit status for writes](../protocol/MEMORY_VERBS_v1.md#cli-exit-status-for-writes).
 The admin health indicators count it as `accepted_pending`, outside the error
@@ -990,7 +993,11 @@ When `persistence_capacity` warns or fails, or a write is refused with
 
 1. Read the finding: `gbrain doctor --only persistence_capacity --json`.
    `details.resources[]` names the scope, resource, days left and `basis`;
-   `fix` is the reversible unblock.
+   `fix` is the reversible unblock. `details.outstanding[]` lists an
+   outstanding-request cap at 90% or more whose oldest request is over ten
+   minutes old (a healthy drain near the line stays ok), with the sources holding its slots;
+   requests that stopped settling (or wait behind a slow publication) hold them, so when it is the only finding, `fix`
+   is that source's read-only `gbrain sources writer status`, not a raise.
 2. Run the `gbrain config set <key> <value>` it prints on the brain host
    (undo with `gbrain config unset <key>`). Writes resume at once; retry the
    refused write with the same `request_id`.
@@ -1003,7 +1010,7 @@ stored, and compaction frees the window's reservations as receipts age out.
 within `persistence.capacity.warn_days` (default 30), adds the
 `[gbrain notice write_capacity_low]` notice (kind `info`) with the same
 `gbrain config set` command. Write and sync receipts carry it at most once an
-hour per process per scope (a remote client sees only the brain and its own
+hour per engine per scope (a remote client sees only the brain and its own
 principal); `gbrain sync status`, doctor and autopilot cycle output carry it
 every time. `gbrain notices mute write_capacity_low` mutes it on receipts;
 doctor still reports it. When a cap passes

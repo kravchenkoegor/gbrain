@@ -22,7 +22,8 @@ import { moveSlugBindings, recordRenameAlias } from '../page-state/rename-alias.
 import { segmentedRevertRefusal } from '../page-state/versions.ts';
 import { sanitizeText } from '../batch-rows.ts';
 import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion } from '../search/safe-chunks.ts';
-import { privatePagesFilterFragment, privateSnapshotFilterFragment } from '../search/private-visibility.ts';
+import { privatePagesFilterFragment, privateSnapshotFilterFragment, privatePagesFilterForCaller, privacyForCaller, callerReadersAllowedSql } from '../search/private-visibility.ts';
+import { validDateSql } from '../valid-time.ts';
 import { quarantineFilterFragment } from '../quarantine.ts';
 import { rederiveHiddenSql } from '../eligibility/sql.ts';
 import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, isMissingSchemaObject, warnOncePerProcess } from '../utils.ts';
@@ -180,7 +181,7 @@ export async function putPage(
         import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
         chunker_version       = ${trustedSql(bodyWriteChunkVersion('EXCLUDED.compiled_truth', 'EXCLUDED.timeline'))},
         source_path           = COALESCE(EXCLUDED.source_path,           pages.source_path),
-        database_only_reason  = CASE WHEN EXCLUDED.source_path IS NOT NULL AND pages.database_only_reason IN ('detached', 'origin_twin') THEN NULL ELSE pages.database_only_reason END,
+        database_only_reason  = CASE WHEN EXCLUDED.source_path IS NOT NULL AND pages.database_only_reason IN ('detached', 'origin_twin', 'mirror_read_only') THEN NULL ELSE pages.database_only_reason END,
         source_kind           = COALESCE(EXCLUDED.source_kind,           pages.source_kind),
         source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
         ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
@@ -495,7 +496,7 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       : sqlFragment`AND p.deleted_at IS NULL`;
     // #4352: untrusted-caller private-page filter (see PageFilters.excludePrivate).
     const privateCondition = filters?.excludePrivate === true
-      ? trustedSql(`AND ${privatePagesFilterFragment('p')}`)
+      ? trustedSql(`AND ${privatePagesFilterForCaller('p')}`)
       : sqlFragment``;
     const effectiveAfterCondition = filters?.effective_after
       ? sqlFragment`AND p.effective_date >= ${filters.effective_after}::timestamptz`
@@ -723,7 +724,7 @@ export async function resolveSlugs(
     // `get_page`.
     const sources = opts?.sourceIds?.length ? opts.sourceIds : null;
     const scalar = opts?.sourceId ?? null;
-    const privacy = opts?.excludePrivate ? trustedSql(` AND ${privatePagesFilterFragment('pages')}`) : sqlFragment``;
+    const privacy = opts?.excludePrivate ? trustedSql(` AND ${privatePagesFilterForCaller('pages')}`) : sqlFragment``;
     const scopeFragment = sources
       ? sqlFragment` AND source_id = ANY(${sources}::text[])`
       : scalar
@@ -1000,6 +1001,24 @@ const PAGE_VERSION_METADATA_COLUMNS = trustedSql('pv.id, pv.page_id, pv.frontmat
 const PAGE_VERSION_SEGMENTED_COLUMNS = trustedSql('pv.body_storage, pv.body_generation, pv.body_bytes, pv.content_hash');
 
 /**
+ * GBRA-217: a snapshot's `replaced_because` as a reader may see it. A trusted reader gets the stored reason. A reader
+ * held to world-visible pages (`excludePrivate`) gets it only when the snapshot's successor is world-visible too (the
+ * next snapshot of the page, or the live page, which the caller's own page predicate checks) and the successor was not
+ * pruned (`successor_pruned`: its visibility can no longer be checked, so the reason is withheld). The successor is
+ * read over every snapshot of the page, never only the rows the reader may see. Shared by get_versions and get_page as_of.
+ * GBRA-286: a successor snapshot that names readers the caller does not meet (GBRA-218 readable_by) withholds it too.
+ */
+export function replacedBecauseSql(pv: string, excludePrivate: boolean): string {
+  if (!excludePrivate) return `${pv}.change_reason`;
+  return `CASE WHEN ${pv}.change_reason IS NULL OR COALESCE(${pv}.successor_pruned, false) THEN NULL
+    WHEN COALESCE((SELECT ${privateSnapshotFilterFragment('rb_next')} AND ${callerReadersAllowedSql('rb_next', 'snapshot')} FROM page_versions rb_next
+      WHERE rb_next.page_id = ${pv}.page_id AND rb_next.id > ${pv}.id ORDER BY rb_next.id LIMIT 1), true) THEN ${pv}.change_reason END`;
+}
+
+/** GBRA-217: each version's parsed valid time (the shared normaliser), so a timeline reads in one get_versions call. */
+const VERSION_VALID_TIME_COLUMNS = `${validDateSql("pv.frontmatter->>'valid_from'")} AS valid_from, ${validDateSql("pv.frontmatter->>'valid_until'")} AS valid_until`;
+
+/**
  * Newest first (`pv.id` breaks snapshot_at ties). Scope, privacy and
  * re-derivation (a page a purge hid) predicates sit in WHERE, so `limit`
  * bounds only rows the caller may read; `includeBody: false` never selects
@@ -1011,14 +1030,15 @@ export async function getVersions<B extends boolean = true>(
   opts?: GetVersionsOpts<B>,
 ): Promise<PageVersionRows<B>> {
     const privacy = opts?.excludePrivate
-      ? trustedSql(`AND ${privatePagesFilterFragment('p')} AND ${privateSnapshotFilterFragment('pv')}`) : sqlFragment``;
+      ? trustedSql(`AND ${privatePagesFilterForCaller('p')} AND ${callerReadersAllowedSql('pv', 'snapshot')} AND ${privacyForCaller('p', privateSnapshotFilterFragment('pv'))}`) : sqlFragment``;
     const scope = opts?.sourceIds && opts.sourceIds.length > 0
       ? sqlFragment`AND p.source_id = ANY(${opts.sourceIds}::text[])`
       : opts?.sourceId ? sqlFragment`AND p.source_id = ${opts.sourceId}` : sqlFragment``;
     const columns = opts?.includeBody === false ? PAGE_VERSION_METADATA_COLUMNS : PAGE_VERSION_COLUMNS;
     const limit = opts?.limit !== undefined ? sqlFragment`LIMIT ${opts.limit}` : sqlFragment``;
     const { rows } = await exec.run(sqlFragment`
-      SELECT ${columns}, ${PAGE_VERSION_SEGMENTED_COLUMNS} FROM page_versions pv
+      SELECT ${columns}, ${PAGE_VERSION_SEGMENTED_COLUMNS}, ${trustedSql(replacedBecauseSql('pv', opts?.excludePrivate === true))} AS replaced_because,
+        ${trustedSql(VERSION_VALID_TIME_COLUMNS)} FROM page_versions pv
       JOIN pages p ON p.id = pv.page_id
       WHERE p.slug = ${slug} ${scope}
         ${privacy} AND ${trustedSql(rederiveHiddenSql('pages', 'p'))}
@@ -1127,7 +1147,7 @@ export async function resolveSlugWithAliasDetailed(
 ): Promise<{ canonical_slug: string; source_id: string } | null> {
     const sources = Array.isArray(sourceOrSources) ? sourceOrSources : [sourceOrSources];
     if (sources.length === 0) return null;
-    const privacy = opts?.excludePrivate ? trustedSql(`AND EXISTS (SELECT 1 FROM pages p WHERE p.slug = slug_aliases.canonical_slug AND p.source_id = slug_aliases.source_id AND p.deleted_at IS NULL AND ${privatePagesFilterFragment('p')})`) : sqlFragment``;
+    const privacy = opts?.excludePrivate ? trustedSql(`AND EXISTS (SELECT 1 FROM pages p WHERE p.slug = slug_aliases.canonical_slug AND p.source_id = slug_aliases.source_id AND p.deleted_at IS NULL AND ${privatePagesFilterForCaller('p')})`) : sqlFragment``;
     try {
       const { rows } = await exec.run<{ canonical_slug: string; source_id: string }>(sqlFragment`
         SELECT canonical_slug, source_id

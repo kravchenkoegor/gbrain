@@ -244,7 +244,7 @@ function checkContent(content: string, slugPath: string | undefined, importable:
   const errors = (parsed.errors ?? []).map(e => ({ code: e.code, message: e.message, line: e.line, ...(e.recoverable ? { recoverable: true } : {}) }));
   const warnings = (parsed.warnings ?? []).map(w => ({ code: w.code, message: w.message, key: w.key, line: w.line,
     ...(w.original !== undefined ? { original: w.original } : {}), ...(w.replacement !== undefined ? { replacement: w.replacement } : {}) }));
-  const screen = importable ? screenImportContent({ content, path: slugPath ?? 'stdin.md', expectedSlug }) : null;
+  const screen = importable ? screenImportContent({ content, path: slugPath ?? 'stdin.md', expectedSlug, holdNoncanonicalPrivate: true }) : null;
   const hold = screen?.status === 'refused' ? screen.refusal : null;
   return {
     errors, warnings, hold,
@@ -688,6 +688,10 @@ function printAuditHumanReport(report: AuditReport): void {
   }
   for (const src of report.per_source) {
     console.log(`\n[${src.source_id}] ${src.source_path}`);
+    if (src.status === 'missing') {
+      console.log('  NOT SCANNED: the directory is missing (restore it, or gbrain sources set-path <id> <path>)');
+      continue;
+    }
     if (src.total === 0) {
       console.log('  clean');
       continue;

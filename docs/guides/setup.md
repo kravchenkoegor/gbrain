@@ -2,7 +2,8 @@
 
 `gbrain setup claude-code` and `gbrain setup codex` give Claude Code or Codex
 memory in one command: a brain (the existing one, or a new keyless local
-brain), a stdio MCP entry, and the read-context hooks, verified with the same
+brain), a stdio MCP entry, the read-context hooks and a short
+[brain-first instruction block](#brain-first-instructions), verified with the same
 smoke test `gbrain doctor --only harness_wiring` runs. Setup changes only what
 it records, and `--remove` undoes exactly that.
 
@@ -23,9 +24,9 @@ Before it writes anything, setup resolves and prints:
 |---|---|
 | Brain | This install's config (`GBRAIN_HOME`). With none, a new keyless PGLite brain from `gbrain init --pglite --no-embedding`. |
 | Source | `--source`, else `GBRAIN_SOURCE`, else unpinned (the server uses the brain's default source). |
-| Transport | Local stdio: the harness starts `<launcher> serve --surface <surface>`. |
+| Transport | Local stdio: the harness starts `<launcher> serve --surface <surface>`, plus `--advertise verbs` on a new registration that chose no surface. |
 | Launcher | `--gbrain-bin`, else the absolute `gbrain` on `PATH` (GUI-launched hosts inherit no `PATH`, so a bare name is never written). |
-| Surface | `--surface`, else `GBRAIN_SURFACE`, else the surface already registered, else `full`. |
+| Surface | `--surface`, else `GBRAIN_SURFACE`, else the surface already registered, else `starter`, listing only the seven memory verbs and `request_tools` (`--advertise verbs`). A chosen surface is listed in full; `--surface full` is the opt-in for every tool; an existing registration keeps its surface and listing. |
 | Owner | Who owns the MCP name now: nobody, this setup (its receipt), or the gbrain Claude Code or Codex plugin (setup then adds hooks only). |
 
 It refuses with a coded error, before any write, when the target is not safe:
@@ -114,10 +115,14 @@ runs only when config.toml carries a `[hooks.state."<hooks.json>:<event>:<index>
 table with its `trusted_hash`, otherwise Codex lists it and silently skips it.
 `gbrain setup codex` writes:
 
-- `[mcp_servers.<name>]` with `command`, `args` and `env` (`GBRAIN_HOME`,
-  `GBRAIN_SOURCE` when set);
+- `[mcp_servers.<name>]` with `command` (the hook launcher), `args` (`<launcher> serve …`) and
+  `env` (`GBRAIN_HOME`, `GBRAIN_SOURCE` when set): Codex starts stdio servers in
+  the session's directory, so serve starts through the hook launcher too (#8426);
 - one hooks.json group per event, running
-  `env GBRAIN_HOOK_LANE=setup … <launcher> hook session-start|user-prompt --harness codex`
+  `env GBRAIN_HOOK_LANE=setup … <hook launcher> <launcher> hook session-start|user-prompt --harness codex`
+  (the hook launcher, `<gbrain config dir>/hook-launcher/gbrain-hook`, starts
+  gbrain from its own directory so the session directory's `bunfig.toml` and
+  `.env` never load; SECURITY.md)
   (15 s), plus the detached `hook session-end --harness codex` capture command
   (3 s) only after `--capture`;
 - one trust table per group.
@@ -146,6 +151,79 @@ leaves it alone. The brain, its notes, unrelated MCP servers and hooks stay.
 Two installs on one machine (different `GBRAIN_HOME`) each use their own
 `--name` and remove only their own entries.
 
+## Brain-first instructions
+
+Registering MCP makes the tools available; it does not make agents use them.
+Without a line in the harness's own instructions, sessions rarely call the
+brain. So setup also writes one short marked block (`<!-- gbrain:brain-first:begin -->`
+… `<!-- gbrain:brain-first:end -->`) into the file the harness loads every
+session: before answering any turn, search the brain first, read the best hit,
+fill gaps with other tools, apply your own access rules (`source_ids` narrows a
+search to what the current requester may see), then finish the task.
+
+| Harness | File |
+|---|---|
+| claude-code | `~/.claude/CLAUDE.md` (`--scope project`: `./CLAUDE.local.md`) |
+| codex | `$CODEX_HOME/AGENTS.md`, or a non-empty `AGENTS.override.md` (the file Codex loads) |
+| opencode | `~/.config/opencode/AGENTS.md` |
+| openclaw | `<workspace>/AGENTS.md` (`agents.defaults.workspace`, else `~/.openclaw/workspace`; several agents need `--workspace`) |
+| hermes | `$HERMES_HOME/SOUL.md`, after the identity text; never created, since a SOUL.md replaces Hermes's default identity |
+| cursor | `./.cursor/rules/gbrain-brain-first.mdc` (an always-applied project rule) |
+
+Text outside the markers is never touched, and a re-run upgrades the block in
+place. `--dry-run` previews it, `--no-instructions` (or
+`GBRAIN_AGENT_INSTRUCTIONS=0`) removes it and remembers the opt-out,
+`--instructions` opts back in, `--instructions-only` manages only the block,
+and `--remove` takes it out with the rest. A hand-edited block with damaged
+markers is left alone and reported. Clients with no instruction file gbrain can
+write (Claude Desktop, ChatGPT, Perplexity, Grok Build, Grok Bot, Muse) get the
+block printed to paste. `gbrain connect --install` and
+`gbrain bootstrap harness` write the same block beside the connection they
+install, and the thin-client `GBRAIN-INSTRUCTIONS.md` starts with it.
+`gbrain doctor` (`harness_wiring`) warns when a registered harness's block is
+missing, stale or damaged, with a fix that rewrites only the block.
+
+A rule in the system prompt is easy for a model to pass over, so the same rule
+also rides each turn where the harness has a per-turn hook: Claude Code and
+Codex get it from setup's UserPromptSubmit hook while the block is installed,
+OpenClaw from a hook-only plugin (`gbrain-turn-rule`, `before_prompt_build`)
+that `gbrain setup openclaw` installs with the openclaw CLI, and Hermes from a
+marked, self-contained `pre_llm_call` hook that `gbrain setup hermes` adds to its
+config.yaml. Cursor's rule is always applied; opencode reads its AGENTS.md on
+every request. QM has no per-turn hook an install can set: its gateway's
+`instructions` are per turn but belong to the surface that posts the turn. The
+opt-out turns the per-turn rule off with the block.
+
+## Skill loading (opt-in)
+
+GBrain ships step-by-step skills (meeting ingestion, fact-checking, the
+bulk-delete gate, filing rules, …). By default no install lane hands them to
+the agent. `--skill-loading spring` adds a second marked block
+(`<!-- gbrain:skills:begin -->` … `<!-- gbrain:skills:end -->`) right after
+the brain-first block in the same file: a compact index of the bundled skills,
+one line per skill with its trigger phrases (about 1.5k tokens, capped at
+6,144 bytes). The full skill is loaded only when a task matches, with
+
+    <launcher> bundled-skill <name>                 # the SKILL.md, then the files it names
+    <launcher> bundled-skill <name> --asset <path>  # one of those files
+
+`gbrain bundled-skill` reads the skills built into gbrain itself: it opens no
+brain and needs no MCP server or skill publication, so it works on a thin
+client and from a compiled binary. The index names the absolute launcher the
+install recorded, so the index and the skills it loads come from the same
+gbrain. MCP `get_skill` is unchanged.
+
+| | |
+|---|---|
+| Select | `--skill-loading off\|spring` on `gbrain setup <harness>`, `gbrain connect --install`, `gbrain connect --harness … --install` and `gbrain bootstrap harness`; or `GBRAIN_SKILL_LOADING`. Flag, then env, then the recorded choice, then `off`. |
+| Default | `off`: no index is written, and `off` removes one an earlier run wrote. |
+| Which skills | Host installs (`setup`, `bootstrap harness`) list all bundled skills; hosted and thin-client connections leave out the host-maintenance ones. |
+| Opt out | `--skill-loading off`; `--no-instructions` removes both blocks; `--remove` takes both out and deletes a file only gbrain created once nothing else is in it. On Codex, `--skill-loading off`, `--no-instructions` and `GBRAIN_SKILL_LOADING=off` also strip an index gbrain recorded in the other global instruction file of the same `CODEX_HOME` (`AGENTS.md` or `AGENTS.override.md`) and print it as a second skills line (`paired` in `--json`, in `--dry-run` too), so the index cannot return when the override file goes. |
+| After an upgrade | The block records the skill catalog it indexes. `gbrain doctor` (`harness_wiring`) names a stale index and the refresh command (`gbrain setup <harness> --skills-index-only`, which rewrites only the skills block, keeping its recorded file, launcher and skill set). It never warns on a stale index alone, and nothing rewrites the file during an upgrade. |
+| Launcher check | Before writing, setup runs `<launcher> bundled-skill --json` and refuses (nothing written, exit 1) when the launcher is not an absolute path, does not run, or serves other skills than the ones indexed. Pass `--gbrain-bin <absolute path>` to name another gbrain. `gbrain doctor` reports an index whose recorded launcher is gone. |
+| Claude Code permission | Claude Code asks before each Bash command it has no rule for (and headless runs deny it), so on Claude Code spring also adds one rule, `Bash(<launcher> bundled-skill:*)`, to `~/.claude/settings.json`. gbrain records that it added it and takes it out with the last index that uses it; a rule you had before is left alone. If you delete the rule, gbrain doesn't add it back until you run with `--skill-loading spring` again. |
+| Choice record | `~/.gbrain/skill-loading.json` (harness, file, mode, launcher, audience, catalog, and the Claude Code rule and whether gbrain added it). It and the brain-first record (`agent-instructions.json`) share one lock, `~/.gbrain/agent-instructions.lock`, held for each install step, so two installs at once cannot drop each other's entry. An install that cannot take the lock within 10 seconds changes nothing and says why (`ledger_locked` in `--json`); re-run it once the other install finishes. A dry run takes no lock. |
+
 ## Harness capability table
 
 The table is data (`src/core/setup/capabilities.ts`, version 2). Push is never
@@ -155,9 +233,9 @@ claimed from documentation alone.
 |---|---|---|---|
 | claude-code | local stdio | supported | native-pending |
 | codex | local stdio | supported | native-verified: on codex-cli 0.162.1, after a fresh `gbrain setup codex`, the `UserPromptSubmit` hook put a randomized brain item into a fresh native `codex exec` session, which answered it with no tool call (3 of 3 installs); a `--no-hooks` control answered NONE |
-| openclaw | local context engine | refusal with [its guide](../mcp/OPENCLAW.md) | native-pending |
-| openclaw | thin client | refusal with [its guide](../mcp/OPENCLAW.md) | unsupported |
-| hermes | local stdio | refusal with [its guide](../mcp/HERMES.md) | unsupported |
+| openclaw | local context engine | instruction block; MCP per [its guide](../mcp/OPENCLAW.md) | native-pending |
+| openclaw | thin client | instruction block; MCP per [its guide](../mcp/OPENCLAW.md) | unsupported |
+| hermes | local stdio | instruction block; MCP per [its guide](../mcp/HERMES.md) | unsupported |
 
 ## How setup relates to the other entry points
 

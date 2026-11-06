@@ -305,19 +305,22 @@ export const staleMentionsEntry: DoctorEntry = {
 };
 
 async function runTimelineHistory(ctx: DoctorContext): Promise<Check[]> {
-  const { orphanRatioSourceId, progress } = ctx;
+  const { orphanRatioSourceId, progress, only } = ctx;
   const engine = connectedEngine(ctx);
   const checks: Check[] = [];
 
   // 9d. Wave 2 residual-state signals (#5567, #5525): database-only timeline
   // rows and derived pages without explicit visibility. Bounded, never throw.
+  // #7343: under --only, run just the named checks of this entry.
   progress.heartbeat('timeline_history');
   {
-    const { timelineHistoryCheck } = await import('./timeline-history.ts');
-    checks.push(await timelineHistoryCheck(engine, orphanRatioSourceId));
+    if (!only || only.has('timeline_history')) {
+      const { timelineHistoryCheck } = await import('./timeline-history.ts');
+      checks.push(await timelineHistoryCheck(engine, orphanRatioSourceId));
+    }
     // Wave checks registered in doctor/wave-checks.ts rather than inline here.
     const { runWaveChecks } = await import('../wave-checks.ts');
-    for (const finding of await runWaveChecks(engine, { only: 'wave', sourceIds: orphanRatioSourceId ? [orphanRatioSourceId] : undefined })) checks.push(finding.check);
+    for (const finding of await runWaveChecks(engine, { only: 'wave', ids: only ?? undefined, sourceIds: orphanRatioSourceId ? [orphanRatioSourceId] : undefined })) checks.push(finding.check);
   }
   return checks;
 }
@@ -335,6 +338,24 @@ export const derivedVisibilityEntry: DoctorEntry = {
   name: 'derived_visibility',
   emits: ['derived_visibility'],
   run: runDerivedVisibility,
+};
+
+/**
+ * GST-1209 follow-up: damaged segmented pages are their own entry with their own budget, so a default run reports the
+ * finding even when the wave checks of timeline_history run out of theirs (and never serves an older entry's last known result for it).
+ */
+async function runSegmentedTiling(ctx: DoctorContext): Promise<Check[]> {
+  ctx.progress.heartbeat('segmented_tiling');
+  const { segmentedTilingCheck } = await import('./segmented-tiling.ts');
+  const checks: Check[] = [];
+  checks.push(await segmentedTilingCheck(connectedEngine(ctx), ctx.orphanRatioSourceId ? [ctx.orphanRatioSourceId] : undefined));
+  return checks;
+}
+
+export const segmentedTilingEntry: DoctorEntry = {
+  name: 'segmented_tiling',
+  emits: ['segmented_tiling'],
+  run: runSegmentedTiling,
 };
 
 export const timelineHistoryEntry: DoctorEntry = {
@@ -373,6 +394,7 @@ export const timelineHistoryEntry: DoctorEntry = {
     'conversation_label_facts',
     'conversation_outcomes_stale',
     'captured_facts_active',
+    'agent_session_facts',
     'facts_redaction_marker',
     'fact_bulk_dates',
     'loop_facts_drift',

@@ -74,8 +74,12 @@ export interface SyncResult {
   fileRefusals?: import('../core/persistence/sync-discovery.ts').SyncFileRefusal[]; links?: import('../core/persistence/links-maintenance.ts').ManagedLinkExtraction; /** #6729: inexact renames split into delete + add; once recorded each is an IdentityDowngrade (old slug, what stayed on it). */ identityDowngrades?: Array<import('../core/sync.ts').DowngradedRename | import('../core/sync-identity-downgrades.ts').IdentityDowngrade>;
   /** #6712 PR 2 (L5): the owed post-checkpoint tail (statistics, links) this call ran after releasing the lease; a degraded tail carries its notice. */
   tail?: Omit<import('../core/persistence/sync-tail.ts').SyncTailReport, 'links'>;
+  /** GBRA-217: the pass's change-reason notices (a failed or capped trailer scan, a secret in a pushed trailer) and its count of skipped malformed trailers. */
+  reason_notices?: import('../core/agent-output.ts').Notice[];
+  reason_trailers_malformed?: number;
   /** #5459 (P4.5): live pages a `--full` tree walk kept because their file is in the working tree and their import provenance is the working tree or unknown. */
   working_tree_kept?: number;
+  /** #8007: pages whose file is gone kept because gbrain.yml's storage section is invalid. */ storage_invalid_kept?: number;
   /**
    * Aggregated alias/undeclared explicit-type warnings (schema.type_warnings,
    * default on) — one entry per distinct non-canonical type this run.
@@ -95,6 +99,8 @@ export interface SyncResult {
   extract_error?: string;
   /** #5050: full sync re-sealed unchanged pages at the safe-chunk fence (see RunImportResult.resealed). */
   resealed?: import('./import.ts').RunImportResult['resealed'];
+  /** GBRA-287: DB-only pages (#2426) a full sync kept but could not re-export to the working tree; the run still completed. */
+  reexport_failures?: import('./sync/full.ts').ReexportFailure[];
   /**
    * v0.41.13.0 partial-sync fields (only set when status === 'partial').
    *
@@ -134,12 +140,12 @@ export interface SyncResult {
   connectorHolds?: { held: number; newly_held: number; retry_command: string; status_command: string };
   /**
    * #5988 Git holds: files held this run instead of blocking (detail capped at
-   * `GBRAIN_SYNC_HOLD_CAP`), their count, the source's outstanding total and the
+   * `GBRAIN_SYNC_HOLD_CAP`), their count (#7199: how many wait on a person), the source's outstanding total and the
    * exact inspect and repair commands. Remote callers get `held_count` and
    * `holds_fix` (a host-operator relay) only.
    */
   held?: import('../core/persistence/sync-holds.ts').GitHoldItem[];
-  held_count?: number;
+  held_count?: number; held_needs_human?: number;
   holds_outstanding?: number;
   holds_escalated?: boolean;
   holds_truncated?: boolean;
@@ -208,6 +214,8 @@ export interface SyncOpts {
    * working-tree mode (resolveManagedSyncContext refuses `--working-tree` for a strict-classified pass).
    */
   canonicalOverride?: 'git';
+  /** #7866, internal (the conversion's strict passes): a full round without a `--full` episode, so a page equal to its blob is not re-imported. */
+  fullRound?: boolean;
   /**
    * v0.18.0 Step 5 — sync a specific named source. When set, sync reads
    * local_path + last_commit from the sources table (not the global
@@ -371,7 +379,7 @@ export interface SyncOpts {
    * breadcrumbs already cover that surface).
    */
   onProgress?: (p: { phase: string; bankedFiles?: number; total?: number; waived?: boolean; group?: number;
-    /** #5984 lanes (phase `managed_sync.lanes`). */ lanes?: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number }; /** #7243: a pass round (`managed_sync.round_level`, `managed_sync.round_admit`). */ round?: { round: number; target: string; paths: number; read_ms?: number; imports?: number; deletes?: number; in_flight?: number } }) => void;
+    /** #5984 lanes (phase `managed_sync.lanes`). */ lanes?: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number }; /** #7243: a pass round (`managed_sync.round_level`, `managed_sync.round_admit`; #7866 `managed_sync.round_batch`: `batch` of `batches`, starting at candidate `base`). */ round?: { round: number; target: string; paths: number; read_ms?: number; imports?: number; deletes?: number; in_flight?: number; batch?: number; batches?: number; base?: number } }) => void;
   /**
    * #5984: managed sync only. Re-enter the single-pass managed sync until the
    * cursor is done, the caller's signal/deadline stops it, or it is blocked

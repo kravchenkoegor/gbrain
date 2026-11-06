@@ -29,7 +29,7 @@ import {
 } from '../core/trust/review.ts';
 import { trustLabel } from '../core/trust/tier.ts';
 import { PENDING_WRITE_EXIT_CODE } from '../core/exit-codes.ts';
-import { acceptPendingRequested, pendingReceiptOf, pollCommand } from '../core/persistence/write-wait.ts';
+import { acceptPendingCovers, acceptPendingRequested, pendingReceiptOf, pollCommand } from '../core/persistence/write-wait.ts';
 import { getCliOptions } from '../core/cli-options.ts';
 import { cliRenderContext } from '../core/agent-output.ts';
 import { reportPersistenceCliError } from './persistence-delegate.ts';
@@ -152,9 +152,14 @@ async function acceptAll(backend: TrustBackend, args: string[], json: boolean): 
       'Narrow it first, e.g. gbrain trust review --accept-all --from default --since 7d; run gbrain trust review to see what would match.');
   }
   const review = await backend.review(filter);
-  const inputs = review.items.map(item => ({ action: item.kind === 'hold' ? 'release' : 'confirm', ref: item.ref, source: item.source_id } as OwnerActionInput));
+  // A contradiction has no single accept: each of its commands decides it differently, so --accept-all leaves it for the owner.
+  const skipped = review.items.filter(item => item.kind === 'contradiction')
+    .map(item => ({ ref: item.ref, reason: 'contradiction', next: 'Decide it with one of its commands: gbrain trust review --kind contradiction' }));
+  const inputs = review.items.filter(item => item.kind !== 'contradiction')
+    .map(item => ({ action: item.kind === 'hold' ? 'release' : 'confirm', ref: item.ref, source: item.source_id } as OwnerActionInput));
+  const skipLines = () => { for (const s of skipped) console.log(`${s.ref}: skipped (a contradiction; ${s.next})`); };
   if (inputs.length === 0) {
-    if (json) await writeStdoutFinal(`${JSON.stringify({ accepted: [], skipped: [] }, null, 2)}\n`); else console.log('Nothing matches those filters.');
+    if (json) await writeStdoutFinal(`${JSON.stringify({ accepted: [], skipped }, null, 2)}\n`); else if (skipped.length) skipLines(); else console.log('Nothing matches those filters.');
     return;
   }
   const previews = await Promise.all(inputs.map(input => backend.preview(input)));
@@ -164,24 +169,27 @@ async function acceptAll(backend: TrustBackend, args: string[], json: boolean): 
   await requireOwnerConfirmation(LOCAL_CTX, { ref: `${previews.length} items`, token, summary, command });
   const accepted: OwnerActionResult[] = [];
   const pending: Array<{ ref: string; request_id: string; poll: string }> = [];
+  let uncovered = 0;
   const failed: Array<{ ref: string; error: unknown }> = [];
   for (let i = 0; i < inputs.length; i++) {
     try { accepted.push(await backend.apply(inputs[i]!, previews[i]!.binding, previews[i]!.raises)); }
     catch (error) {
       const receipt = pendingReceiptOf(error);
+      if (receipt && !acceptPendingCovers(receipt)) uncovered++;
       if (receipt) pending.push({ ref: previews[i]!.ref, request_id: receipt.request_id,
         poll: pollCommand(receipt.request_id, (error as { fix?: { argv?: readonly string[] } }).fix, cliRenderContext().routing) });
       else failed.push({ ref: previews[i]!.ref, error: error instanceof OperationError ? error.toJSON() : String(error) });
     }
   }
-  if (json) await writeStdoutFinal(`${JSON.stringify({ accepted, pending, failed }, null, 2)}\n`);
+  if (json) await writeStdoutFinal(`${JSON.stringify({ accepted, pending, failed, skipped }, null, 2)}\n`);
   else {
+    skipLines();
     for (const r of accepted) console.log(resultLine(r));
     for (const p of pending) console.log(`${p.ref}: accepted, still pending (request ${p.request_id}; check with ${p.poll})`);
     for (const f of failed) console.log(`${f.ref}: not applied (${(f.error as { message?: string }).message ?? String(f.error)})`);
   }
   if (failed.length) setCliExitVerdict(1);
-  else if (pending.length && !acceptPendingRequested(getCliOptions().acceptPending)) setCliExitVerdict(PENDING_WRITE_EXIT_CODE);
+  else if (pending.length && (!acceptPendingRequested(getCliOptions().acceptPending) || uncovered > 0)) setCliExitVerdict(PENDING_WRITE_EXIT_CODE);
 }
 
 /** Renders a refusal through the shared CLI envelope with its contract exit code (3 for consent refusals). */
