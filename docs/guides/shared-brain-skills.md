@@ -418,12 +418,13 @@ gbrain config set shared_skills.migration.enabled false
 ```
 
 The key is brain-level database config, so it applies to every machine that
-uses that database. From then on `gbrain apply-migrations` (including the
-`bun install` postinstall, `gbrain upgrade` and `gbrain post-upgrade`) skips
+uses that database. From then on `gbrain apply-migrations` (including
+`gbrain upgrade` and `gbrain post-upgrade`) skips
 v0.53.0 entirely: no inventory, no `shared_skills.migration.v1*` config
 writes, and the applied-migration re-check does not run. `gbrain
 apply-migrations --list` and `--dry-run` show it as `declined` with the key,
-`gbrain doctor` reports `minions_migration` ok with `declined: ['0.53.0']`,
+`gbrain doctor` reports `minions_migration` ok with `declined: ['0.53.0']`
+(`gbrain doctor --fast` cannot read the key and never lists v0.53.0 as not run),
 and `get_health.migrations.declined` lists it. An explicit `gbrain
 apply-migrations --migration 0.53.0` refuses with `migration_declined` (exit
 3) and the command that turns it back on instead of overriding the owner's
@@ -536,6 +537,22 @@ before parking existed) resumes with
 `gbrain apply-migrations --force-retry 0.53.0`, then
 `gbrain apply-migrations --migration 0.53.0 --yes`; the oversized source parks
 and the migration completes.
+
+A 0.53.0 migration wedged on a source conflict is reported by `gbrain doctor`,
+`gbrain apply-migrations --dry-run` and `post-upgrade`, each naming the sources
+in conflict, the code and the next step; ordinary commands say nothing about it
+once a newer migration has completed. Run
+`gbrain apply-migrations --migration 0.53.0 --dry-run --json` (it changes
+nothing) to see each source's state, then settle each conflict with the user.
+For `shared_skills_unmanifested` (skills in the source's `skills/` folder that no
+`skillpack.json` declares), declare the ones to share in a `skillpack.json` at
+the source's root, or keep the source out with
+`gbrain sources shared-skills <id> off`. Doctor stops warning once the preview
+has inspected every source and finds none in conflict; a source whose policy it
+could not read (a dropped database connection, for example) keeps the warning.
+Don't clear the wedge with `--force-retry` for this:
+the next `--yes` run would also publish each source's pending shared-skills
+content.
 
 ## Troubleshoot, leave, and recover
 

@@ -44,6 +44,7 @@ import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { _resetCliExitVerdictForTests, currentExitCode } from '../src/core/cli-force-exit.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
+import { installFaultHook } from '../src/core/persistence/fault-points.ts';
 import { testBackends } from './helpers/test-backends.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { commitFile, git, page, withRefreshFixture, type RefreshFixture } from './helpers/worktree-refresh-fixture.ts';
@@ -214,7 +215,7 @@ test('4b. Q1: the diverged refusal names the keep-checkout publish; running it, 
   const local = f.head();
   const error = await refusedWith(refreshWorktree(f.engine, f.alpha), 'refresh_diverged') as { suggestion?: string; fix?: { argv: string[]; ask_user?: boolean; actor?: string } };
   expect(error.suggestion).toContain('1 local commit(s)');
-  expect(error.fix).toMatchObject({ argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', f.root, '--json'], ask_user: true, actor: 'user' });
+  expect(error.fix).toMatchObject({ argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--scan-secrets', '--path', f.root, '--json'], ask_user: true, actor: 'user' });
   git(f.root, 'config', 'user.name', 'Example'); git(f.root, 'config', 'user.email', 'example@example.invalid');
   expect(commitAndPush({ repo: f.root, pushOnly: true, keepCheckout: true })).toMatchObject({ outcome: 'pushed', integrated: 1, checkout: 'unchanged' });
   expect(f.head()).toBe(local);
@@ -237,7 +238,7 @@ test('4e. #7685: sources refresh --json emits the diverged refusal\'s structured
   try {
     const refusal = JSON.parse(out.join('\n'));
     expect(refusal).toMatchObject({ status: 'refused', code: 'refresh_diverged', contract_version: 1,
-      fix: { argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', f.root, '--json'], next: 'ask_user', actor: 'user' } });
+      fix: { argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--scan-secrets', '--path', f.root, '--json'], next: 'ask_user', actor: 'user' } });
     expect(refusal.fix.user_message).toContain(f.alpha);
     expect(refusal.suggestion).toContain('1 local commit(s)');
     expect(currentExitCode()).toBe(1);
@@ -278,7 +279,7 @@ test('4d. Q1: writer status and doctor name each commit a diverged managed check
   const root = (check?.details as { roots: Array<Record<string, any>> }).roots.find(r => r.root === f.root)!;
   expect(root).toMatchObject({ managed: true, diverged: true, ahead: 1, behind: 1, porcelain: { untracked: 1 } });
   expect(root.unpushed_commits[0]).toMatchObject({ sha, author, paths: ['beta/local.md'] });
-  expect(check?.fix).toMatchObject({ ask_user: true, actor: 'user', argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', f.root, '--json'] });
+  expect(check?.fix).toMatchObject({ ask_user: true, actor: 'user', argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--scan-secrets', '--path', f.root, '--json'] });
 }), 120_000);
 
 test('5. dirt overlapping the incoming diff refuses naming the path; unrelated dirt is preserved and listed', () => each(async f => {
@@ -1098,6 +1099,35 @@ test('13c. a committed write whose publisher still holds the worktree lock (reco
     await publisherFinishes;
     expect(result).toMatchObject({ status: 'completed', target_head: target });
   } finally { await clear(); }
+}), 120_000);
+
+test('13e. a write the consumer claimed and is still preparing holds the drain until it finishes', () => each(async f => {
+  f.push('alpha/two.md', page('Alpha two', 'Upstream.'));
+  const requestId = randomUUID();
+  let reached!: () => void; const preparing = new Promise<void>(resolve => { reached = resolve; });
+  let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
+  installFaultHook(async (point, detail) => { if (point === 'consumer:preparing' && detail.requestId === requestId) { reached(); await held; } });
+  const points: string[] = [];
+  let write: Promise<unknown> | undefined;
+  let refresh: Promise<{ status: string }> | undefined;
+  try {
+    write = f.put(f.alpha, 'notes/preparing', page('Preparing', 'claimed before the refresh started'), requestId);
+    await preparing;
+    const [claimed] = await f.engine.executeRaw<{ state: string }>('SELECT state FROM persistence_requests WHERE request_id=$1::uuid', [requestId]);
+    expect(claimed!.state).toBe('running');
+    refresh = refreshWorktree(f.engine, f.alpha, { hooks: { boundary: async point => { points.push(point); } } });
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    expect(points).toEqual([]);
+    release();
+    await write;
+    expect((await refresh).status).toBe('completed');
+    expect(points[0]).toBe('drained');
+  } finally {
+    release();
+    installFaultHook(undefined);
+    await write?.catch(() => undefined);
+    await refresh?.catch(() => undefined);
+  }
 }), 120_000);
 
 test('13d. a publisher that clears its record and releases the lock between the precheck probe and its lock attempt is not refused', () => each(async f => {

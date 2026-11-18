@@ -83,17 +83,21 @@ Brain / database level (gbrain-specific):
   the files" or "remove it from Git" is not a go to purge database pages. After
   the go, purge one page at a time (never a parallel `xargs` or a background
   loop), confirm each one is gone (`gbrain get <slug> --include-deleted` reports
-  `page_not_found`) before the next, and stop the batch at the first refusal. A purge batch that was
+  `page_not_found`; a receipt with `purge_held` was kept soft-deleted to keep its derived pages private) before the next, and stop the batch at the first refusal. A purge batch that was
   stopped (SIGTERM, a write freeze, a timeout) stays stopped: report what
   finished and ask again before relaunching it.
 - **`gbrain pages purge-deleted`** — permanently removes soft-deleted pages
   from every source of the brain. This is the point of no return for the
   soft-delete safety net. Show the user `gbrain pages purge-deleted --dry-run --json`
   first; the command itself asks (exit 3 without a terminal) and runs with
-  `--yes` only after the user agrees.
+  `--yes` only after the user agrees. It keeps a file committed at the source's
+  last synced commit or at HEAD (the page waits or goes database-only), unless a
+  person's delete of the page never removed the file (e.g. another page shared it).
 - **Source removal** — `gbrain sources remove <id>` deletes the source AND
   every page in it. The `--confirm-destructive` flag does not substitute for
-  the card.
+  the card. A managed removal deletes pages in committed batches: one that
+  stops early (`write_pending`) has already deleted some, so say so and rerun it
+  to finish.
 - **Mount removal** — `gbrain mounts remove <id>` only removes the local
   registration (the mounted brain's database survives; re-add to recover). Gate
   it anyway when the flow ALSO plans to delete the mount's underlying database

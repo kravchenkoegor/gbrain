@@ -36,7 +36,7 @@
 
 import { execFileSync } from '../spawn.ts';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync, rmSync } from 'node:fs';
-import { dirname, isAbsolute, relative } from 'node:path';
+import { dirname, relative } from 'node:path';
 
 import type { BrainEngine, NewFact, FactVisibility, FactKind, FactAttribution } from '../engine.ts';
 import type { ResolutionSource } from '../entities/resolve.ts';
@@ -49,6 +49,7 @@ import { gbrainPath } from '../config.ts';
 import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
 import { isDurabilityHardened, commitWriteThroughFile } from '../brain-repo-durability.ts';
 import { upsertFactRow, parseFactsFence, formatFenceDate } from '../facts-fence.ts';
+import { withHeldFactsFence } from './unfenced-facts.ts';
 import { unparsedFenceRefusal } from '../fence-repair/refusal.ts';
 import type { OperationError } from '../ops/contract.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
@@ -61,9 +62,10 @@ import { recordTaintEdges } from '../trust/taint.ts';
 import { recordFlaggedRow, type GatedRowDecision } from '../write-gate-store.ts';
 import type { TaintInput, WriteTrust } from '../trust/tier.ts';
 import { gitChildEnv } from '../git-env.ts';
-import { urlCloneReadOnly } from '../url-clone.ts';
+import { readOnlyCheckout } from '../persistence/mirror-read-only.ts';
 import { bodyUnread } from '../page-body/page-shape.ts';
 import { bestEffortStoredBodyMirror, fileBodyMatchesStored, fileDatabaseDriftToken, mirrorFileBody, readStoredBody } from './file-body-guard.ts';
+import { relativeEscapesRoot } from '../path-confine.ts';
 
 /** Resolved source binding for the entity page. */
 export interface FenceTarget {
@@ -82,6 +84,8 @@ export interface FenceTarget {
    * stub-create (DB↔file drift repair) stays allowed for them.
    */
   resolutionSource: ResolutionSource | null;
+  /** Automatic extraction (the facts backstop): a claim withdrawn at any visibility is skipped, not only at the fact's own. */
+  automatic?: boolean;
 }
 
 /** Input fact prepared by runPipelineWithBody (post-dedup). */
@@ -116,10 +120,10 @@ export interface FenceWriteResult {
   inserted: number;
   /** DB ids assigned to the inserted rows, in input order. */
   ids: number[];
-  /** True when the path fell through to DB-only: local_path unset, `sync.write_through` off, or a gbrain-owned clone (`databaseOnlyReason`). */
+  /** True when the path fell through to DB-only: local_path unset, `sync.write_through` off, or a read-only checkout (`databaseOnlyReason`). */
   legacyFallback?: true;
-  /** #6946: why a `legacyFallback` is expected — `url_clone`: the source is a clone gbrain owns and pulls (url-clone.ts), so its checkout is never written. */
-  databaseOnlyReason?: 'url_clone' | 'file_database_drift';
+  /** Why a `legacyFallback` is expected: `mirror_read_only` (#7098) or `url_clone` (#6946, a clone gbrain owns and pulls), so the checkout is never written. */
+  databaseOnlyReason?: 'mirror_read_only' | 'url_clone' | 'file_database_drift';
   /** A held file mirror's typed diagnostic and repair instructions; facts take the DB-only fallback. */
   warning?: string;
   /** True when fence parse-validate failed; rows were NOT inserted, .tmp quarantined. */
@@ -203,7 +207,7 @@ export type FactFenceGitPathState = 'clean' | 'self_dirty' | 'foreign_dirty' | '
 export function gitPathState(repoPath: string, filePath: string): FactFenceGitPathState {
   try {
     const rel = relative(repoPath, filePath);
-    if (!rel || rel.startsWith('..') || isAbsolute(rel)) return 'unknown';
+    if (!rel || relativeEscapesRoot(rel)) return 'unknown';
     const status = execFileSync(
       'git',
       ['-C', repoPath, 'status', '--porcelain=v1', '--untracked-files=all', '--', rel],
@@ -305,8 +309,8 @@ export function stubEntityPage(
  * stamps the DB index via engine.insertFacts.
  *
  * Returns `legacyFallback: true` when `target.localPath` is null (also
- * under `sync.write_through` off and, with `databaseOnlyReason: 'url_clone'`,
- * for a clone gbrain owns, #6946) —
+ * under `sync.write_through` off and, with `databaseOnlyReason`, for a
+ * read-only mirror (#7098) or a clone gbrain owns, #6946) —
  * the caller is responsible for falling through to the legacy
  * DB-only `engine.insertFact` path. We don't do the legacy fallback
  * here because the caller has the FactsBackstopCtx (visibility,
@@ -333,7 +337,7 @@ export async function writeFactsToFence(
     // fence rows through its fact intent instead of editing the file here.
     const kept: FenceInputFact[] = [];
     for (const f of facts) {
-      if (!await isFactWithdrawn(engine, target.sourceId, f.visibility, f.fact, target.slug)) kept.push(f);
+      if (!await isFactWithdrawn(engine, target.sourceId, target.automatic ? null : f.visibility, f.fact, target.slug)) kept.push(f);
     }
     const withdrawnSkipped = facts.length - kept.length ? { withdrawnSkipped: facts.length - kept.length } : {};
     if (!kept.length) return { inserted: 0, ids: [], ...withdrawnSkipped };
@@ -352,7 +356,7 @@ export async function writeFactsToFence(
   // legacyFallback contract as a missing local_path — the caller's DB-only
   // path still records the facts.
   if (await isWriteThroughDisabled(engine)) return { inserted: 0, ids: [], legacyFallback: true };
-  if (await urlCloneReadOnly(engine, target.sourceId)) return { inserted: 0, ids: [], legacyFallback: true, databaseOnlyReason: 'url_clone' };
+  const readOnly = await readOnlyCheckout(engine, target.sourceId); if (readOnly) return { inserted: 0, ids: [], legacyFallback: true, databaseOnlyReason: readOnly };
 
   // #4204: compute the SAME path writePageThrough computes for this
   // (source, slug) — the fence appends to the page's file, so the two writers
@@ -385,7 +389,7 @@ export async function writeFactsToFence(
     async () => {
       const kept: FenceInputFact[] = [];
       for (const f of facts) {
-        if (!await isFactWithdrawn(engine, target.sourceId, f.visibility, f.fact, target.slug)) kept.push(f);
+        if (!await isFactWithdrawn(engine, target.sourceId, target.automatic ? null : f.visibility, f.fact, target.slug)) kept.push(f);
       }
       const withdrawnSkipped = facts.length - kept.length ? { withdrawnSkipped: facts.length - kept.length } : {};
       facts = kept;
@@ -510,6 +514,7 @@ export async function writeFactsToFence(
       } catch (err) {
         console.warn(`[facts.fence] FACTS_ROW_NUM_HINT_UNAVAILABLE: ${target.slug} (source ${target.sourceId}): ${err instanceof Error ? err.message : String(err)}; numbering from the file alone`);
       }
+      body = (await withHeldFactsFence(engine, target.sourceId, target.slug, { compiled_truth: body })).compiled_truth;
       const fenceRefusal = refuseUnparsedFence(body, target, filePath);
       if (fenceRefusal) return { inserted: 0, ids: [], fenceWriteFailed: true, fenceRefusal, ...withdrawnSkipped };
       const { facts: existingFenceFacts } = parseFactsFence(body);

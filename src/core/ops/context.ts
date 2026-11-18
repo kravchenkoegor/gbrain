@@ -11,21 +11,23 @@
  */
 
 import { lstatSync, realpathSync } from 'fs';
-import { resolve, relative, sep } from 'path';
+import { resolve, sep } from 'path';
 import { OperationError, opError } from './contract.ts';
+import { resolvedPrefixContained } from '../path-confine.ts';
 import type { AuthInfo, Operation, OperationContext } from './contract.ts';
 import type { Action } from '../agent-output.ts';
 import { hostFix, invalidParam, paramUse, readFix } from './op-fix.ts';
-import { CJK_SLUG_CHARS, SLUG_WORD_CHARS, SLUG_EXTRA_SCRIPT_CHARS } from '../cjk.ts';
+import { CJK_SLUG_CHARS, SLUG_EXTRA_SCRIPT_CHARS } from '../cjk.ts';
+import { isOpPageSlug, OP_PAGE_SLUG_RE } from '../page-slug-grammar.ts';
 import { validateSlug } from '../utils.ts';
 import { ALL_SOURCES, NO_SOURCES, isValidSourceId } from '../source-id.ts';
 import { encodeDeepResearchId } from '../deep-research-id.ts';
 import { isSearchMode } from '../search/mode.ts';
-import { stampEvidence } from '../search/evidence.ts';
+import { stampEvidence, type EvidenceOpts } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
 import type { SearchResult, HybridSearchMeta, PageReadScope, PageReadPolicy } from '../types.ts';
 import { resolveExcludePrivatePages, isPrivatePage } from '../search/private-visibility.ts';
-import { assertMemberPageWriter } from '../access/member-facts.ts';
+import { assertMemberPageWriter, assertScopePageWriter } from '../access/member-facts.ts';
 import { pageNotVisibleError, remoteTargetHidden } from '../persistence/page-visibility.ts';
 
 // --- Agent-contract fixes shared by the op error sites ---
@@ -67,19 +69,32 @@ export function withFix(fix: Action | undefined): { fix?: Action } {
  * surface-correct prose plus the matching read.
  */
 export function pageNotFoundError(
-  ctx: Pick<OperationContext, 'remote' | 'transport'>,
+  ctx: Pick<OperationContext, 'remote' | 'transport' | 'auth' | 'isCallable'>,
   slug: string,
   opts: { includeDeleted: boolean; sourceIdParam?: string; elsewhereSource?: string },
 ): OperationError {
-  const retry = opts.includeDeleted ? `Check the slug or use ${paramUse(ctx, 'fuzzy')}` : `Page may be soft-deleted; pass ${paramUse(ctx, 'include_deleted')} to verify`;
+  // GBRA-585: a member's credential misses pages kept to other members too, and it reads the same for both, so it is
+  // sent neither after a deletion nor to the host CLI.
+  if (ctx.remote !== false && ctx.auth?.member) {
+    return opError('page_not_found', `Page not found: ${slug}`,
+      'This connection reads no page with this slug: it may not exist, or it may not be readable by this connection, since a page can be kept to other members. Do not create it to find out; ask the user whether the page exists and who can read it.');
+  }
+  // #9669: a caller whose surface refuses include_deleted or fuzzy is never pointed at them; it gets a search instead.
+  const can = (param: string) => ctx.remote === false || !ctx.isCallable || ctx.isCallable('get_page', { slug, [param]: true });
+  const fuzzy = can('fuzzy');
+  const deleted = !opts.includeDeleted && can('include_deleted');
+  const check = fuzzy ? `Check the slug or use ${paramUse(ctx, 'fuzzy')}` : 'Check the slug, or search for the page';
+  const retry = deleted ? `Page may be soft-deleted; pass ${paramUse(ctx, 'include_deleted')} to verify` : check;
   const where = opts.elsewhereSource;
   const explicit = opts.sourceIdParam !== ALL_SOURCES ? opts.sourceIdParam : undefined;
   return opError('page_not_found', `Page not found: ${slug}`,
     where !== undefined ? `Page exists in source '${where}' — pass ${paramUse(ctx, 'source', where)}. ${retry}` : retry,
     withFix(where !== undefined
       ? getPageFix(slug, `Reads the page from source ${where}, where it exists.`, { sourceId: where })
-      : getPageFix(slug, opts.includeDeleted ? 'Fuzzy-matches the slug.' : 'Shows the page if it is soft-deleted (deleted_at set).',
-        { sourceId: explicit, ...(opts.includeDeleted ? { fuzzy: true } : { includeDeleted: true }) })));
+      : deleted || fuzzy ? getPageFix(slug, deleted ? 'Shows the page if it is soft-deleted (deleted_at set).' : 'Fuzzy-matches the slug.',
+        { sourceId: explicit, ...(deleted ? { includeDeleted: true } : { fuzzy: true }) })
+      : readFix('Searches for pages matching the slug, to find the one you meant.', {
+        argv: cliSafeSlug(slug) ? ['gbrain', 'search', slug] : ['gbrain', 'search', '--', slug], mcp: { tool: 'search', arguments: { query: slug } } })));
 }
 
 const HTTP_HOST = { remote: true, transport: 'http' } as const;
@@ -130,6 +145,16 @@ function migrationsFix(ctx: Pick<OperationContext, 'remote' | 'transport'>): Act
 // --- Upload validators (Fix 1 / B5 / H5 / M4) ---
 
 /**
+ * Strict-mode containment over two realpaths. Separator-aware: `..drafts/` is an
+ * ordinary folder name, while `../`, another drive (Windows), a UNC share and a
+ * sibling sharing the root's name prefix all fall outside. The root itself is
+ * never an uploadable file. Pure, so tests can drive it with `path.win32` shapes.
+ */
+export function uploadPathInsideRoot(real: string, realRoot: string, sepChar: string): boolean {
+  return real !== realRoot && resolvedPrefixContained(real, realRoot, sepChar);
+}
+
+/**
  * Validate an upload path. Two modes:
  *   - strict (remote=true): confines the resolved path to `root` and rejects symlinks.
  *     Used when the caller is untrusted (MCP over stdio/HTTP, agent-facing).
@@ -171,7 +196,7 @@ export function validateUploadPath(filePath: string, root: string, strict = true
 
   if (!strict) return real;
 
-  // Strict mode: confine to root via realpath + path.relative (catches parent-dir symlinks per B5).
+  // Strict mode: confine to root by realpath on both sides (catches parent-dir symlinks per B5).
   let realRoot: string;
   try {
     realRoot = realpathSync(root);
@@ -179,37 +204,13 @@ export function validateUploadPath(filePath: string, root: string, strict = true
     throw opError('invalid_params', `Confinement root not accessible: ${root}`,
       "The upload root (the server's working directory) is unreadable on the brain host; tell the user so its operator can fix that directory.");
   }
-  const rel = relative(realRoot, real);
-  if (rel === '' || rel.startsWith('..') || rel.startsWith(`..${sep}`) || resolve(realRoot, rel) !== real) {
+  if (!uploadPathInsideRoot(real, realRoot, sep)) {
     throw opError('invalid_params', `Upload path must be within the working directory: ${filePath}`,
       "Copy the file under the server's working directory and pass that path; a symlinked parent that resolves outside it is refused too.");
   }
   return real;
 }
 
-/**
- * Op-boundary page-slug segment (#4665/#5032): cjk.ts's PAGE_SLUG_SEG shape
- * widened LOCALLY so `.` and `_` are allowed as part-CONTINUATION characters.
- * Colon separates individually valid parts inside a path segment, preserving
- * existing integration slugs such as `calendar:event-id` without admitting
- * empty or dot-led parts (`calendar:../x` remains invalid). The
- * sync slugifier deliberately preserves both (`notes/v1.0.0`,
- * `people/my_file_name` — see slugifySegment in src/core/sync.ts), so the
- * put_page boundary must round-trip every slug sync can produce. The lead
- * char stays a word char, so dot-LED segments remain impossible — `..`
- * traversal and every H5 rejection (backslash, %2e/%2f encodings, control
- * chars, RTL overrides, spaces) still fail. Deliberately NOT widened in
- * cjk.ts: cite-render, SlugRegistry's SLUG_RE, and the dream-cycle
- * SUMMARY_SLUG_RE consume the shared grammar with different semantics.
- * Compose with the `u` flag — see SLUG_WORD_CHARS.
- */
-// Underscore may also LEAD a segment: the sync slugifier preserves leading
-// underscores (`_index.md` → `_index`, the Hugo convention), so rejecting
-// them recreates the un-updatable-synced-page class this widen closes.
-// Dot stays continuation-only — `..` traversal remains impossible.
-const OP_PAGE_SLUG_PART = `[${SLUG_WORD_CHARS}_][${SLUG_WORD_CHARS}._\\-]*`;
-const OP_PAGE_SLUG_SEG = `${OP_PAGE_SLUG_PART}(?::${OP_PAGE_SLUG_PART})*`;
-const OP_PAGE_SLUG_RE = new RegExp(`^${OP_PAGE_SLUG_SEG}(\\/${OP_PAGE_SLUG_SEG})*$`, 'iu');
 
 /**
  * Allowlist validator for page slugs. Rejects URL-encoded traversal, backslashes,
@@ -233,10 +234,7 @@ export function validatePageSlug(slug: string): void {
   }
 }
 
-/** True when `slug` passes validatePageSlug's op-boundary grammar. */
-export function isOpPageSlug(slug: string): boolean {
-  return typeof slug === 'string' && slug.length > 0 && slug.length <= 255 && OP_PAGE_SLUG_RE.test(slug);
-}
+export { isOpPageSlug };
 
 /**
  * #6212: a slug an older gbrain stored that today's grammar refuses (a space,
@@ -376,6 +374,7 @@ export function slugOutsideCallerFence(ctx: OperationContext, slug: string): boo
  */
 export function enforceClientSlugFence(ctx: OperationContext, slug: string, opName: string): void {
   assertMemberPageWriter(ctx, slug, opName);
+  assertScopePageWriter(ctx, slug, opName);
   if (ctx.auth?.fenceProjectionDegraded) {
     throw opError(
       'permission_denied',
@@ -553,6 +552,24 @@ export function noSourceGrantError(operation?: string, auth?: Pick<AuthInfo, 'cl
     { docs: 'docs/mcp/ADMIN.md#legacy-token-grants', fix });
   err.detail = 'fence=no_source_grant';
   return err;
+}
+
+/**
+ * #8982 item 3: POST /ingest refuses a member-bound credential whose write source every credential without a source grant
+ * reads (GST-2051); the fix asks the operator to give it a write source of its own that is not federated.
+ */
+export function sharedWriteSourceMemberError(operation: string, auth: Pick<AuthInfo, 'clientId' | 'principal'>, sourceId: string): OperationError {
+  const fix = grantFix(auth, { token: ['--sources', '<sources>'], client: ['--source', '<source>'] },
+    'Gives this connection a write source of its own that is not federated; only the brain host operator can change grants.');
+  const input = fix.argv?.includes('<sources>')
+    ? { name: 'sources', how: 'Ask the user for a source that is not federated, written first, then default (e.g. <private-source>,default; `gbrain sources list` on the brain host shows them).' }
+    : fix.argv?.includes('<source>') ? { name: 'source', how: 'Ask the user for a source that is not federated (`gbrain sources list` on the brain host shows them).' } : null;
+  return opError('permission_denied',
+    `${operation} is unavailable to a credential bound to a member whose write source is ${sourceId}, which every credential without a source grant reads: its pages would land where other members ` +
+      'and unbound credentials read. Write through the MCP put_page op, which keeps a new page to its member, ' +
+      'or ask the brain operator to grant this credential its own write source that is not federated (gbrain auth rescope --sources <private-source>,default).',
+    "Write through the MCP put_page op, or ask the brain host's operator to give this credential a write source that is not federated (command in fix).",
+    { docs: 'docs/guides/multi-source-brains.md#lay-out-sources-by-who-may-read-them', fix: input ? { ...fix, inputs: [input] } : fix });
 }
 
 /**
@@ -1067,8 +1084,9 @@ export async function requireWritablePage(
     sourceId: writeSource,
     includeDeleted: true,
   });
-  // GBRA-218: a page the remote caller cannot read under the member-access part answers exactly as a missing slug.
-  const hidden = !!writable && await remoteTargetHidden(ctx.engine, ctx.remote, writeSource, slug);
+  // GBRA-218 / GBRA-431: a page the remote caller cannot read answers exactly as a missing slug. A delegated subagent
+  // write keeps its own privacy refusal below.
+  const hidden = !!writable && await remoteTargetHidden(ctx.engine, ctx.remote, writeSource, slug, ctx.viaSubagent === true);
   if (writable && !hidden) {
     if (ctx.viaSubagent === true && ctx.auth && isPrivatePage(writable)
       && await resolveExcludePrivatePages(ctx.engine, ctx.remote)) {
@@ -1237,8 +1255,8 @@ export function resolvePerCallMode(ctx: OperationContext, raw: unknown, opName =
 }
 
 /** T4 — stamp evidence/create_safety on a result set, fail-soft. */
-export function stampEvidenceSafe(results: SearchResult[]): void {
-  try { stampEvidence(results); } catch { /* non-fatal */ }
+export function stampEvidenceSafe(results: SearchResult[], opts?: EvidenceOpts): void {
+  try { stampEvidence(results, opts); } catch { /* non-fatal */ }
 }
 
 export function stampDeepResearchIds(results: SearchResult[]): void {

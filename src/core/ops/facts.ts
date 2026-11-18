@@ -29,6 +29,7 @@ import { OperationError, opError, verbError } from './contract.ts';
 import { invalidParam, paramUse } from './op-fix.ts';
 import { parseSourceIdParam, sourceScopeOpts, stampEvidenceSafe } from './context.ts';
 import { parseSourceIdsParam, requestSourceScope, SOURCE_IDS_PARAM } from './search-source-scope.ts';
+import { boundRecallChars, MEMORY_RECALL_MAX_CHARS, parseMaxChars } from './qm-memory.ts';
 import { markKeywordHits } from '../search/evidence.ts';
 import { hybridSearchCached, stampContentFlags, type HybridSearchOpts } from '../search/hybrid.ts';
 import { dedupResults } from '../search/dedup.ts';
@@ -56,7 +57,7 @@ import type { TrustTier } from '../trust/tier.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 import { parseSinceParam } from '../facts/since-parse.ts';
 import { callerSessionKey } from '../access/member-facts.ts';
-import { groupFactsByEntity, parseQuestionParam, questionRecallNotices, rankFactsByQuestion, recallHintNotice, unlinkedNamesakes, type EntityCandidate, type QuestionRecall } from '../facts/question-recall.ts';
+import { groupFactsByEntity, parseQuestionParam, questionRecallNotices, rankFactsByQuestion, recallHintNotice, namesakesOrMerge, unlinkedNamesakes, type EntityCandidate, type QuestionRecall } from '../facts/question-recall.ts';
 
 // ============================================================
 // v0.31 — Hot memory ops: extract_facts / recall / forget_fact
@@ -170,7 +171,7 @@ const extract_facts: Operation = {
     // instruction would silently widen private-default extractions because
     // `remember` hard-defaults to 'world'.
     const visibilityPin = `visibility: "${visibility}"` +
-      (visibility === 'private' ? ' (remember defaults to world — omitting it would widen these facts)' : '');
+      (visibility === 'private' ? ' (remember defaults to world unless your credential is bound to a member — omitting it could widen these facts)' : '');
     if (r.skipped_reason === 'chat_unavailable') {
       return {
         inserted: 0, duplicate: 0, superseded: 0, fact_ids: [],
@@ -317,11 +318,13 @@ const recall: Operation = {
     return_unit: { type: 'string', enum: ['chunk', 'window', 'section', 'page', 'auto'], description: 'results[] unit (see search).', fullSurfaceOnly: true },
     return_window: { type: 'number', description: 'Window 1-3.', fullSurfaceOnly: true },
     min_trust: MIN_TRUST_PARAM,
+    max_chars: { type: 'integer', minimum: MEMORY_RECALL_MAX_CHARS.min, description: `Cap on fact (then results) text, ${MEMORY_RECALL_MAX_CHARS.min}-${MEMORY_RECALL_MAX_CHARS.max}; whole items only, truncated says if cut.`, fullSurfaceOnly: true },
   },
   scope: 'read',
   verb: true,
   annotations: { title: 'recall (memory read)', readOnlyHint: true },
   handler: async (ctx, p) => {
+    const maxChars = p.max_chars === undefined || p.max_chars === null ? null : parseMaxChars(p.max_chars);
     const sourceId = ctx.sourceId ?? 'default';
     const limit = clampRecallLimit(p.limit);
     const includeExpired = p.include_expired === true;
@@ -361,14 +364,10 @@ const recall: Operation = {
     )];
     const scalarSource = factSources.length === 1 ? factSources[0] : undefined;
 
-    // Visibility filter: remote callers see world-only unless their token
-    // grants elevated visibility (future-proofing; v0.31 ships world-only
-    // for remote, all for local CLI).
-    const visibility =
-      ctx.remote === false
-        ? undefined
-        : ['world'] as ('private' | 'world')[];
-    const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+    // Visibility filter: remote callers see world-only facts; the local CLI and (GST-2059) the brain owner see all.
+    const { resolveExcludePrivatePages, worldOnlyFacts } = await import('../search/private-visibility.ts');
+    const worldOnly = worldOnlyFacts(ctx.remote);
+    const visibility = worldOnly ? ['world'] as ('private' | 'world')[] : undefined;
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote); // #4352: fact and page arms alike
     const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust }); // #5575 floor + quarantine/rederive hiding
 
@@ -401,7 +400,7 @@ const recall: Operation = {
     const byEventTime = (rec: Record<string, unknown>) => rec.valid_from ?? rec.created_at;
 
     let rows: FactRows = [];
-    let ambiguousEntity: EntityCandidate[] | null = null;
+    let ambiguousEntity: EntityCandidate[] | null = null, mergedSources: [string, string] | null = null;
 
     // `since` is parsed once, up front, and a value that does not parse is
     // rejected instead of silently widening the window: a caller that asked
@@ -432,8 +431,8 @@ const recall: Operation = {
 
     if (question !== null && !readsNoSource) {
       ranking = await rankFactsByQuestion(ctx, { question, params: p, factSources, limit, entity: entityParam, sessionId: sessionParam, since, grep, includeExpired,
-        scope: { sourceIds: factSources, remote: ctx.remote !== false, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged } });
-      ({ rows, ambiguousEntity } = ranking);
+        scope: { sourceIds: factSources, worldOnly, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged } });
+      ({ rows, ambiguousEntity } = ranking); mergedSources = ranking.mergedSources ?? null;
       for (const notice of questionRecallNotices(ranking, ctx.brainId)) ctx.emitNotice?.(notice);
     } else if (p.supersessions === true) {
       // Visibility filters at the ENGINE level (before each source's LIMIT),
@@ -461,7 +460,7 @@ const recall: Operation = {
           s => ctx.engine.listFactsSince(src, since, { ...listOpts, eventTime: true, entitySlug: s, sessionId: sessionParam ?? undefined }));
         return { slug: entitySlug, rows };
       }));
-      ambiguousEntity = entityParam ? await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug ?? r.entity_slug })))) : null;
+      ({ ambiguousEntity, mergedSources } = await namesakesOrMerge(ctx, entityParam ? await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug ?? r.entity_slug })))) : null));
       rows = ambiguousEntity ? [] : mergeNewest(resolvedLists.map(l => l.rows), byEventTime);
     } else if (entityParam) {
       const { resolveEntitySlug } = await import('../entities/resolve.ts');
@@ -469,7 +468,7 @@ const recall: Operation = {
         const slug = (await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam;
         return { slug, rows: await readEntityFacts(ctx, src, slug, MAX_SEARCH_LIMIT, s => ctx.engine.listFactsByEntity(src, s!, { ...listOpts, sessionId: sessionParam ?? undefined })) };
       }));
-      ambiguousEntity = await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug }))));
+      ({ ambiguousEntity, mergedSources } = await namesakesOrMerge(ctx, await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug }))))));
       rows = ambiguousEntity ? [] : mergeNewest(resolvedLists.map(l => l.rows), (rec) => rec.valid_from ?? rec.created_at);
     } else if (sessionParam) {
       rows = mergeNewest(
@@ -552,7 +551,7 @@ const recall: Operation = {
       bumpLastRetrievedAt(ctx.engine, searchResults.map(r => r.page_id));
       const applied = recallDeliveryPlan(effectivePlan(evidencePlan, searchResults), p.budget_policy, queryText, budgetTokens, rows);
       if (applied) ({ results: searchResults, delivery } = await deliverEvidence(ctx.engine, searchResults, applied, { ...searchScope, excludePrivate, requireSafeChunks: ctx.remote !== false }));
-      searchResults = await stampPageTrust(ctx.engine, searchResults, eligibility.floor);
+      searchResults = await stampPageTrust(ctx.engine, searchResults, eligibility.floor, undefined, worldOnlyFacts(ctx.remote));
     }
 
     // Pack what is delivered: results redacted for all; facts for remote only (localVerbatim).
@@ -593,6 +592,7 @@ const recall: Operation = {
     const grouped = ranking?.groupByEntity ? groupFactsByEntity(packedFacts, ranking, p, ctx.emitNotice) : null; if (grouped) packedFacts = grouped.rows; // #2953: reorders delivered facts only
     const budgetPacking = recallBudgetPacking(p.budget_policy, queryText, budgetTokens, { rows, packedFacts, searchResults, packedResults }, recallResultCost(delivery)), contested: ContestedLookup = {};
 
+    let observedUnavailable = false;
     const out = {
       facts: await withDecideContested(ctx.engine, await withFactDateHeaders(ctx.engine, await stampRowTrust(ctx.engine, 'facts', packedFacts.map(r => ({ // #5575 A6 trust labels; GBRA-216 dp contested
         id: r.id,
@@ -626,12 +626,14 @@ const recall: Operation = {
         provenance: r.source, ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}), ...(r.quoted ? { quoted: r.quoted } : {}), ...recallClaimColumns(r),
         ...(r.entity_slugs ? { entity_slugs: r.entity_slugs } : {}), ...(r.collapsed_count ? { collapsed_count: r.collapsed_count } : {}),
         ...(ranking ? { relevance: ranking.relevance.get(r.id), ...(ranking.weighting ? { rank_score: ranking.weighting.rank.get(r.id), confidence_factor: ranking.weighting.factor.get(r.id) } : {}) } : {}),
-      })), f => f.id)), { remote: ctx.remote !== false, excludePrivate, eligibility }, contested),
+      })), f => f.id), { excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged }, () => { observedUnavailable = true; }), { remote: ctx.remote !== false, excludePrivate, eligibility }, contested),
       total: packedFacts.length,
       facts_order: ranking ? 'relevance' : 'newest',
-      ...(quoted.withheld ? { facts_degraded: { reason: 'saved_facts_withheld' } } : ranking?.degraded || contested.degraded ? { facts_degraded: { ...contested.degraded, ...ranking?.degraded } } : {}),
-      ...(ranking?.calibration ? { facts_calibration: ranking.calibration } : {}),
+      ...(quoted.withheld ? { facts_degraded: { reason: 'saved_facts_withheld' } } : ranking?.degraded || contested.degraded || observedUnavailable
+        ? { facts_degraded: { ...(observedUnavailable ? { reason: 'fact_observed_date_unavailable' } : {}), ...contested.degraded, ...ranking?.degraded } } : {}),
+      ...(ranking?.calibration ? { facts_calibration: ranking.calibration } : {}), ...(ranking?.belowFloor ? { facts_below_floor: ranking.belowFloor } : {}),
       ...grouped?.fields, ...(ambiguousEntity ? { ambiguous_entity: { candidates: ambiguousEntity, suggestion: AMBIGUOUS_ENTITY_SUGGESTION } } : {}),
+      ...(mergedSources ? { merged_sources: mergedSources } : {}), // GST-2898 D3-B: the facts carry each source_id
       ...(pending_consolidation_count !== undefined ? { pending_consolidation_count } : {}),
       // MEMORY_VERBS v1 envelope (G1B superset — additive on every response).
       protocol_version: MEMORY_VERBS_VERSION,
@@ -661,7 +663,7 @@ const recall: Operation = {
       ...(delivery ? { delivery } : {}),
     };
     recordRecallOutcome(out);
-    return out;
+    return maxChars === null ? out : boundRecallChars(out, maxChars);
   },
 };
 
@@ -740,7 +742,6 @@ const context_pack: Operation = {
     const { assembleContextPack, renderPack, isAfter, PACK_DEFAULT_MAX_ENTITIES, renderCardLine, renderThreadLine, renderFactLine, packHeaderCost,
       renderNewerMentionLines, ENTITY_FACTS_HEADER } = await import('../context/turn-context.ts');
     const { NEWER_MENTIONS_HEADER } = await import('../mentions/newer-mentions.ts');
-    const sourceId = ctx.sourceId ?? 'default';
     const rawSince = typeof p.since === 'string' && p.since.trim() ? p.since : undefined;
     if (rawSince !== undefined && !Number.isFinite(Date.parse(rawSince))) {
       throw verbError(
@@ -758,6 +759,8 @@ const context_pack: Operation = {
     // #6723: names resolve across the readable sources (home first) unless source_id pins one; entity_refs name their source.
     const { ambientMissNotice, entityRefs, entitySources } = await import('../verbs/entity-source.ts');
     const walk = await entitySources(ctx, p, 'context_pack');
+    const named = (await import('../access/scope-read.ts')).currentReadMode() !== undefined;
+    const sourceId = named ? walk.home : ctx.sourceId ?? 'default';
     const refs = (await entityRefs(ctx, p.entity_refs, PACK_DEFAULT_MAX_ENTITIES)).slice(0, PACK_DEFAULT_MAX_ENTITIES - names.length);
     const entities = [...names, ...refs.map((r) => r.name)];
     // Fail-closed: private only when EXPLICITLY requested AND the caller is
@@ -794,8 +797,8 @@ const context_pack: Operation = {
     // Always-loaded core tier (core-memory.ts): owner-designated pages of
     // `default` plus this source, inside the caller's grant; it packs first.
     const { loadCoreBlock } = await import('../core-memory.ts');
-    const allowed = ctx.auth?.allowedSources?.length ? ctx.auth.allowedSources : null;
-    const core = await loadCoreBlock(ctx.engine, { sessionSourceId: sourceId, allowedSources: allowed, excludePrivate: !includePrivate, eligibility })
+    const allowed = named ? [sourceId] : ctx.auth?.allowedSources?.length ? ctx.auth.allowedSources : null;
+    const core = await loadCoreBlock(ctx.engine, { sessionSourceId: sourceId, allowedSources: allowed, excludePrivate: !includePrivate, forCaller: true, eligibility, remote: ctx.remote })
       .catch(() => null);
     const coreText = core?.text ?? '';
     const coreTokens = estimateTokens(coreText);
@@ -1231,7 +1234,7 @@ const delta: Operation = {
     // structured arrays reflect — the assembler's render predates both.
     let text = renderDelta(pages, facts, threads, effectiveSince);
     const diff = p.beliefs === true ? await (await import('../belief/changes.ts')).deltaBeliefs(ctx.engine, { sourceId, since: effectiveSince, until: horizon,
-      remote: !includePrivate, takesHolders: readHolders(ctx), entities: parseEntityList(p.entities) }, budgetTokens !== null ? beliefBudget : null, text, TURN_CONTEXT_ENVELOPE) : null;
+      remote: !includePrivate, worldOnly: (await import('../search/private-visibility.ts')).worldOnlyFacts(ctx.remote), takesHolders: readHolders(ctx), entities: parseEntityList(p.entities) }, budgetTokens !== null ? beliefBudget : null, text, TURN_CONTEXT_ENVELOPE) : null;
     if (diff) text = diff.text;
     const budgetUsed = budgetTokens !== null ? estimateTokens(text) : undefined;
 

@@ -20,6 +20,7 @@
  */
 
 import { resolverHealthEntry, retrievalReflexEntry, skillConformanceEntry } from './checks/skill-group.ts';
+import { skillHealthEntry } from './checks/skill-health.ts';
 import {
   bootstrapChecksEntry,
   memorableRelayEntry,
@@ -27,6 +28,7 @@ import {
   minionsMigrationEntry,
 } from './checks/local-runtime.ts';
 import { supervisorEntry } from './checks/supervisor-health.ts';
+import { skillpackUpdateEntry } from './checks/skillpack-update.ts';
 import {
   stubGuardEntry,
   extractionBacklogsEntry,
@@ -42,6 +44,11 @@ import {
 } from './checks/db-connection.ts';
 import { ipcSocketPathEntry } from './checks/local-ipc.ts';
 import { functionSearchPathEntry } from './checks/function-search-path.ts';
+import { guardLedgerChecksEntry } from './checks/guard-ledger-checks.ts';
+import { ownerOnlyMarksTriggersEntry } from './checks/owner-only-marks-triggers.ts';
+import { postgresTlsEntry } from './checks/postgres-tls.ts';
+import { databaseEncodingEntry } from './checks/database-encoding.ts';
+import { schemaFunctionBodiesEntry } from './checks/schema-function-bodies.ts';
 import {
   pgvectorEntry,
   rlsEntry,
@@ -88,11 +95,15 @@ import { queueHealthEntry, indexAuditEntry, imageAssetsEntry } from './checks/qu
 import { imageEmbeddingCoverageEntry } from './checks/image-embedding-coverage.ts';
 import { globalMaintenanceTimeoutsEntry } from './checks/global-maintenance-timeouts.ts';
 import { globalMaintenanceStalledEntry } from './checks/global-maintenance-stalled.ts';
+import { unattendedMaintenanceEntry } from './checks/unattended-maintenance.ts';
+import { transcriptArchiveEntry } from './checks/transcript-archive.ts';
+import { factsPagesEntry } from './checks/facts-pages.ts';
 import { embedBackfillStalledEntry } from './checks/embed-backfill-stalled.ts';
 import { contentDriftSweepEntry } from './checks/content-drift-sweep.ts';
 import { connectorAccountMismatchEntry } from './checks/connector-account-mismatch.ts';
 import { legacyJobAuthorityEntry } from './checks/legacy-job-authority.ts';
 import { legacyTokenGrantsEntry } from './checks/legacy-token-grants.ts';
+import { unscopedMultiUserTokenEntry } from './checks/unscoped-multi-user-token.ts';
 import { grantNewOpsEntry } from './checks/grant-new-ops.ts';
 import { linksExtractionLagEntry, syncFreshnessEntry, searchModeEntry } from './checks/sync-search.ts';
 import { persistenceConsumersEntry, serveBuildDriftEntry } from './checks/persistence-consumers.ts';
@@ -102,18 +113,22 @@ import { runtimeBuildSkewEntry } from './checks/runtime-build-skew.ts';
 import { cliSocketRefusalsEntry } from './checks/cli-socket-refusals.ts';
 import { gitConvergenceEntry } from './checks/git-convergence.ts';
 import { gitWriterEntry } from './checks/git-writer.ts';
+import { foreignWritersEntry } from './checks/foreign-writers.ts';
 import { retrievalFeedbackEntry } from './checks/retrieval-feedback.ts';
 import { transcriptSecretExposureEntry } from './checks/transcript-secrets.ts';
 import { autoChronicleEntry } from './checks/auto-chronicle.ts';
 import { factsDrainEntry } from './checks/facts-drain.ts';
+import { wakeshiftEntry } from './checks/wakeshift.ts';
+import { wakeshiftOpenclawEntry } from './checks/wakeshift-openclaw.ts';
 import { factTakeVectorsEntry } from './checks/vector-coverage.ts';
 import { decideHealthEntry } from './checks/decide.ts';
+import { memoryProposalsEntry } from './checks/memory-proposals.ts';
 import { supersessionCalibrationEntry } from './checks/supersession-calibration.ts';
 import { factAdmissionFloorsEntry } from './checks/fact-admission-floors.ts';
 import { unlinkedFactsEntry } from './checks/unlinked-facts.ts';
 import { edgeValidityEntry } from './checks/edge-validity.ts';
 import { coreMemoryEntry } from './checks/core-memory.ts';
-import { personTitleDuplicatesEntry } from './checks/entity-duplicates.ts';
+import { entityDuplicatesEntry, personTitleDuplicatesEntry } from './checks/entity-duplicates.ts';
 import { plannerStatsEntry } from './checks/planner-stats.ts';
 import { revisionBackfillEntry } from './checks/revision-backfill.ts';
 import { beliefLedgerEntry } from './checks/belief-ledger.ts';
@@ -128,20 +143,35 @@ import { chatFallbackChainEntry } from './checks/chat-fallback.ts';
 import { providerConsentEntry } from './checks/provider-consent.ts';
 import { behaviorChangesEntry } from './checks/behavior-changes.ts';
 import { fenceIntegrityEntry } from './checks/fence-integrity.ts';
+import { mcpRequestLogRetentionEntry } from './checks/mcp-request-log.ts';
+import { storageManifestEntry } from './checks/storage-manifest.ts';
 import { outsideContentFencesEntry } from './checks/outside-content-fences.ts';
 import { dbAheadOfGitEntry } from './checks/db-ahead-of-git.ts';
 import { gitIndexLagEntry } from './checks/git-index-lag.ts';
+import { strictFactsOutsideGitEntry } from './checks/strict-facts-outside-git.ts';
+import { localEditAdoptionsEntry } from './checks/local-edit-adoptions.ts';
+import { sessionLaneBudgetEntry } from './checks/session-lane.ts';
 import { syncConfigKeysEntry } from './checks/sync-config-keys.ts';
 import { ghostPagesEntry } from './checks/ghost-pages.ts';
 import { memberAccessEntry } from './checks/member-access.ts';
 import { folderAccessEntry } from './checks/folder-access.ts';
+import { unlabeledPeopleFoldersEntry } from './checks/unlabeled-people-folders.ts';
+import { openSharedPagesEntry } from './checks/open-shared-pages.ts';
+import { unscopedSharedReadsEntry } from './checks/unscoped-shared-reads.ts';
+import { sharedStdioBindingEntry } from './checks/shared-stdio-binding.ts';
 import { sharedAgentAccessEntry } from './checks/shared-agent-access.ts';
+import { ownerReadsRestrictedEntry } from './checks/owner-reads-restricted.ts';
+import { accessLineageEntry } from './checks/access-lineage.ts';
+import { accessLabelledOnlyEntry } from './checks/access-labelled-only.ts';
+import { attestReadAccessEntry } from './checks/attest-read-access.ts';
+import { guestSourceEntry } from './checks/guest-source.ts';
 import { originTwinsEntry } from './checks/origin-twins.ts';
 import { slugPathMismatchEntry } from './checks/slug-path-mismatch.ts';
 import { renameIdentityDowngradesEntry } from './checks/rename-identity-downgrades.ts';
 import { unindexedFilesEntry } from './checks/unindexed-files.ts';
 import { syncLandingGapsEntry } from './checks/landing-gaps.ts';
-import { purgeParkedPagesEntry } from './checks/purge-parks.ts';
+import { derivedOriginParkedEntry, purgeParkedPagesEntry } from './checks/purge-parks.ts';
+import { purgeMirrorEntry } from './checks/purge-mirror.ts';
 import { derivationPurgeSweepsEntry } from './checks/derivation-purge-sweeps.ts';
 import { missingRecordedFilesEntry } from './checks/missing-recorded-files.ts';
 import { uncommittedSyncDeletionsEntry } from './checks/uncommitted-sync-deletions.ts';
@@ -179,6 +209,8 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   resolverHealthEntry,
   retrievalReflexEntry,
   skillConformanceEntry,
+  skillHealthEntry,
+  skillpackUpdateEntry,
   bootstrapChecksEntry,
   memorableRelayEntry,
   connectorsEntry,
@@ -217,12 +249,32 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   pgvectorEntry,
   // #7276: the privacy check next, with its own entry budget, before any full scan.
   derivedVisibilityEntry,
+  // GBRA-541: then the checks that catch a lost write (LOST_WRITE_CHECKS), bounded, before any full scan uses the budget.
+  gitIndexLagEntry,
+  dbAheadOfGitEntry,
+  strictFactsOutsideGitEntry,
+  ownerHostStaleEntry,
+  uncommittedSyncDeletionsEntry,
   memberAccessEntry,
   folderAccessEntry,
+  unlabeledPeopleFoldersEntry,
+  openSharedPagesEntry,
+  unscopedSharedReadsEntry,
+  sharedStdioBindingEntry,
   sharedAgentAccessEntry,
+  ownerReadsRestrictedEntry,
+  accessLineageEntry,
+  accessLabelledOnlyEntry,
+  attestReadAccessEntry,
+  guestSourceEntry,
   rlsEntry,
+  postgresTlsEntry,
   functionSearchPathEntry,
+  guardLedgerChecksEntry,
+  ownerOnlyMarksTriggersEntry,
+  databaseEncodingEntry,
   schemaVersionEntry,
+  schemaFunctionBodiesEntry,
   rlsEventTriggerEntry,
   embeddingsEntry,
   embeddingProviderEntry,
@@ -257,12 +309,15 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   queueHealthEntry,
   globalMaintenanceTimeoutsEntry,
   globalMaintenanceStalledEntry,
+  unattendedMaintenanceEntry,
+  transcriptArchiveEntry,
   embedBackfillStalledEntry,
   contentDriftSweepEntry,
   connectorAccountMismatchEntry,
   legacyJobAuthorityEntry,
   legacyTokenGrantsEntry,
   grantNewOpsEntry,
+  unscopedMultiUserTokenEntry,
   indexAuditEntry,
   imageAssetsEntry,
   imageEmbeddingCoverageEntry,
@@ -271,11 +326,15 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   commitNotifierEntry,
   gitConvergenceEntry,
   gitWriterEntry,
+  foreignWritersEntry,
   decideHealthEntry,
+  memoryProposalsEntry,
   unlinkedFactsEntry,
   edgeValidityEntry,
   autoChronicleEntry,
   factsDrainEntry,
+  wakeshiftEntry,
+  wakeshiftOpenclawEntry,
   factTakeVectorsEntry,
   plannerStatsEntry,
   retrievalFeedbackEntry,
@@ -289,6 +348,8 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   trustReleaseUnpreviewedEntry,
   coreMemoryEntry,
   persistenceConsumersEntry,
+  // GBRA-133: this role's session connections across every process, against the pooler's limit (read-only).
+  sessionLaneBudgetEntry,
   runtimeBuildSkewEntry,
   cliSocketRefusalsEntry,
   atomHeldFailedEntry,
@@ -299,9 +360,10 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   slugPathMismatchEntry,
   renameIdentityDowngradesEntry,
   purgeParkedPagesEntry,
+  derivedOriginParkedEntry,
+  purgeMirrorEntry,
   derivationPurgeSweepsEntry,
   missingRecordedFilesEntry,
-  uncommittedSyncDeletionsEntry,
   unindexedFilesEntry,
   overwrittenEditsEntry,
   rowsBehindEntry,
@@ -310,15 +372,20 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   managedSyncConvergenceEntry,
   // #7160: title-prefixed person pages next to the unprefixed page (read-only, preview-first).
   personTitleDuplicatesEntry,
-  // Git-canonical G1: the read-only git-gap census totals per source with a checkout (informational, always ok).
-  dbAheadOfGitEntry,
-  // Git-canonical G3: how far each strict source's index trails the commit at HEAD.
-  gitIndexLagEntry,
+  // plan autoplan-20261117192252 PR 1: likely duplicate person and company pages by key, name and slug shape (read-only).
+  entityDuplicatesEntry,
+  // GST-1601: the one-sided local edits adopted in the last 24 h per source (informational, always ok).
+  localEditAdoptionsEntry,
   // GBRA-221: live fence rows on imported pages whose body is outside-authored text (review only).
   outsideContentFencesEntry,
-  // GBRA-248 W0: writes waiting on a long-quiet owner host, and a file plane that disables embeddings over a database with vectors.
-  ownerHostStaleEntry,
+  // GBRA-248 W0: a file plane that disables embeddings over a database with vectors (owner_host_stale runs with LOST_WRITE_CHECKS).
   embeddingPlaneDisagreementEntry,
+  // #6770: MCP request-log size and the opt-in retention prune (read-only; the enable fix asks the user).
+  mcpRequestLogRetentionEntry,
+  // GST-1943: the storage shelf: cards failing the card schema, interim records not adopted, a hosted shelf directory gone.
+  storageManifestEntry,
+  // GST-2731: facts pages (type: facts) with fact lines that carry no date (read-only; the fix asks the user for the dates).
+  factsPagesEntry,
   fenceIntegrityEntry,
   searchModeEntry,
 ];
@@ -333,6 +400,14 @@ export const CHEAP_INCIDENT_CHECKS: ReadonlySet<string> = new Set([
   // GBRA-150: bounded receipt and page reads, so a brain whose default run cannot finish still names its landing gaps.
   'sync_landing_gaps',
 ]);
+
+/**
+ * GBRA-541: checks that catch a write the database holds and Git does not (or that waits on a host that never commits it):
+ * written-but-uncommitted pages and facts, an index behind its commits, writes held on a quiet owner, deletions Git never
+ * held. Each is bounded, and every entry that emits one runs right after the privacy check, before the full scans, so a
+ * large brain's slow scans cannot use up the budget first (test/doctor-entry-deadline-6803.test.ts).
+ */
+export const LOST_WRITE_CHECKS: ReadonlySet<string> = new Set(['git_index_lag', 'db_ahead_of_git', 'strict_facts_outside_git', 'owner_host_stale', 'uncommitted_sync_deletions']);
 
 const CONNECTION_LANE: ReadonlySet<DoctorEntry> = new Set([offlineConnectionEntry, dbChecksGateEntry, connectionEntry, connectionGateEntry]);
 
@@ -379,7 +454,7 @@ function onlyResult(checks: Check[], only: ReadonlySet<string>, stopped: boolean
   const kept = checks.filter((c) => only.has(c.name) || (stopped && missing.length > 0 && c.name === 'connection'));
   for (const name of missing) {
     kept.push(stopped
-      ? { name, status: 'warn', message: 'Not run: the database checks stopped early (see the connection check).', fix_unavailable_reason: 'check_errored' }
+      ? { name, status: 'warn', message: 'Not run: the database checks stopped early (see the connection check).', details: { health: 'unknown' }, fix_unavailable_reason: 'check_errored' }
       : infoCheck(name, 'No finding: this check does not apply to this brain right now.', 'not_applicable'));
   }
   return kept;
@@ -397,7 +472,11 @@ function onlyResult(checks: Check[], only: ReadonlySet<string>, stopped: boolean
  * connection lane runs at every tier). Each entry runs under its own deadline:
  * the per-entry budget (`doctor.entry_budget_ms`, read with a bounded
  * statement) clipped to the overall deadline; under `--tier ops`, or under
- * `--only` with an explicit `--budget-ms`, the overall deadline alone. The
+ * `--only` with an explicit `--budget-ms`, the overall deadline alone. #8979:
+ * with an engine, without `--fast` or `--only`, the entries before the
+ * connection lane stop at half the time left when the run starts, so the ops
+ * sections and the cheap incident checks after it keep the other half however
+ * slow those entries are. The
  * entry reads through the run's deadline-bound engine with that deadline in
  * its async context, so its statements stop at it (src/core/statement-deadline.ts).
  * An entry past its budget, or whose statement was refused or cancelled at its
@@ -416,6 +495,9 @@ export function runDoctorRegistry(ctx: DoctorContext, entries: readonly DoctorEn
     const outcomes: EntryOutcome[] = [];
     const memo = new Map<string, Promise<unknown>>();
     const gateAt = entries.indexOf(connectionGateEntry);
+    const dbLaneAt = ctx.engine && !ctx.fastMode && !ctx.only ? entries.findIndex((e) => CONNECTION_LANE.has(e)) : -1;
+    const startedAt = Date.now();
+    const preLaneReserveMs = dbLaneAt >= 0 && ctx.deadline?.deadlineAt != null ? Math.floor((ctx.deadline.deadlineAt - startedAt) / 2) : 0;
     const checks: Check[] = [];
     let entryBudgetMs: number | null = null;
     for (const entry of entries) {
@@ -434,7 +516,7 @@ export function runDoctorRegistry(ctx: DoctorContext, entries: readonly DoctorEn
         entryBudgetMs = await readEntryBudget(ctx);
       }
       const overallOnly = cheapTier(tier) || (!!ctx.only && ctx.deadline?.explicit === true);
-      const budgetMs = entryBudget(ctx, overallOnly, CONNECTION_LANE.has(entry) ? null : entryBudgetMs, started);
+      const budgetMs = entryBudget(ctx, overallOnly, CONNECTION_LANE.has(entry) ? null : entryBudgetMs, started, entries.indexOf(entry) < dbLaneAt ? preLaneReserveMs : 0);
       const limit = budgetMs !== null && ctx.deadline?.deadlineAt != null && (overallOnly || entryBudgetMs === null || started + budgetMs >= ctx.deadline.deadlineAt) ? 'overall' : 'entry';
       if (budgetMs !== null && budgetMs <= 0) {
         checks.push(...emitted.map((n) => budgetUnknownCheck(n, 0, ctx.deadline?.budgetMs ?? 0, 'overall')));
@@ -463,7 +545,8 @@ export function runDoctorRegistry(ctx: DoctorContext, entries: readonly DoctorEn
             checks.push(...later.emits.filter((n) => !ctx.only || ctx.only.has(n)).map((n) => budgetUnknownCheck(n, ctx.connectError instanceof DoctorBudgetError ? ctx.connectError.elapsedMs : 0, ctx.deadline?.budgetMs ?? 0, 'overall')));
           }
         }
-        return ctx.only ? onlyResult(checks, ctx.only, true) : checks;
+        // An engine-free --only run stops at the database gate by design: only a failed or skipped connect stopped the database checks early.
+        return ctx.only ? onlyResult(checks, ctx.only, ctx.connectError !== undefined || ctx.connectionFailed === true || ctx.fastMode) : checks;
       }
       const pastDeadline = ctx.deadline?.deadlineAt != null && Date.now() >= ctx.deadline.deadlineAt;
       const produced = result.map((c) => {
@@ -496,9 +579,9 @@ async function withLastKnown(engine: BrainEngine, checks: Check[], outcomes: Ent
   return unmeasured ? [...applied.checks, unmeasured] : applied.checks;
 }
 
-/** The time this entry may take: the per-entry budget (unless only the overall deadline applies) clipped to the overall deadline; null: unbounded. */
-function entryBudget(ctx: DoctorContext, overallOnly: boolean, perEntry: number | null, now: number): number | null {
-  const overall = ctx.deadline?.deadlineAt != null ? ctx.deadline.deadlineAt - now : null;
+/** The time this entry may take: the per-entry budget (unless only the overall deadline applies) clipped to the overall deadline less `reservedMs`; null: unbounded. */
+function entryBudget(ctx: DoctorContext, overallOnly: boolean, perEntry: number | null, now: number, reservedMs: number): number | null {
+  const overall = ctx.deadline?.deadlineAt != null ? ctx.deadline.deadlineAt - reservedMs - now : null;
   const own = overallOnly ? null : ctx.entryBudgetOverrideMs ?? perEntry;
   if (overall === null) return own;
   return own === null ? overall : Math.min(own, overall);

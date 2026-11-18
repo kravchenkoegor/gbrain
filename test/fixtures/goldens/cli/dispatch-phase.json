@@ -573,6 +573,13 @@
         "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
+      "dedupe": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
       "diag": {
         "hasSwitchCase": true,
         "phase": "post-connect",
@@ -1032,6 +1039,13 @@
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
+      "guests": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
       "hook": {
         "hasSwitchCase": false,
         "phase": "pre-connect",
@@ -1175,7 +1189,17 @@
       "maintain": {
         "hasSwitchCase": true,
         "phase": "post-connect",
-        "preConnectRules": [],
+        "preConnectRules": [
+          {
+            "condition": "command === 'maintain' && await (await import('../commands/maintain-schedule.ts')).tryRunMaintainEngineFree(args)",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": []
+          }
+        ],
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
@@ -1196,6 +1220,13 @@
           }
         ],
         "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
+      "memory-proposals": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
       "migrate": {
@@ -1670,6 +1701,13 @@
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
+      "secrets": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
       "self-upgrade": {
         "hasSwitchCase": false,
         "phase": "pre-connect",
@@ -1719,6 +1757,25 @@
             "thinClientCheck": false,
             "unconditionalFor": [
               "setup"
+            ]
+          }
+        ],
+        "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
+      "skill-resolver": {
+        "hasSwitchCase": false,
+        "phase": "pre-connect",
+        "preConnectRules": [
+          {
+            "condition": "command === 'skill-resolver'",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": [
+              "skill-resolver"
             ]
           }
         ],
@@ -2042,11 +2099,11 @@
       },
       "upgrade": {
         "hasSwitchCase": false,
-        "phase": "pre-connect",
+        "phase": "pre-connect-own-engine",
         "preConnectRules": [
           {
             "condition": "command === 'upgrade'",
-            "connectsEngine": false,
+            "connectsEngine": true,
             "refusesThinClient": false,
             "routesThinClient": false,
             "terminates": true,
@@ -2065,6 +2122,16 @@
         "preConnectRules": [],
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
+      },
+      "wakeshift": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "route-then-refuse",
+        "thinClientRoutedSubcommands": [
+          "watch",
+          "accept-terms"
+        ]
       },
       "watch": {
         "hasSwitchCase": true,
@@ -2180,6 +2247,16 @@
       },
       {
         "commands": [],
+        "condition": "cliOpts.room !== undefined && !helpRequested && (CLI_ONLY.has(command) || !(cliOps.has(command) || cliAliases.has(command)))",
+        "connectsEngine": false,
+        "refusesThinClient": false,
+        "routesThinClient": false,
+        "terminates": false,
+        "thinClientCheck": false,
+        "unconditionalFor": []
+      },
+      {
+        "commands": [],
         "condition": "!['serve', 'jobs', 'autopilot'].includes(command)",
         "connectsEngine": false,
         "refusesThinClient": false,
@@ -2250,8 +2327,18 @@
       },
       {
         "commands": [],
-        "condition": "cliOpts.as === undefined && ['search', 'query', 'get', 'recall'].includes(command) && await (await import('./cli-socket-client.ts')).maybeServeFromCliSocket(command, subArgs)",
+        "condition": "cliOpts.as === undefined && cliOpts.room === undefined && !enforcedClass && ['search', 'query', 'get', 'recall'].includes(command) && await (await import('./cli-socket-client.ts')).maybeServeFromCliSocket(command, subArgs)",
         "connectsEngine": false,
+        "refusesThinClient": false,
+        "routesThinClient": false,
+        "terminates": true,
+        "thinClientCheck": false,
+        "unconditionalFor": []
+      },
+      {
+        "commands": [],
+        "condition": "CLI_ONLY.has(command) && enforcedClass && !helpRequested && command !== 'errors' && command !== 'protocol'",
+        "connectsEngine": true,
         "refusesThinClient": false,
         "routesThinClient": false,
         "terminates": true,
@@ -2285,6 +2372,7 @@
         "stats",
         "tune"
       ],
+      "serve": [],
       "sources": [
         "shared-skills"
       ],
@@ -2297,6 +2385,10 @@
         "update",
         "resolve",
         "supersede"
+      ],
+      "wakeshift": [
+        "watch",
+        "accept-terms"
       ]
     }
   },

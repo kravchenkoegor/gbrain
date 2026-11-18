@@ -5,7 +5,7 @@
  * (docs/designs/refactor-wave-1/w1-inventory.md). `listAllSources` was
  * unscoped on master (EO4 inventory), so it takes `LegacyUnscopedRead`.
  */
-import type { SourceRow } from '../engine.ts';
+import type { SourceDetailRow, SourceRow } from '../engine.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from '../source-config-sql.ts';
 import { jsonbParam, type SqlExecutor } from './executor.ts';
 import type { LegacyUnscopedRead } from './brands.ts';
@@ -20,14 +20,15 @@ export async function listAllSources(exec: LegacyUnscopedRead, opts?: {
     // how many archived rows exist. ORDER BY (id='default') DESC, id
     // matches sources-ops.listSources for operator-output stability.
     // localPathOnly skips pure-DB sources so autopilot fan-out doesn't
-    // dispatch jobs that would fall back to the global sync.repo_path.
+    // dispatch jobs that would fall back to the global sync.repo_path, and
+    // the storage shelf, whose cycle is always skipped (GST-1943).
     const includeArchived = opts?.includeArchived === true;
     const localPathOnly = opts?.localPathOnly === true;
     const { rows } = await exec.run(sqlFragment`
       SELECT id, name, local_path, last_sync_at, config
         FROM sources
        WHERE (${includeArchived} OR archived IS NOT TRUE)
-         AND (${!localPathOnly} OR local_path IS NOT NULL)
+         AND (${!localPathOnly} OR (local_path IS NOT NULL AND config->>'role' IS DISTINCT FROM 'storage_manifest'))
        ORDER BY (id = 'default') DESC, id
     `);
     return rows.map((r) => ({
@@ -78,3 +79,23 @@ export async function updateSourceConfig(exec: SqlExecutor, sourceId: string, pa
     `);
     return affectedRows > 0;
   }
+
+/** One source with the columns import and contextual retrieval read, or null for an unknown id. Rows come back as the driver returns them. */
+export async function getSource(exec: LegacyUnscopedRead, sourceId: string): Promise<SourceDetailRow | null> {
+  const rows = await exec.executeRaw<SourceDetailRow>(
+    `SELECT id, name, local_path, last_commit, last_sync_at, config, created_at,
+            contextual_retrieval_mode, trust_frontmatter_overrides
+     FROM sources WHERE id = $1`,
+    [sourceId],
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Local paths of every source that has one, unscoped on master (`withSourceFilesystemLock` read it through
+ * `executeRaw`). Empty strings are dropped as well as NULLs.
+ */
+export async function listSourceLocalPaths(exec: LegacyUnscopedRead): Promise<string[]> {
+  const { rows } = await exec.query<{ local_path: string }>(`SELECT local_path FROM sources WHERE local_path IS NOT NULL AND local_path <> ''`);
+  return rows.map(r => r.local_path);
+}

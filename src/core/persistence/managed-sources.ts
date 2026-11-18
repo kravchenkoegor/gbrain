@@ -9,6 +9,7 @@ import { runManagedSourceLifecycle, type SourceLifecycleInput } from './source-l
 import { isValidSourceId } from '../source-id.ts';
 import { chooseMeetingsRecord, meetingsSourceConfig } from '../meetings/source-add.ts';
 import { slackSourceConfig } from '../slack/source-add.ts';
+import { imessageSourceConfig } from '../imessage/source-add.ts';
 import { WRITE_ERROR_CODES, type WriteErrorCode } from './types.ts';
 
 export function assertTopologyCommitted(result:Record<string,unknown>):void{
@@ -23,7 +24,7 @@ export function assertTopologyCommitted(result:Record<string,unknown>):void{
 export function managedSourceAddInput(opts:AddSourceOpts):SourceLifecycleInput{
   if(!isValidSourceId(opts.id))throw new OperationError('invalid_params','A valid explicit source ID is required.',
     'Pass a source id of 1-32 lowercase letters, digits and inner hyphens (for example "notes" or "acme-wiki").');
-  const connectors=[opts.github,opts.google,opts.meetings,opts.slack].filter(Boolean).length;
+  const connectors=[opts.github,opts.google,opts.meetings,opts.slack,opts.imessage].filter(Boolean).length;
   if(opts.remoteUrl&&opts.localPath||connectors>1||connectors&&(opts.remoteUrl||opts.localPath))
     throw new OperationError('invalid_params','Choose exactly one source location: path, remote URL, GitHub, Google, meetings, or Slack.',
       `Add source ${opts.id} with exactly one of a local path, a Git remote URL, or one connector (GitHub, Google, meetings, Slack).`);
@@ -33,7 +34,7 @@ export function managedSourceAddInput(opts:AddSourceOpts):SourceLifecycleInput{
     throw new OperationError('invalid_params','force and federated must be boolean values.','Pass force and federated as true or false, or omit them.');
   let path=opts.localPath?resolve(msysToNativePath(opts.localPath)):undefined;
   let config:Record<string,unknown>=opts.federated==null?{}:{federated:opts.federated};
-  if(opts.remoteUrl){path=resolve(opts.cloneDir??defaultCloneDir(opts.id));config={...config,remote_url:opts.remoteUrl,managed_clone:true};}
+  if(opts.remoteUrl){path=resolve(opts.cloneDir??defaultCloneDir(opts.id));config={...config,remote_url:opts.remoteUrl,managed_clone:true,added_by_remote_caller:opts.addedByRemoteCaller===true};}
   if(opts.github){
     const gh=opts.github;path=resolve(msysToNativePath(gh.dir));
     config={kind:'github',gh_token_env:gh.tokenEnv,gh_handle:gh.handle,gh_scope:gh.scope,gh_repos:gh.repos.join(','),gh_involvement:gh.involvement,
@@ -58,8 +59,9 @@ export function managedSourceAddInput(opts:AddSourceOpts):SourceLifecycleInput{
     path=choice.dir??undefined;
     config=slackSourceConfig(opts.slack,choice,opts.federated,true);
   }
+  if(opts.imessage){path=undefined;config=imessageSourceConfig(opts.imessage,opts.federated);}
   return {operation:'add',sourceId:opts.id,path,name:opts.name,config,remoteUrl:opts.remoteUrl,
-    createDirectory:!!(opts.github||opts.google||(opts.meetings||opts.slack)&&path),requireGitContent:!!(path&&!opts.remoteUrl&&!opts.github&&!opts.google&&!opts.meetings&&!opts.slack&&!opts.force),requestId:opts.requestId,expectedIncarnation:opts.expectedIncarnation};
+    createDirectory:!!(opts.github||opts.google||(opts.meetings||opts.slack)&&path),requireGitContent:!!(path&&!opts.remoteUrl&&!opts.github&&!opts.google&&!opts.meetings&&!opts.slack&&!opts.imessage&&!opts.force),requestId:opts.requestId,expectedIncarnation:opts.expectedIncarnation};
 }
 export async function addManagedSource(engine:BrainEngine,opts:AddSourceOpts):Promise<SourceRow>{
   const result=await runManagedSourceLifecycle(engine,managedSourceAddInput(opts));

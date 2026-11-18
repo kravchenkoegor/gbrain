@@ -83,6 +83,23 @@ function scrubErrorChain(err: unknown, redact: (text: string) => string): void {
   }
 }
 
+/** #9466: the registry code of a success response whose body the AI SDK could not parse as one JSON document. */
+export const UNPARSEABLE_RESPONSE_CODE = 'provider_response_unparseable';
+
+/**
+ * #9466: the provider answered with a success status and a body that is not one JSON document. The AI SDK raises its
+ * JSON parse error, wrapped in an API call error that carries the 2xx status when it read a response. The same request
+ * gets the same body (the common case: a route that streams Server-Sent Events when `stream` is omitted), so retrying
+ * cannot help. A body that parsed but failed the response schema, and an error status whose body did not parse, are not
+ * this case.
+ */
+function unparseableSuccessResponse(err: unknown): boolean {
+  const e = err as { name?: unknown; statusCode?: unknown; cause?: unknown } | null;
+  if (e?.name === 'AI_JSONParseError') return true;
+  return e?.name === 'AI_APICallError' && typeof e.statusCode === 'number' && e.statusCode >= 200 && e.statusCode < 300
+    && (e.cause as { name?: unknown } | null)?.name === 'AI_JSONParseError';
+}
+
 /** Model ids a provider renamed, mapped to the current id (B-N7: suggested on a 404). */
 const KNOWN_MODEL_RENAMES: Readonly<Record<string, string>> = {
   'deepseek:deepseek-v4-flash': 'deepseek:deepseek-flash',
@@ -137,6 +154,11 @@ export function normalizeAIError(err: unknown, context?: string, redact?: (text:
   // 4xx (except 429) = config-level, non-retryable. A 403 whose body says the
   // project has no access to the model is a model problem, not a key problem.
   if (typeof status === 'number' && status >= 400 && status < 500 && status !== 429) {
+    // #9696: Ollama answers 400 while the runner behind a model restarts; a refused connection to it is an outage.
+    const body = (err as { responseBody?: unknown }).responseBody;
+    if (/\bconnect: connection refused\b|"error"\s*:\s*"connection refused"/.test(`${raw}\n${typeof body === 'string' ? body : ''}`)) {
+      return carryStatusFields(err, new AITransientError(`${ctxPrefix}${msg}`, err));
+    }
     return carryStatusFields(err, new AIConfigError(
       `${ctxPrefix}${msg}`,
       status === 404 || MODEL_NOT_FOUND_MESSAGE_RE.test(msg) ? modelNotFoundFix(context, routeHint)
@@ -144,6 +166,16 @@ export function normalizeAIError(err: unknown, context?: string, redact?: (text:
         : 'Check your model id + provider options match the provider API.',
       err,
     ));
+  }
+
+  // #9466: fixed text only; the SDK's parse error quotes the response body, which must not reach a log or a job row.
+  if (unparseableSuccessResponse(err)) {
+    return Object.assign(carryStatusFields(err, new AIConfigError(
+      `${ctxPrefix}The provider answered with a success status, but the response body could not be parsed as one JSON document.`,
+      'Check that this provider route returns one JSON body for a non-streaming request; a route that streams when `stream` is omitted is the common cause. '
+        + 'Send the field the route needs for that model with gbrain config set provider_chat_options.<provider>:<model> \'{"stream": false}\', or fix the route.',
+      err,
+    )), { code: UNPARSEABLE_RESPONSE_CODE, retryable: false });
   }
 
   // AI SDK named errors
@@ -265,7 +297,20 @@ const PER_ITEM_HTTP_STATUSES = new Set([400, 408, 413, 422]);
 // halts an entire cycle phase, so a stray word inside a raw-output slice
 // must not trip it. Only specific provider phrasings qualify.
 export const BILLING_MESSAGE_RE =
-  /insufficient_quota|quota exceeded|exceeded your (?:current )?quota|credit balance is too low|spend limit|billing_not_active|billing hard limit|payment required/i;
+  /insufficient_quota|quota exceeded|exceeded your (?:current )?quota|credit balance is too low|no credits remaining|spend limit|billing_not_active|billing hard limit|payment required/i;
+// #8385: the provider's structured error type or code, read from a parsed
+// response body, so a 429 whose message names no billing phrase still halts.
+const BILLING_ERROR_CODES = new Set(['insufficient_quota', 'credit_balance_exhausted', 'billing_not_active']);
+
+function billingErrorBody(responseBody: unknown): boolean {
+  if (typeof responseBody !== 'string') return false;
+  try {
+    const error = JSON.parse(responseBody)?.error;
+    return [error?.type, error?.code].some(v => typeof v === 'string' && BILLING_ERROR_CODES.has(v));
+  } catch {
+    return false;
+  }
+}
 const AUTH_MESSAGE_RE =
   /authentication_error|permission_error|invalid (?:x-)?api[-_ ]?key|api key (?:is )?(?:invalid|expired|missing)|unauthorized|failed to authenticate|oauth session expired/i;
 export const RATE_MESSAGE_RE = /rate[-_ ]?limit(?:ed|_error)?\b|too many requests/i;
@@ -414,7 +459,7 @@ export function classifyGlobalLlmError(err: unknown): GlobalLlmErrorClass | null
   const rawIdx = message.indexOf('--- raw ---');
   const phraseText = rawIdx === -1 ? message : message.slice(0, rawIdx);
 
-  if (BILLING_MESSAGE_RE.test(phraseText)) return 'billing';
+  if ([...wrappedErrorLayers(err)].some(layer => billingErrorBody(layer.responseBody)) || BILLING_MESSAGE_RE.test(phraseText)) return 'billing';
   if (MODEL_NOT_FOUND_MESSAGE_RE.test(phraseText)) return 'model_not_found';
   if (status !== undefined) {
     const byStatus = statusToClass(status);

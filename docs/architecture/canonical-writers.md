@@ -47,7 +47,9 @@ A durable cursor uses a singleton JSON-array envelope under the private
 `managed-sync` operation in `op_checkpoints`; the immutable manifest is stored
 separately so advancing one page never rewrites the entire discovered file list. Only one page is admitted ahead of
 the scan, and the scan yields after at most 25 pages or 250 milliseconds between
-page publications. Foreground requests on the same root receive service first;
+page publications. On PGLite, which answers queries without returning to the event
+loop, every step of the scan also takes a `setImmediate` turn, so a run of pages
+settled without a write (held or waived) still lets timers and signal handlers run. Foreground requests on the same root receive service first;
 after 25 foreground commits or one second of continuous foreground service, sync
 earns a bounded batch even while new interactive requests continue arriving. Interruption or a pending owner leaves the cursor and source
 checkpoint intact. A later invocation resumes the frozen target; a newer Git
@@ -78,8 +80,9 @@ worktree native lock while claims stop (`fenced`), verifies HEAD and runs
 ordinary managed `--no-pull` sync that follows, so every imported page is a
 journaled request. A durable `persistence_worktree_refreshes` row lets a
 restarted owner converge an interrupted refresh without adopting an unverified
-HEAD. With `sources.refresh_publish_diverged` on (the user's standing consent,
-default off), a diverged refresh first runs the keep-checkout publish, which
+HEAD. With `sources.refresh_publish_diverged` on (unset means on when the
+worktree's Git durability is on; `false` turns it off), a diverged refresh runs the
+keep-checkout publish with a secret scan of the local commits, which
 pushes HEAD merged with the upstream in memory and never moves the checkout or
 writes the database, then fast-forwards as above. Remote sync retains the
 original `submit_job` principal, admin/source/operation ceiling and normalized

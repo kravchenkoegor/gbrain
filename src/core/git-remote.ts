@@ -17,7 +17,7 @@ import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts'
  */
 import { execFileSync } from './spawn.ts';
 import { lstatSync, existsSync, readdirSync } from 'fs';
-import { isAbsolute, join } from 'path';
+import { dirname, isAbsolute, join } from 'path';
 import { isInternalUrl } from './url-safety.ts';
 import { execFileBounded } from './bounded-child-exec.ts';
 import { gitChildEnv } from './git-env.ts';
@@ -97,7 +97,16 @@ export interface CloneOpts {
   depth?: number; // default 1; 0 means full clone
   branch?: string;
   timeoutMs?: number; // default 600_000 (10 min)
+  /**
+   * Keep git-lfs from downloading, in this clone and every later git command in it: the repository's own .lfsconfig
+   * picks the LFS endpoint, outside the URL gate. Written to the clone's .git/config, which outranks .lfsconfig;
+   * hooks are off too, so git-lfs's pre-push hook never asks that endpoint on a push.
+   */
+  skipLfs?: boolean;
 }
+
+/** `git clone` options that write the skipLfs lock-down into the clone's own .git/config. */
+export const LFS_OFF_CLONE_CONFIG = ['--config', 'lfs.fetchexclude=*', '--config', 'core.hooksPath=/dev/null', '--config', 'lfs.locksverify=false'] as const;
 
 export class GitOperationError extends Error {
   constructor(
@@ -163,6 +172,7 @@ export function cloneRepo(url: string, destDir: string, opts: CloneOpts = {}): v
   if (opts.branch) {
     args.push('--branch', opts.branch);
   }
+  if (opts.skipLfs) args.push(...LFS_OFF_CLONE_CONFIG);
   args.push(url, destDir);
 
   try {
@@ -341,6 +351,20 @@ export function validateRepoState(
  * `addSource` (#2707) to validate `--path` at registration time instead of
  * deferring the failure to the first sync.
  */
+/** Whether `dir` or any directory above it has a `.git` entry (read from the filesystem, no Git process). */
+export function underGitCheckout(dir: string): boolean {
+  for (let current = dir; ; current = dirname(current)) {
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- the second segment is the fixed name '.git'; this only checks for its existence while walking up from a registered source root.
+    if (existsSync(join(current, '.git'))) return true;
+    if (current === dirname(current)) return false;
+  }
+}
+
+/** GST-2732: a path counts as a plain folder only when neither Git nor the filesystem places it in a checkout, the test sync applies. */
+export function inGitCheckout(path: string): boolean {
+  return underGitCheckout(path) || isInsideGitRepo(path);
+}
+
 export function isInsideGitRepo(path: string): boolean {
   try {
     execFileSync('git', ['-C', path, 'rev-parse', '--show-toplevel'], {

@@ -1,7 +1,11 @@
 import { PENDING_IMPORT, pendingImportRefusal } from './pending-import.ts';
+import { deferredWaiting } from './refresh-barrier.ts';
+import { withSupersedes } from './import-deferral.ts';
+import { withAdoptedLocalEdit } from './local-edit-adoption.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { OperationError } from '../ops/contract.ts';
+import { isPhysicalRootDirectoryChangedMessage, relocatedRootTransferFix } from './physical-root-record.ts';
 import { LANE_BUSY, PersistenceConsumer, type PersistenceConsumerLike, type PrepareMutation } from './consumer.ts';
 import { WaiterOnlyConsumer, type ElectedOwner } from './consumer-election.ts';
 import { RESIDENT_CONSUMER_KINDS, startConsumerHeartbeat, type ConsumerHeartbeat } from './consumer-heartbeat.ts';
@@ -79,6 +83,10 @@ export function registerMutationPreparer(operation: string, prepare: PrepareMuta
  * phase clock, which carries the preparation's cancellation to every preparer's `enterClaimStep` boundaries.
  */
 export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest, cfg: GBrainConfig, signal?: AbortSignal, clock?: ClaimPhaseClock) {
+  // GST-1601: a write prepared again after its page's local edit was adopted names the adoption on its receipt.
+  return withAdoptedLocalEdit(row, await prepareByOperation(e, row, cfg, signal, clock));
+}
+async function prepareByOperation(e: BrainEngine, row: WriteRequest, cfg: GBrainConfig, signal?: AbortSignal, clock?: ClaimPhaseClock) {
   assertMutationProtocol(row);
   enterClaimStep(clock, 'dispatch');
   const registered = preparers.get(row.operation);
@@ -115,8 +123,8 @@ export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest
   if (['add_tag','remove_tag','add_timeline_entry'].includes(row.operation)) return prepareSemanticPageMutation(e, row, cfg);
   if (row.operation === 'add_link' || row.operation === 'remove_link') return (await import('./manual-links.ts')).prepareManualLinkMutation(e, row, cfg);
   if (row.operation === 'append_page') return (await import('./page-upload.ts')).withStagedBodyIf(e, row, async () => (await import('./page-append.ts')).prepareAppendMutation(e, row, cfg, signal, clock));
-  if (['put_page','capture','delete_page','restore_page','revert_version','edit_page'].includes(row.operation)) return withValidTimeAdvisory(row, withChangeReason(row, await preparePageMutation(e, row, cfg, undefined, signal,
-    { coordinated: await writeSwitchOn(e, 'single_write_group').catch(() => true), clock, boundedChunkWrites: true })));
+  if (['put_page','capture','delete_page','restore_page','revert_version','edit_page'].includes(row.operation)) return withValidTimeAdvisory(row, withChangeReason(row, await withSupersedes(row, await preparePageMutation(e, row, cfg, undefined, signal,
+    { coordinated: await writeSwitchOn(e, 'single_write_group').catch(() => true), clock, boundedChunkWrites: true }))));
   throw new OperationError('unsupported_mutation_protocol', 'No compatible mutation preparer is registered for this operation.', `Request ${row.request_id} (${row.operation}) was accepted by a gbrain version whose preparer this one lacks, so it has not run. Run gbrain upgrade on every host that serves this brain; the request stays journaled and resumes after the upgrade.`);
 }
 /**
@@ -218,7 +226,7 @@ export function assertPersistenceAccepting(engine: BrainEngine): void {
 }
 /** DX-A3: pending heads that need intervention, not more waiting. */
 export const BLOCKED_WRITE_REASONS = ['recovery_required', 'owner_unavailable', 'unexpected_file_bytes', 'unexpected_staging_bytes'] as const;
-const FATAL_READ_REASONS: readonly PgAccessReason[] = ['auth_failed', 'permission_denied', 'tenant_not_found', 'db_missing', 'schema_missing', 'storage_corrupt'];
+const FATAL_READ_REASONS: readonly PgAccessReason[] = ['auth_failed', 'permission_denied', 'tenant_not_found', 'db_missing', 'schema_missing', 'storage_corrupt', 'tls_required_default'];
 /** CEO-A7: the first poll waits this long (at most half the wait) for an in-process handoff, or not at all when this process already settled the request; later polls back off from 50 to 250 ms. */
 export const WRITE_POLL_START_MS = 200;
 export type WriteWait =
@@ -237,6 +245,9 @@ export type WriteWait =
 export async function awaitWrite(engine: BrainEngine, row: WriteRequest, config: GBrainConfig,
   opts: { waitMs?: number; signal?: AbortSignal; whileHeldMs?: number } = {}): Promise<WriteWait> {
   if (isTerminal(row)) return { kind: 'terminal', row };
+  // PR B: a write deferred behind a refresh still running (GST-1582: or an import not landed) cannot publish before it ends,
+  // so its pending receipt is returned at once.
+  if (row.state === 'deferred' && await deferredWaiting(engine, row)) return { kind: 'pending', row };
   const consumer = startPersistenceConsumer(engine, config);
   const service = services.get(engine)!;
   const id = row.id;
@@ -261,7 +272,11 @@ export async function awaitWrite(engine: BrainEngine, row: WriteRequest, config:
   let ownerRead: SharedOwnerRead | undefined;
   try {
     while (!service.stopping && !opts.signal?.aborted) {
-      if (handed) { row = handed; handed = undefined; if (isTerminal(row)) return { kind: 'terminal', row }; }
+      if (handed) {
+        row = handed; handed = undefined;
+        if (isTerminal(row)) return { kind: 'terminal', row };
+        if (row.state === 'deferred' && await deferredWaiting(engine, row)) return { kind: 'pending', row };
+      }
       const remaining = deadline - performance.now();
       if (!ownerRead && row.worktree_id && remaining <= OWNER_READ_BUDGET_MS) ownerRead = sharedOwnerRead(engine, row.worktree_id);
       if (remaining <= 0) {
@@ -289,6 +304,7 @@ export async function awaitWrite(engine: BrainEngine, row: WriteRequest, config:
       if (!read.row) continue;
       row = { ...row, ...read.row };
       if (isTerminal(row)) return { kind: 'terminal', row: await getWriteRequestById(engine, id).catch(() => null) ?? row };
+      if (row.state === 'deferred' && await deferredWaiting(engine, row)) return { kind: 'pending', row: await getWriteRequestById(engine, id).catch(() => null) ?? row };
     }
     // A stopped wait settles only what this process can settle at once: one consumer tick (it claims and publishes the
     // request when nothing holds it back) and the request this consumer is still executing. A write that cannot move
@@ -410,6 +426,10 @@ export function writeResponse(row: WriteRequest, hints: { retryAfterMs?: number 
       ? pendingWriteHint(receipt, row.operation)
       : delivered?.suggestion ?? content?.suggestion ?? held?.suggestion ?? terminalReceiptHint(row, reason), delivered?.docs);
   if (delivered?.detail ?? held?.reason) error.detail = delivered?.detail ?? held?.reason;
+  // #7671: a copied or restored checkout; the receipt kept only the message, so name the relocated-root self-transfer here.
+  if (isTerminal(row) && reason === 'recovery_required' && isPhysicalRootDirectoryChangedMessage(row.error_message)) {
+    Object.assign(error, { detail: 'physical_root_directory_changed', fix: relocatedRootTransferFix(row.source_id) });
+  }
   // #6693: a write refused while its page's file awaited import says so, with the wait (remember) or the sync to run first.
   if (isTerminal(row) && reason === 'source_changed' && (row.error_detail as { origin?: unknown } | null | undefined)?.origin === PENDING_IMPORT) {
     const pending = pendingImportRefusal(row, row.authority?.remote === true);
@@ -417,6 +437,8 @@ export function writeResponse(row: WriteRequest, hints: { retryAfterMs?: number 
   }
   const checkout = isTerminal(row) ? storedCheckoutRefusal((row.error_detail as { origin?: unknown } | null | undefined)?.origin, row.source_id, row.slug || null) : undefined;
   if (checkout) Object.assign(error, { suggestion: checkout.suggestion, fix: checkout.fix, detail: checkout.detail, docs: checkout.docs });
+  // GST-2462 (D2): a page whose file left git can still be narrowed: name the page rule, not only the ghost-page repair (which deletes it).
+  if (isTerminal(row) && reason === 'source_changed' && (row.error_detail as { origin?: unknown } | null | undefined)?.origin === 'canonical_file_missing') error.suggestion = `${error.suggestion} The page's file is gone, so a visibility edit cannot publish; to narrow who reads it without restoring the file, add a page rule on the brain host: gbrain access rule add --slug ${row.slug} --readers <member> --source ${row.source_id} (it previews; --yes applies, and removing the rule undoes it). See docs/guides/write-refusals.md#canonical_file_missing.`;
   // #6317 (B1b): a waiter-only process names the owner that publishes for it, so the caller is told who holds the write instead of polling blind.
   if (!isTerminal(row) && hints.waiterOnlyOwner) {
     const owner = hints.waiterOnlyOwner;

@@ -4,7 +4,7 @@ import { comparableFrontmatter } from '../markdown.ts';
 import { opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { digest, stableJson } from './digest.ts';
-import { RECONCILE_SAFETY_KEYS } from './reconcile-safety.ts';
+import { RECONCILE_SAFETY_KEYS, withoutSafetyAssessments } from './reconcile-safety.ts';
 
 export type ReconcileDecision = { path: string; action: 'take_file' | 'take_database' | 'set_value' | 'delete'; value?: unknown };
 export interface ReconcileConflict { path: string; file: unknown; database: unknown; }
@@ -19,6 +19,10 @@ export function reconcileCanonical(page: Pick<Page, 'type' | 'title' | 'compiled
     frontmatter: comparableFrontmatter(page.frontmatter), tags: [...new Set(tags)].sort() };
   validateReconcileJson(value, true);
   return JSON.parse(stableJson(value)) as ParsedPage;
+}
+/** `reconcileCanonical` without the gate's database-only markers, for asking whether a row and a file hold the same page. */
+export function contentCanonical(page: Parameters<typeof reconcileCanonical>[0], tags: string[]): ParsedPage {
+  return reconcileCanonical({ ...page, frontmatter: withoutSafetyAssessments(page.frontmatter ?? {}) }, tags);
 }
 function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 export function validateReconcileJson(value: unknown, allowDates = false): void {
@@ -39,10 +43,13 @@ export function validateReconcileJson(value: unknown, allowDates = false): void 
   visit(value, 0);
 }
 export function strictReconcileKeys(value: unknown, allowed: string[], required = allowed): asserts value is Record<string, unknown> {
-  if (!object(value) || Object.keys(value).some(k => !allowed.includes(k)) || required.some(k => !Object.hasOwn(value, k))) {
-    throw opError('invalid_params', 'Unsupported or missing reconciliation fields.',
-      'Pass the preview file written by --out unchanged, and give each decision only path, action and, for set_value, value.');
-  }
+  if (!object(value)) throw opError('invalid_params', 'Unsupported or missing reconciliation fields.',
+    'Pass the preview file written by --out unchanged, and give each decision only path, action and, for set_value, value.',
+    { why: 'Expected a JSON object with the reconciliation fields.' });
+  const unsupported = Object.keys(value).filter(k => !allowed.includes(k)).sort(), missing = required.filter(k => !Object.hasOwn(value, k));
+  if (unsupported.length || missing.length) throw opError('invalid_params', 'Unsupported or missing reconciliation fields.',
+    'Pass the preview file written by --out unchanged, and give each decision only path, action and, for set_value, value.',
+    { why: [unsupported.length ? `unsupported: ${unsupported.join(', ')}` : '', missing.length ? `missing: ${missing.join(', ')}` : ''].filter(Boolean).join('; ') });
 }
 function pointer(path: string): string[] {
   if (!path.startsWith('/') || /~(?![01])/u.test(path)) throw opError('invalid_params', 'Decisions require escaped JSON Pointer paths.',

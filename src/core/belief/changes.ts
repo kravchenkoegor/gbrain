@@ -26,6 +26,7 @@ import { readBeliefHistoryPage, type BeliefHistoryRow, type BeliefHistoryQuery }
 import { coverageAt } from './coverage-report.ts';
 import { readPageAtTime, remoteMayRead } from './page-at-time.ts';
 import { bodySubjects } from './backfill.ts';
+import { isQuarantined } from '../quarantine.ts';
 import { canonicalJson, valueHash } from './keys.ts';
 import { estimateTokens, packToBudget } from '../search/token-budget.ts';
 
@@ -59,6 +60,8 @@ export interface BeliefChangesQuery {
   sourceId: string; since: string; until: string; remote: boolean; entities?: readonly string[]; limit?: number;
   /** Remote callers: the take holders they may read (`readHolders`); `['world']` when absent. */
   takesHolders?: readonly string[];
+  /** GST-2957: the reader's fact reads are world-only (worldOnlyFacts); `deltaBeliefs` empties link contexts (withoutLinkContexts). */
+  worldOnly?: boolean;
 }
 
 const SUBJECT_EVENTS = new Set(['fact.asserted', 'fact.revised', 'fact.retracted', 'fact.withdrawn', 'fact.superseded', 'fact.transferred', 'fact.purged',
@@ -290,13 +293,16 @@ export async function beliefChanges(engine: BrainEngine, q: BeliefChangesQuery):
 
 /**
  * Fence subjects of a page body, keyed `kind\u0000subject_key`, under the history reader's rules: a subject whose key a
- * purge hid is dropped for every caller; a remote caller gets them only where it may read the interval, and only
+ * purge hid is dropped for every caller; a remote caller gets them only where it may read the interval and neither the interval nor the live page is quarantined, and only
  * world rows (takes of holders it may read) whose claim was not made private after the interval's event.
  */
 async function subjectsOf(engine: BrainEngine, q: BeliefChangesQuery, at: Awaited<ReturnType<typeof readPageAtTime>>, interval: NonNullable<Awaited<ReturnType<typeof readPageAtTime>>['current']>,
   privateAfter = interval.event.id) {
   if (!interval.page || interval.body === 'unavailable' || interval.body === 'segmented' || interval.page.compiled_truth == null) return null;
-  if (q.remote && !await remoteMayRead(engine, at.page_id, interval)) return null;
+  if (q.remote) {
+    const [live] = at.page_id == null ? [] : await engine.executeRaw<{ frontmatter: Record<string, unknown> | null }>('SELECT frontmatter FROM pages WHERE id = $1', [at.page_id]);
+    if (isQuarantined(interval.page.frontmatter) || isQuarantined(live?.frontmatter) || !await remoteMayRead(engine, at.page_id, interval)) return null;
+  }
   const { subjects } = await bodySubjects(engine, interval.lifetime, `${interval.page.compiled_truth}\n${interval.page.timeline ?? ''}`, interval.event.visibility);
   const holders = new Set(q.takesHolders ?? ['world']);
   const readable = subjects.filter(s => !q.remote || s.visibility === 'world' && (s.kind !== 'take' || holders.has(String(s.value.holder))));
@@ -342,6 +348,7 @@ const lineCost = (line: string) => estimateTokens(line + '\n');
  */
 export async function deltaBeliefs(engine: BrainEngine, q: BeliefChangesQuery, budget: number | null, text: string, envelope: string): Promise<{ beliefs: BeliefChanges; text: string }> {
   let beliefs = await beliefChanges(engine, q);
+  if (q.worldOnly) beliefs = withoutLinkContexts(beliefs);
   const header = `## Belief changes since ${q.since}`;
   if (budget !== null) {
     const room = budget - lineCost('') - lineCost(header);
@@ -349,6 +356,15 @@ export async function deltaBeliefs(engine: BrainEngine, q: BeliefChangesQuery, b
     if (kept.length < beliefs.changes.length) beliefs = { ...beliefs, changes: kept, truncated: true };
   }
   return { beliefs, text: beliefs.changes.length ? [text || envelope, '', header, ...beliefs.changes.map(renderBeliefChange)].join('\n') : text };
+}
+
+/**
+ * GST-2957: the changes with every link value's carried context emptied, for a delta reader whose fact reads are
+ * world-only (worldOnlyFacts): the context is an excerpt of a page body, past or present, that can hold private rows.
+ */
+export function withoutLinkContexts(b: BeliefChanges): BeliefChanges {
+  const bare = (v: Record<string, unknown> | null) => (v && typeof v.context === 'string' && v.context ? { ...v, context: '' } : v);
+  return { ...b, changes: b.changes.map(c => (c.kind === 'link' ? { ...c, before: bare(c.before), after: bare(c.after) } : c)) };
 }
 
 /** The CLI's text for a whole window: a header, the coverage note, one line per change. */

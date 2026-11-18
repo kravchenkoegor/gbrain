@@ -1,3 +1,4 @@
+import { sqlEngineKind } from '../core/sql-engine-kind.ts';
 import { jsonRequested } from '../core/cli-force-exit.ts';
 import { prepareProseChunks } from '../core/markdown-chunks.ts';
 import type { FenceChunkOverlay } from '../core/eligibility/fence-overlay.ts';
@@ -441,7 +442,7 @@ async function preflightDimMismatch(engine: BrainEngine, dryRun: boolean): Promi
     requestedDims: resolvedDims,
     requestedModel: resolvedModel,
     source: 'embed',
-    engineKind: engine.kind,
+    engineKind: sqlEngineKind(engine.kind, 'gbrain embed'),
     databasePath,
   });
   throw new EmbeddingDimMismatchError(recipe);
@@ -993,7 +994,7 @@ export async function runEmbed(engine: BrainEngine, args: string[], selectedConf
     // E-2: CLI-only single-flight for stale runs (the minion path locks itself).
     opts = { all, stale, dryRun, sourceId, batchSize, priority, catchUp, ...(pace && { pace }), ...(stale && { singleFlight: true }), ...(includeNullSignature && { includeNullSignature: true }) };
   } else {
-    const slug = args.find(a => !a.startsWith('--'));
+    const slug = (await import('./embed-slug-args.ts')).embedSlugTarget(args);
     if (!slug) {
       serr('Usage: gbrain embed [<slug>|--all|--stale|--slugs s1 s2 ...|--held] [--dry-run] [--batch-size N] [--priority recent] [--catch-up] [--include-null-signature] [--yes | --max-usd N] | --stale --images (gbrain embed --help: paid runs need the user\'s approval)');
       process.exit(1);

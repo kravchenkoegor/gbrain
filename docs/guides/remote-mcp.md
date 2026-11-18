@@ -120,8 +120,18 @@ Next — choose the connection method supported by the intended client
                    then gbrain bootstrap harness --yes --port 3131 --token <value>; or grant a scoped client with
                    gbrain mcp grant … --url http://127.0.0.1:3131/mcp --admin-token-file ~/.gbrain/serve/admin-token
                    and gbrain connect http://127.0.0.1:3131/mcp --harness <id> --credentials-file … --install
+  Cursor           cursor://anysphere.cursor-deeplink/mcp/install?name=gbrain&config=eyJ1cmwiOiJodHRwczovL3lvdXItbWFjaGluZS55b3VyLXRhaWxuZXQudHMubmV0L21jcCJ9
+                   Opens Cursor's MCP install prompt with this URL filled in; the Cursor machine must be on your tailnet.
   Check            gbrain mcp expose --status
 ```
+
+The `Cursor` line is a one-click link: it opens Cursor's install prompt with
+this MCP URL filled in. With `--funnel`, a `Claude` line comes first, which
+opens claude.ai's add-connector form the same way. Tailnet-only publishes get
+no Claude line, because claude.ai connects from Anthropic's servers. You still
+confirm and sign in inside the client. `--status` repeats the links and
+`--json` returns them as `install_links`. See [one-click client
+links](../mcp/README.md#one-click-client-links).
 
 The `Engine` and `Local agents` lines depend on the engine the receipt
 recorded: a Postgres brain prints `Local agents     gbrain bootstrap harness
@@ -418,8 +428,8 @@ put_pages with one request_id per batch and wait_ms 25000."*
   immediately and by meaning once its embedding effect finishes.
 - **Request size.** HTTP carries less than the 24 MiB page ceiling:
   `gbrain serve --http` reads at most 4 MiB per request (the MCP SDK
-  default), and the simpler HTTP transport caps a request at
-  `GBRAIN_HTTP_MAX_BODY_BYTES`. A batch goes in smaller `put_pages` calls; a
+  default) and the simpler HTTP transport 1 MiB; `GBRAIN_HTTP_MAX_BODY_BYTES`
+  sets either cap. A batch goes in smaller `put_pages` calls; a
   page over the transport limit goes by file on the brain host (sync,
   `gbrain import` or `gbrain put`), never split by hand. Every limit is in
   [limits per entry point](memory-boundaries.md#large-page-limits).
@@ -515,6 +525,12 @@ dedupe off) in the serve wrapper's environment.
   client on the host when it should stop. Self-service registration stays
   off unless you pass `--enable-dcr`, and even then every new connection waits
   for your approval in the admin dashboard.
+- **Remote `think` runs your think model.** Every `think` answer is a paid
+  call on the host's key, so a connected client's `model` is used only when it
+  is your think model (`models.think`) or you allow it with
+  `gbrain config set think.remote_models <model>,<model>`. Any other model
+  answers on your think model, with a `model_override_ignored` notice instead
+  of an error.
 - **Loopback bind.** The server keeps `127.0.0.1`; never pass
   `--bind 0.0.0.0` for this shape. Tailscale is the only way in.
 - **No secrets in chat or config.** The admin token lives in a 0600 file the

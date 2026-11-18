@@ -6,13 +6,14 @@ import { slugUnderBoundPrefixes, matchesSlugAllowList, noSourceGrantError } from
 import { NO_SOURCES } from '../source-id.ts';
 import { hasScope } from '../scope.ts';
 import { normalizeTokenScopes } from '../legacy-token-scope.ts';
-import { authSourcesFromGrant, grantFromTokenRow } from '../grants/model.ts';
+import { authSourcesFromGrant, grantFromTokenRow, tokenGrantRowSelect, type TokenGrantRow } from '../grants/model.ts';
 import { readLocalWriter, currentVerifiedLocalWriter, takeRegisteredWriterRow, verifyLocalWriter, type LocalGrant } from './identity.ts';
-import type { Principal, SqlEngine, WriteAuthority, WriteRequest } from './model.ts';
+import { authorizedSlug, type Principal, type SqlEngine, type WriteAuthority, type WriteRequest } from './model.ts';
 import { authorizePageVisibility, excludesPrivateWritesAtAdmission } from './page-visibility.ts';
 import { currentCallerAccess } from '../search/private-visibility.ts';
 import { parseStoredActor, storedActorIdentity } from '../access/actor.ts';
-import { sameAttestedActor } from '../access/member-facts.ts';
+import { ownerSpeaksForItself, sameAttestedActor } from '../access/member-facts.ts';
+import { perCallWriteSource, storedPerCallWriteSource } from '../access/attest-sources.ts';
 import { pipelined, transactionMemo } from '../page-state/transactions.ts';
 
 function deny(message: string): never { throw new OperationError('permission_denied', message, 'Inspect the current writer registration and source/operation grants.'); }
@@ -36,6 +37,8 @@ function liveDelegation(row: Record<string, unknown>, jobId: unknown): readonly 
   const key = jobNamespaceKey(jobId);
   return mode === 'job' && listed === null && key !== undefined ? [`wiki/agents/${key}/*`] : [];
 }
+/** GST-2091: the page writes the brain owner's own credential may make to a private page it reads. */
+const OWNER_PRIVATE_WRITES = new Set(['put_page', 'edit_page', 'append_page']);
 function skillWrite(operation: string): boolean {
   return ['put_skill', 'delete_skill', 'adopt_skillpack'].includes(operation);
 }
@@ -69,7 +72,11 @@ export async function submissionAuthority(ctx: OperationContext, operation: stri
     // GBRA-231: a channel audience (anything but one member) never relaxes privacy, so its ceiling hides private pages.
     excludePrivate: (actingFor !== undefined && currentCallerAccess().hidePrivate) || await excludesPrivateWritesAtAdmission(ctx.engine, ctx.remote !== false),
     ...(actingFor ? { actingFor } : {}),
+    // GST-363: a stdio server started with --stdio-member stamps that member, so preparation and publication re-resolve
+    // the same member (live) instead of whatever config mcp.stdio_member names then.
+    ...(principal.kind === 'local_stdio' && ctx.stdioMember !== undefined ? { stdioMember: ctx.stdioMember } : {}),
     ...(access?.actor && ctx.attestedOp ? { attestedOp: ctx.attestedOp } : {}),
+    ...(perCallWriteSource(ctx, sourceId, slug) ? { attestedSource: sourceId } : {}),
     autoLinkTrusted: ctx.remote === false || ctx.viaSubagent === true && !ctx.auth && !!ctx.allowedSlugPrefixes?.length,
     takesHolders: ctx.remote === false ? null : [...(ctx.takesHoldersAllowList ?? ['world'])],
     scopes: [...(ctx.auth?.scopes ?? localGrant?.scopes ?? [])],
@@ -80,7 +87,9 @@ export async function submissionAuthority(ctx: OperationContext, operation: stri
       delegatedPrefixes: ctx.allowedSlugPrefixes?.length ? [...ctx.allowedSlugPrefixes]
         : typeof ctx.subagentId === 'number' ? [`wiki/agents/${ctx.subagentId}/*`] : [] } : {}),
   };
-  if (ctx.auth?.sourceId != null && ctx.auth.sourceId !== sourceId) deny('The source is outside this writer grant.');
+  const owner = access?.remotePolicy?.ownerMember;
+  if (owner && OWNER_PRIVATE_WRITES.has(operation) && hasScope(a.scopes, 'write') && ownerSpeaksForItself(ctx)) a.ownerWrite = `member:${owner}`;
+  if (ctx.auth?.sourceId != null && ctx.auth.sourceId !== sourceId && !a.attestedSource) deny('The source is outside this writer grant.');
   if (!prefixAllowed(a.slugPrefixes, slug)) deny('The target is outside this writer grant.');
   await authorizeWrite(ctx.engine, a, operation, slug);
   if (!skillWrite(operation)) await authorizePageVisibility(ctx.engine, a, slug);
@@ -143,7 +152,8 @@ export async function slugDisclosable(engine: SqlEngine, a: WriteAuthority, slug
   return authorizePageVisibility(engine, a, slug).then(() => true, () => false);
 }
 /** Caller holds source guards first. FOR SHARE serializes publication against revocation. */
-export async function authorizeWrite(engine: SqlEngine, a: WriteAuthority, operation: string, slug: string, lock = false): Promise<void> {
+export async function authorizeWrite(engine: SqlEngine, a: WriteAuthority, operation: string, page: string, lock = false): Promise<void> {
+  const slug = authorizedSlug(a, page);
   if (a.version !== 1 || !a.principal || !a.sourceId || !a.sourceIncarnation) deny('Missing durable write authority.');
   assertSkillWriteScopes(a.scopes, operation, a.remote);
   // GST-359: an attested write is granted by the public operation the person's system called (memory_write runs remember).
@@ -153,13 +163,19 @@ export async function authorizeWrite(engine: SqlEngine, a: WriteAuthority, opera
   if (a.actingFor && !Array.isArray(a.actingFor)) {
     const actor = parseStoredActor(a.actingFor);
     if (!actor) deny('The accepted attested actor is malformed.');
-    await storedActorIdentity(engine, a.principal, actor, a.attestedOp ?? operation);
+    // GST-1113: lock the credential row before reading its attest right, so a concurrent removal commits before or after this publication.
+    if (lock && a.principal.kind === 'oauth_client') await engine.executeRaw('SELECT 1 FROM oauth_clients WHERE client_id=$1 FOR SHARE', [a.principal.id]);
+    if (lock && a.principal.kind === 'legacy_token') await engine.executeRaw('SELECT 1 FROM access_tokens WHERE id=$1 FOR SHARE', [a.principal.id]);
+    await storedActorIdentity(engine, a.principal, actor, a.attestedOp ?? operation, storedPerCallWriteSource(a, slug) ?? undefined);
   }
+  // GST-1113: the one exception to the owner's single write source (the scope page), re-checked against the live attest_sources above.
+  // A live grant of no sources writes nothing, so it refuses before that exception.
+  const ownSource = (source: unknown, sourcesNone: boolean) => !sourcesNone && (source === a.sourceId || storedPerCallWriteSource(a, slug) !== null);
   const suffix = lock ? ' FOR SHARE' : '';
   if (a.principal.kind === 'oauth_client') {
-    const [row] = await engine.executeRaw<Record<string, unknown>>(`SELECT deleted_at,scope,source_id,allowed_operations,
+    const [row] = await engine.executeRaw<Record<string, unknown>>(`SELECT deleted_at,scope,source_id,source_grant,allowed_operations,
       bound_slug_prefixes,bound_tools,delegated_namespace,delegated_slug_prefixes FROM oauth_clients WHERE client_id=$1${suffix}`, [a.principal.id]);
-    if (!row || row.deleted_at != null || row.source_id !== a.sourceId) deny('The owning OAuth client is revoked or its source changed.');
+    if (!row || row.deleted_at != null || !ownSource(row.source_id, row.source_grant === 'none')) deny('The owning OAuth client is revoked or its source changed.');
     const scopes = typeof row.scope === 'string' ? row.scope.split(/\s+/) : [];
     assertSkillWriteScopes(scopes, operation, a.remote);
     if (skillWrite(operation) && (!strings(row.allowed_operations) || !row.allowed_operations.includes(operation))) deny('The current skill operation grant was removed.');
@@ -172,14 +188,15 @@ export async function authorizeWrite(engine: SqlEngine, a: WriteAuthority, opera
     return;
   }
   if (a.principal.kind === 'legacy_token') {
-    const [row] = await engine.executeRaw<Record<string, unknown>>(`SELECT * FROM access_tokens WHERE id=$1${suffix}`, [a.principal.id]);
+    // GST-2314: named columns, not SELECT *: inside this transaction a plan cached before a migration added a column fails 0A000.
+    const [row] = await engine.executeRaw<TokenGrantRow & { revoked_at: unknown }>(`SELECT ${await tokenGrantRowSelect(engine)},revoked_at FROM access_tokens WHERE id=$1${suffix}`, [a.principal.id]);
     if (!row || row.revoked_at != null) deny('The owning token is revoked.');
     const grant = grantFromTokenRow(row);
     if (grant.permissionsMalformed) deny('The current legacy grant is malformed.');
     assertSkillWriteScopes(normalizeTokenScopes(row.scopes) ?? [], operation, a.remote);
     const liveOperations = grant.allowedOperations;
     if (!operationAllowed(liveOperations, granted) || skillWrite(operation) && !liveOperations?.includes(operation)) deny('The current legacy operation grant excludes this write.');
-    if (!hasScope(grant.scopes, 'write') || authSourcesFromGrant(grant).sourceId !== a.sourceId) deny('The current token no longer permits this source write.');
+    if (!hasScope(grant.scopes, 'write') || !ownSource(authSourcesFromGrant(grant).sourceId, grant.sources.kind === 'none')) deny('The current token no longer permits this source write.');
     return;
   }
   if (a.principal.kind === 'local_cli' || a.principal.kind === 'local_stdio') {
@@ -255,18 +272,24 @@ async function authorizeStoredTakeHolders(engine: SqlEngine, row: WriteRequest):
 /**
  * #6007: one access check answers identical read-only statements once (the
  * current and the stored authority read the same writer row and visibility).
- * The memo lives for that single check and holds no locking reads.
+ * The memo lives for that single check and holds no locking reads. The typed
+ * brain-identity and unlocked writer-row reads are memoized the same way.
  */
 function onceReads(engine: BrainEngine): BrainEngine {
-  const reads = new Map<string, Promise<unknown[]>>();
+  const reads = new Map<string, Promise<unknown>>();
+  const memo = <T>(id: string, run: () => Promise<T>): Promise<T> => {
+    let read = reads.get(id) as Promise<T> | undefined;
+    if (!read) { read = run(); reads.set(id, read); read.catch(() => reads.delete(id)); }
+    return read;
+  };
   return new Proxy(engine, { get(target, key) {
     if (key === 'executeRaw') return (sql: string, params?: unknown[], opts?: { signal?: AbortSignal }) => {
       if (/\bFOR (?:SHARE|UPDATE)\b/i.test(sql)) return target.executeRaw(sql, params, opts);
-      const id = JSON.stringify([sql, params ?? null]);
-      let read = reads.get(id);
-      if (!read) { read = target.executeRaw(sql, params, opts); reads.set(id, read); read.catch(() => reads.delete(id)); }
-      return read;
+      return memo(JSON.stringify([sql, params ?? null]), () => target.executeRaw(sql, params, opts));
     };
+    if (key === 'readPersistenceBrainId') return () => memo('typed:brain', () => target.readPersistenceBrainId());
+    if (key === 'readLocalWriterRow') return (id: string, opts?: { lock?: boolean }) => opts?.lock ? target.readLocalWriterRow(id, opts)
+      : memo(JSON.stringify(['typed:writer', id]), () => target.readLocalWriterRow(id));
     const value = Reflect.get(target, key, target);
     return typeof value === 'function' ? value.bind(target) : value;
   } });
@@ -274,9 +297,9 @@ function onceReads(engine: BrainEngine): BrainEngine {
 export async function ownRequestAccessible(ctx: OperationContext, row: WriteRequest): Promise<boolean> {
   try {
     const engine = onceReads(ctx.engine);
-    const auth = await submissionAuthority({ ...ctx, engine, attestedOp: row.authority?.attestedOp }, row.operation, row.source_id, row.source_incarnation, row.slug);
+    const auth = await submissionAuthority({ ...ctx, engine, attestedOp: row.authority?.attestedOp, attestedSource: row.authority?.attestedSource }, row.operation, row.source_id, row.source_incarnation, row.slug);
     if (auth.principal.kind !== row.principal_kind || auth.principal.id !== row.principal_id) return false;
-    // GST-359 C2: under one attest credential, a receipt belongs to the person it was written for.
+    // GST-359 C2: under one credential, a receipt belongs to the person or audience it was written for.
     if (!sameAttestedActor(row.authority?.actingFor)) return false;
     await authorizeStoredRequest(engine, row);
     return true;

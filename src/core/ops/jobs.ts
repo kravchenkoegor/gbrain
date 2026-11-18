@@ -1,6 +1,6 @@
 import { prepareRemoteJob, prepareRemoteAgent, assertRemoteJobControl } from '../minions/submission-authority.ts';
 import type { MinionJob } from '../minions/types.ts';
-import { jobActorSql, NO_JOB_ACTOR, type JobActor } from '../minions/types.ts';
+import { jobActorSql, jobAudienceKey, type JobActor } from '../minions/types.ts';
 import { currentCallerAccess } from '../search/private-visibility.ts';
 
 function publicJob(job: MinionJob) {
@@ -54,6 +54,7 @@ import { opError, type OperationError } from './contract.ts';
 import type { Action } from '../agent-output.ts';
 import { hostFix, invalidParam, readFix, scopeDeniedError } from './op-fix.ts';
 import { hasScope } from '../scope.ts';
+import { emitReportBackNotice } from '../report-back-notice.ts';
 import { LIST_JOBS_DEFAULT_LIMIT, LIST_JOBS_REMOTE_MAX_LIMIT, pagingLimit, reportJobPage } from './read-paging.ts';
 import { SOURCE_ID_RE } from '../source-id.ts';
 import {
@@ -82,7 +83,7 @@ import {
  *     `data->>'__owner_client_id'`. Missing identity → permission_denied
  *     (fail closed, mirroring get_agent_job).
  */
-function agentOwnerFence(ctx: OperationContext, opName: string): string | null {
+export function agentOwnerFence(ctx: OperationContext, opName: string): string | null {
   if (ctx.remote === false) return null;
   const scopes = ctx.auth?.scopes;
   if (scopes && hasScope(scopes, 'admin')) return null;
@@ -108,7 +109,7 @@ function getJobFix(id: unknown, why: string): Action {
 }
 
 /** A1 frozen pair: a missing job keeps `error: invalid_params` and reports `code: not_found`. */
-function jobNotFound(message: string): OperationError {
+export function jobNotFound(message: string): OperationError {
   return opError('not_found', message,
     'No job with that id is visible to this caller (jobs owned by another client read as missing). List jobs to find the right id.',
     { legacy_error: 'invalid_params', fix: listJobsFix('Lists the jobs this caller can see, with their ids and status.') });
@@ -126,7 +127,7 @@ function jobStateError(id: unknown, message: string, need: string): OperationErr
  * design (anti-enumeration): both throw the SAME error the unfenced path
  * throws for a missing id.
  */
-async function assertJobOwned(ctx: OperationContext, id: number, owner: string): Promise<void> {
+export async function assertJobOwned(ctx: OperationContext, id: number, owner: string): Promise<void> {
   const rows = await ctx.engine.executeRaw<{ id: number }>(
     `SELECT id FROM minion_jobs WHERE id = $1 AND data->>'__owner_client_id' = $2 AND ${jobActorSql(3)}`,
     [id, owner, ...callerJobActor()],
@@ -270,6 +271,7 @@ const submit_job: Operation = {
     // fail-open). The job is already persisted; a probe failure degrades to
     // {probe_failed: true}, never an error on a successful submission.
     await emitNoWorkerNotice(ctx, job.queue);
+    emitReportBackNotice(ctx, job.id);
     return { ...publicJob(job), queue_state: await probeQueueStateSafe(ctx, job.queue, [name]) };
   },
 };
@@ -349,13 +351,17 @@ function delegationDenied(ctx: OperationContext, error: Error & { reasons: strin
 //   3. The dispatcher is the subagent handler with the gateway-native loop
 //      (agent.use_gateway_loop is auto-on for submit_agent jobs).
 /**
- * GST-359 C2: the caller's attested actor, matched against a job's accepted grant (jobActorSql in minions/types.ts). A remote
- * agent job never coalesces (queue.add coalesces application jobs only), so two people's submissions stay two jobs.
+ * GST-359 C2: the caller's attested actor, else its audience, matched against a job's accepted grant (jobActorSql in
+ * minions/types.ts) the way prepareRemoteAgent stores them. A remote agent job never coalesces (queue.add coalesces
+ * application jobs only), so two people's submissions stay two jobs.
  */
 function callerJobActor(): JobActor {
-  const actor = currentCallerAccess().actor;
-  return actor ? [actor.system, actor.external_id, actor.member] : NO_JOB_ACTOR;
+  const { actor, audience } = currentCallerAccess();
+  return actor ? [actor.system, actor.external_id, actor.member, ''] : ['', '', '', jobAudienceKey(audience)];
 }
+
+/** What a submit_agent call that sends no max_turns gets; a starter caller may only lower it (STARTER_PARAM_CEILINGS). */
+export const SUBMIT_AGENT_DEFAULT_MAX_TURNS = 20;
 
 const submit_agent: Operation = {
   name: 'submit_agent',
@@ -403,9 +409,9 @@ const submit_agent: Operation = {
     const bad = (param: string, message: string, example: unknown) =>
       invalidParam(ctx, 'submit_agent', param, message, { def: submit_agent.params[param], example });
     if (typeof p.prompt !== 'string' || p.prompt.trim() === '') throw bad('prompt', 'prompt must be nonempty', "Summarize this week's new pages.");
-    const maxTurns = p.max_turns ?? 20;
+    const maxTurns = p.max_turns ?? SUBMIT_AGENT_DEFAULT_MAX_TURNS;
     if (!Number.isSafeInteger(maxTurns) || Number(maxTurns) < 1 || Number(maxTurns) > 100) {
-      throw bad('max_turns', 'max_turns must be an integer from 1 to 100', 20);
+      throw bad('max_turns', 'max_turns must be an integer from 1 to 100', SUBMIT_AGENT_DEFAULT_MAX_TURNS);
     }
     if (p.model !== undefined && (typeof p.model !== 'string' || p.model.trim() === '')) {
       throw bad('model', 'model must name a supported agent tool-loop model', TIER_DEFAULTS.subagent);
@@ -493,6 +499,7 @@ const submit_agent: Operation = {
       });
     } catch { /* never block submission */ }
 
+    emitReportBackNotice(ctx, job.id);
     // Amendments 24/25: the returned job id means nothing if the lane is
     // dead — attach a time-bounded, fail-open queue-state probe.
     return {

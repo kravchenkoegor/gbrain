@@ -45,7 +45,7 @@ const step = (job: Job, name: string) => job.steps!.find(s => s.name === name)!;
 const bash = (script: string, env: Record<string, string>, cwd = root) =>
   spawnSync('bash', ['-c', script], { cwd, encoding: 'utf8', env: { PATH: process.env.PATH, ...env } });
 
-const CHEAP = ['changes', 'cheap-tier', 'dependency-audit', 'executed-receipts', 'gitleaks', 'security-regressions', 'stress-changed-tests', 'typecheck', 'verify'];
+const CHEAP = ['changes', 'cheap-tier', 'dependency-audit', 'enumeration-census-tests', 'executed-receipts', 'gitleaks', 'security-regressions', 'stress-changed-tests', 'typecheck', 'verify'];
 const FULL_ONLY = ['serial-tests', 'slow-brainbench-e2e', 'brainbench', 'slow-entity-resolve-perf', 'test', 'admin-browser',
   'shared-skills-compatibility', 'coverage-report', 'test-status', 'full-suite'];
 
@@ -59,7 +59,19 @@ describe('full CI on pull requests', () => {
       for (const job of [...FULL_ONLY, 'native-locks', 'persistence-validation']) expect(full, `${event}: ${job}`).toContain(job);
       expect(full).not.toContain('cheap-tier');
       expect(full).not.toContain('dynamic-ci');
+      expect(full).not.toContain('enumeration-census-tests');
     }
+  });
+
+  // docs/ci-event-parity.md#enumeration-and-census-tests: a doc-only pull request skips the job, a failed
+  // classifier runs it, and no aggregate, merge check or reuse rule waits for it.
+  test('the enumeration and census tests run on every pull request that is not doc-only and nothing needs them', () => {
+    const smoke = { 'native-scope': 'smoke', convergence: 'skip' };
+    expect(runs(unit, { event: 'pull_request', outputs: { ...smoke, census: 'skip' } })).not.toContain('enumeration-census-tests');
+    expect(runs(unit, { event: 'pull_request', outputs: { ...smoke, census: 'run' } })).toContain('enumeration-census-tests');
+    expect(runs(unit, { event: 'pull_request', outputs: smoke, changes: 'failure' })).not.toContain('enumeration-census-tests');
+    for (const [name, job] of Object.entries(unit.jobs)) expect(job.needs ?? [], name).not.toContain('enumeration-census-tests');
+    expect(step(unit.jobs['enumeration-census-tests']!, 'Run shard ${{ matrix.shard }} of 2').run).toBe('bash scripts/ci-census-tests.sh --run ${{ matrix.shard }} 2');
   });
 
   // Trunk Dynamic CI (docs/ci-event-parity.md#trunk-dynamic-ci): the filter runs only on pull requests, so every other event
@@ -67,7 +79,7 @@ describe('full CI on pull requests', () => {
   // waits for its other needs to succeed.
   test('Dynamic CI skips a gated pull-request lane only on an exact false verdict and never filters another event', () => {
     const gated = Object.keys(unit.jobs['dynamic-ci']!.outputs!).sort();
-    expect(gated).toEqual(['native-locks', 'persistence-validation', 'security-regressions', 'stress-changed-tests']);
+    expect(gated).toEqual(['enumeration-census-tests', 'native-locks', 'persistence-validation', 'security-regressions', 'stress-changed-tests']);
     const selected = { 'native-scope': 'primary', convergence: 'run' };
     const all = runs(unit, { event: 'pull_request', outputs: selected });
     for (const verdict of ['', 'true']) {
@@ -78,7 +90,7 @@ describe('full CI on pull requests', () => {
     }
     for (const event of ['push', 'merge_group', 'schedule', 'workflow_dispatch']) {
       expect(Boolean(evaluate(unit.jobs['dynamic-ci']!.if!, { event })), event).toBe(false);
-      for (const job of gated) expect(runs(unit, { event }), `${event}: ${job}`).toContain(job);
+      for (const job of gated.filter(name => name !== 'enumeration-census-tests')) expect(runs(unit, { event }), `${event}: ${job}`).toContain(job);
     }
     for (const job of ['native-locks', 'persistence-validation']) {
       expect(runs(unit, { event: 'push', changes: 'failure' }), job).not.toContain(job);
@@ -199,7 +211,7 @@ describe('full CI on pull requests', () => {
     expect(dispatcher.on.pull_request).toEqual({ branches: ['master'], types: ['labeled', 'synchronize', 'reopened'] });
     expect(dispatcher.permissions).toEqual({});
     const job = dispatcher.jobs.dispatch!;
-    expect(job.permissions).toEqual({ actions: 'write', contents: 'read' });
+    expect(job.permissions).toEqual({ actions: 'write', contents: 'read', 'pull-requests': 'write' });
     const own = { head: { repo: { full_name: 'acme-example/gbrain' } } };
     const fork = { head: { repo: { full_name: 'fork-a/gbrain' } } };
     const labels = (...names: string[]) => names.map(name => ({ name }));
@@ -217,6 +229,66 @@ describe('full CI on pull requests', () => {
     expect(run).toContain('gh workflow run test.yml -R "$REPO" --ref "$BRANCH"');
     expect(run).toContain('gh workflow run e2e.yml -R "$REPO" --ref "$BRANCH"');
     expect(run.indexOf('"$current" != "$HEAD_SHA"')).toBeLessThan(run.indexOf('gh workflow run'));
+  });
+
+  // The label is a per-head request: it comes off once both dispatches were accepted, stays on (visibly) when either was
+  // refused, and a maintainer adding it again at a later head fires again.
+  describe('full-ci label lifetime', () => {
+    const job = dispatcher.jobs.dispatch!;
+    const own = { head: { repo: { full_name: 'acme-example/gbrain' } } };
+    const dispatch = (opts: { refuse?: string; moved?: boolean; removal?: number } = {}) => {
+      const dir = mkdtempSync(join(tmpdir(), 'gbrain-full-ci-'));
+      try {
+        const log = join(dir, 'gh.log');
+        writeFileSync(join(dir, 'gh'), [
+          '#!/usr/bin/env bash',
+          `echo "$*" >> ${log}`,
+          `if [ "$1 $2" = "api repos/acme-example/gbrain/commits/heads/feature" ]; then echo ${opts.moved ? 'b'.repeat(40) : 'a'.repeat(40)}; exit 0; fi`,
+          `if [ "$1 $2 $3" = "workflow run ${opts.refuse ?? 'none'}" ]; then echo "HTTP 422: refused" >&2; exit 1; fi`,
+          ...(opts.removal ? [`if [ "$1 $2 $3" = "api -X DELETE" ]; then echo "gh: refused (HTTP ${opts.removal})" >&2; exit 1; fi`] : []),
+          'exit 0',
+        ].join('\n'), { mode: 0o755 });
+        const result = spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', job.steps![0]!.run!], { encoding: 'utf8', env: {
+          PATH: `${dir}:${process.env.PATH}`, GH_TOKEN: 'x', REPO: 'acme-example/gbrain', BRANCH: 'feature', HEAD_SHA: 'a'.repeat(40), PR: '42',
+          GITHUB_STEP_SUMMARY: join(dir, 'summary.md') } });
+        return { status: result.status, calls: readFileSync(log, 'utf8').trim().split('\n') };
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+    const removal = 'api -X DELETE repos/acme-example/gbrain/issues/42/labels/full-ci --silent';
+
+    test('the label comes off only after both Test and E2E dispatches were accepted', () => {
+      const ok = dispatch();
+      expect(ok.status).toBe(0);
+      expect(ok.calls.slice(1)).toEqual(['workflow run test.yml -R acme-example/gbrain --ref feature', 'workflow run e2e.yml -R acme-example/gbrain --ref feature', removal]);
+    });
+
+    test.each(['test.yml', 'e2e.yml'])('a refused %s dispatch fails the job and leaves the label on', workflow => {
+      const refused = dispatch({ refuse: workflow });
+      expect(refused.status).not.toBe(0);
+      expect(refused.calls).not.toContain(removal);
+    });
+
+    test('a label already removed (404) leaves the job green; any other removal error fails it', () => {
+      const gone = dispatch({ removal: 404 });
+      expect(gone.status).toBe(0);
+      expect(gone.calls).toContain(removal);
+      expect(dispatch({ removal: 403 }).status).not.toBe(0);
+    });
+
+    test('a head that moved after the event dispatches nothing and keeps the label for the push that moved it', () => {
+      const moved = dispatch({ moved: true });
+      expect(moved.status).toBe(0);
+      expect(moved.calls).toHaveLength(1);
+    });
+
+    test('once removed, a later push does not fire; the label added again at a later head does', () => {
+      const labels = (...names: string[]) => names.map(name => ({ name }));
+      expect(Boolean(evaluate(job.if!, { event: 'pull_request', action: 'synchronize', pr: { ...own, labels: labels() } }))).toBe(false);
+      expect(Boolean(evaluate(job.if!, { event: 'pull_request', action: 'labeled', label: 'full-ci', pr: { ...own, labels: labels('full-ci') } }))).toBe(true);
+      expect(dispatch().calls).toContain(removal);
+    });
   });
 
   describe('cheap-tier aggregator', () => {

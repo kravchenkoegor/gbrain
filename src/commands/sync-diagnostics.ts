@@ -31,6 +31,7 @@ export function printHoldNotes(result: SyncResult, write: (line: string) => void
   // #7199: the source synced, and files held this run wait on a person; the hold fix's verify step names the source.
   const source = result.holds_fix?.verify?.argv?.[3];
   if (result.reason === 'held_needs_human' && source) write(`Synced; ${result.held_needs_human} file(s) held for a person (gbrain sync status --source ${source}).`);
+  if (result.holds_released) write(`  Released ${result.holds_released} held file(s) that no longer need a decision.`);
   for (const item of (result.held ?? []).slice(0, HOLD_LINES)) write(holdLine(item, 'Held'));
   const shown = Math.min(result.held?.length ?? 0, HOLD_LINES);
   if ((result.held_count ?? 0) > shown) write(`  ... and ${(result.held_count ?? 0) - shown} more held this run (--json lists ${result.holds_truncated ? 'the first ones' : 'them all'}).`);
@@ -75,7 +76,7 @@ export function printManagedSyncNotes(result: SyncResult, write: (line: string) 
     write(`  Refused ${refusal.code}: ${refusal.message} ${refusal.suggestion} (${refusal.docs})`);
   }
   if (result.storage_invalid_kept) write(`  ${result.storage_invalid_kept} page(s) whose file is gone were kept, not deleted: gbrain.yml's storage section is invalid or ambiguous about db_only (it does not load, declares db_only in a form that resolved no directory, or lists a deprecated supabase_only next to canonical keys), so sync cannot tell which are database-only. Run \`gbrain storage status\`, fix gbrain.yml, then sync again.`);
-  if (result.working_tree_kept) write(`  ${result.working_tree_kept} page(s) whose file is in the working tree but not in Git were kept (imported from the working tree, or import provenance unknown); delete the file, or commit it, to change that.`);
+  if (result.working_tree_kept) write(`  ${result.working_tree_kept} page(s) whose file is in the working tree but not in Git were kept. Pages under a storage.db_only folder that gbrain.yml declares are database-only by declaration and need nothing; for any other (imported from the working tree, or import provenance unknown), delete the file, or commit it, to change that.`);
   const skips = result.legacySkips;
   if (skips?.contextualMode) write(`  ${skips.contextualMode} legacy file(s) skipped because they parse to the same page but have no contextual retrieval mode, which a skipped import cannot stamp; to stamp it: gbrain repair contextual-mode`);
   if (skips?.canonicalBytes) write(`  ${skips.canonicalBytes} legacy file(s) skipped because they parse to the same page but their bytes are not what gbrain reads back (for example, not valid UTF-8); re-save them as UTF-8 to publish them exactly.`);

@@ -24,6 +24,7 @@
 import type { BrainEngine } from '../engine.ts';
 import type { WriteRequest } from '../persistence/model.ts';
 import { CONNECTOR_SOURCE_KINDS } from '../persistence/connector-identity.ts';
+import { asciiLower, asciiLowerSql, edgeTrimSql } from '../edge-whitespace.ts';
 import {
   CONTENT_ORIGINS, OWNER_TIER_FLOOR, TRUST_TIER_RANK, compareTrust, contentOriginTier, effectiveWriteTrust, isTrustTier, minTrust, trustRankSql,
   type ContentOrigin, type TrustTier, type WriteTrust,
@@ -42,10 +43,12 @@ export const AGENT_WRITE_OPERATIONS: readonly string[] = [
  */
 const OWNER_SOURCE_KINDS = ['canonical_reconcile', 'managed_file_import', 'managed_file_repair', 'managed_grandfather', 'managed_quarantine_clear'];
 
+/** The `captured_via` stamp of a Life Chronicle event page (chronicle/publish.ts): model-extracted from its depth page. */
+export const CHRONICLE_CAPTURED_VIA = 'life-chronicle:auto';
 /** Page frontmatter `source_kind` / `ingested_via` / `captured_via` values written by an ingestion capture (external). */
 export const EXTERNAL_CAPTURE_KINDS: readonly string[] = ['webhook', 'file-watcher', 'inbox-folder', 'cron-scheduler', 'ingest_capture'];
-/** ...and by an agent through a gbrain verb (agent_written). */
-const AGENT_CAPTURE_KINDS = ['put_page', 'capture-cli', 'capture-mcp', 'capture'];
+/** ...and by an agent through a gbrain verb, or by the Life Chronicle extractor (agent_written). */
+const AGENT_CAPTURE_KINDS = ['put_page', 'capture-cli', 'capture-mcp', 'capture', CHRONICLE_CAPTURED_VIA];
 /**
  * Harnesses whose `transcript_import` pages are the user's own sessions with
  * their agent (or their own chat exports): relayed user turns count as
@@ -136,7 +139,7 @@ export function frontmatterTrustCaps(frontmatter: Record<string, unknown> | null
   }
   const transcript = fm.transcript_import as { harness?: unknown } | undefined;
   if (transcript && typeof transcript === 'object') {
-    caps.push(OWN_SESSION_HARNESSES.includes(str(transcript.harness).toLowerCase()) ? 'agent_written' : 'external_untrusted');
+    caps.push(OWN_SESSION_HARNESSES.includes(asciiLower(str(transcript.harness))) ? 'agent_written' : 'external_untrusted');
   }
   if (str(fm.source_url) && (str(fm.clipped_at) || str(fm.clipper) || str(fm.captured_via) === 'clipper' || str(fm.type) === 'clipping')) {
     caps.push('external_untrusted');
@@ -155,7 +158,7 @@ export function frontmatterTrustCaps(frontmatter: Record<string, unknown> | null
  */
 export function frontmatterTrustCapsSql(fm: string): string[] {
   const list = (values: readonly string[]) => values.map(v => `'${v.replace(/'/g, "''")}'`).join(',');
-  const text = (key: string, base = fm) => `(CASE WHEN jsonb_typeof(${base}->'${key}') = 'string' THEN NULLIF(btrim(${base}->>'${key}', E' \\t\\n\\r'), '') END)`;
+  const text = (key: string, base = fm) => `(CASE WHEN jsonb_typeof(${base}->'${key}') = 'string' THEN NULLIF(${edgeTrimSql(`${base}->>'${key}'`)}, '') END)`;
   const stamp = (key: string) => `CASE WHEN ${text(key)} IN (${list(EXTERNAL_CAPTURE_KINDS)}) THEN ${TRUST_TIER_RANK.external_untrusted}
     WHEN ${text(key)} LIKE 'mcp:%' OR ${text(key)} IN (${list(AGENT_CAPTURE_KINDS)}) THEN ${TRUST_TIER_RANK.agent_written}
     WHEN ${text(key)} LIKE 'connector:%' OR ${text(key)} IN (${list(CONNECTOR_SOURCE_KINDS)}) THEN ${TRUST_TIER_RANK.external_untrusted} END`;
@@ -163,7 +166,7 @@ export function frontmatterTrustCapsSql(fm: string): string[] {
     `CASE WHEN jsonb_typeof(${fm}->'trust_tier') = 'string' THEN NULLIF(${trustRankSql(`(${fm}->>'trust_tier')`)}, 0) END`,
     ...['source_kind', 'ingested_via', 'captured_via'].map(stamp),
     `CASE WHEN jsonb_typeof(${fm}->'transcript_import') IN ('object', 'array') THEN
-      CASE WHEN lower(${text('harness', `(${fm}->'transcript_import')`)}) IN (${list(OWN_SESSION_HARNESSES)}) THEN ${TRUST_TIER_RANK.agent_written} ELSE ${TRUST_TIER_RANK.external_untrusted} END END`,
+      CASE WHEN ${asciiLowerSql(text('harness', `(${fm}->'transcript_import')`))} IN (${list(OWN_SESSION_HARNESSES)}) THEN ${TRUST_TIER_RANK.agent_written} ELSE ${TRUST_TIER_RANK.external_untrusted} END END`,
     `CASE WHEN ${text('source_url')} IS NOT NULL AND (${text('clipped_at')} IS NOT NULL OR ${text('clipper')} IS NOT NULL
       OR ${text('captured_via')} = 'clipper' OR ${text('type')} = 'clipping') THEN ${TRUST_TIER_RANK.external_untrusted} END`,
     `CASE WHEN ${text('provenance')} = 'auto-extracted' OR ${fm}->'dream_generated' = 'true'::jsonb OR ${text('dream_generated')} = 'true'
@@ -240,12 +243,15 @@ export async function ownerGateInput(engine: Pick<BrainEngine, 'executeRaw'>, ro
   return { tier: trust.tier, origin: { channel: trust.origin?.channel ?? null, source_uri: trust.origin?.source_uri ?? null }, requestId: row.id };
 }
 
-/** The write-gate input of an unmanaged owner file import (direct sync / import of a source's files): the source default lowered by markers. */
-export async function ownerSourceGateInput(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, frontmatter: Record<string, unknown> | null | undefined) {
+/**
+ * The write-gate input of an unmanaged owner file import (direct sync / import of a source's files): the source default
+ * lowered by markers. `sourceUri` (the file's source path) lets an owner allow rule scoped by URI prefix apply.
+ */
+export async function ownerSourceGateInput(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, frontmatter: Record<string, unknown> | null | undefined, sourceUri?: string | null) {
   const [source] = await engine.executeRaw<{ config: Record<string, unknown> | string | null }>('SELECT config FROM sources WHERE id = $1', [sourceId]);
   const config = typeof source?.config === 'string' ? JSON.parse(source.config) as Record<string, unknown> : source?.config ?? null;
   const trust = ownerPageTrust({ frontmatter, sourceConfig: config, channel: 'import' });
-  return { tier: trust.tier, origin: { channel: 'import' }, requestId: null };
+  return { tier: trust.tier, origin: { channel: 'import', ...(sourceUri ? { source_uri: sourceUri } : {}) }, requestId: null };
 }
 
 /**

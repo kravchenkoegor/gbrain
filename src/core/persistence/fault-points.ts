@@ -36,6 +36,9 @@ export type FaultPoint = `publication:${PublicationBoundary}` | `effect:${Effect
   // #6712 PR 1 (L2): after the cursor step that holds a failed entry and settles its index commits (`holdUnderGate`), and after
   // the cursor step that defers an entry whose file changed after admission past the manifest end (`deferChangedEntry`).
   | 'sync:held_settled' | 'sync:retry_deferred'
+  // #6712 PR 4b: after the cursor step that passes over a pass's entry whose file changed after admission (the level moved; the
+  // next round classifies the new level) commits.
+  | 'sync:passed_over'
   // #6712 PR 1: after a pass took the source's drain lease (before it reads the cursor); after each cursor the fan-in
   // superseded is retired (before the next one), and after a pass stamped its authority on a cursor another writer started.
   | 'sync:lease_acquired' | 'sync:cursor_adopted'
@@ -45,6 +48,8 @@ export type FaultPoint = `publication:${PublicationBoundary}` | `effect:${Effect
   | 'purge:slug_lookup' | 'purge:tail_recheck' | 'purge:pending_recheck' | 'purge:redaction_read'
   // #6511: before each keyset chunk of the preparation-time journal sweep (a stalling hook models a slow chunk), and the fact purge's planning read.
   | 'purge:sweep_chunk' | 'purge:carrying_lookup'
+  // GST-2689: after a purge labelled the pages derived from its origins (repair/origin-carry.ts) and before it deletes any row.
+  | 'purge:after_carry'
   // W1: before each keyset batch of the belief ledger's purge redaction (belief/purge.ts); a 57014 from the hook models its statement timeout.
   | 'purge:ledger_redaction'
   // Before a fact purge records its derivation sweep in its transaction (segment-derive.ts recordDerivationPurge); a 57014 from the hook models its statement timeout.
@@ -104,8 +109,9 @@ export type FaultPoint = `publication:${PublicationBoundary}` | `effect:${Effect
   | 'generation:published' | 'generation:retired' | 'generation:activated'
   // GBRA-161 PR 1b: as a managed generation member (an overwrite or retirement after its activation committed) is prepared.
   | 'generation:member'
-  // G8a (git-conversion.ts): after a conversion group's door commit, and after the strict-equivalent pass, before the flag is set.
-  | 'conversion:group_committed' | 'conversion:withhold_stamped' | 'conversion:withhold_committed' | 'conversion:before_flip';
+  // G8a (git-conversion.ts): after a conversion group's door commit, after the recheck (before the holds are cleared and the
+  // strict passes run), and after the strict-equivalent pass, before the flag is set.
+  | 'conversion:group_committed' | 'conversion:withhold_stamped' | 'conversion:withhold_committed' | 'conversion:after_recheck' | 'conversion:before_flip';
 /**
  * `signal` (#6278, `consumer:preparing` only): the preparation's abort signal, so
  * a stalling hook can model both the reporter's cases: a preparer that honours

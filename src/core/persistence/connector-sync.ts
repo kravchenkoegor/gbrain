@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { realpathSync, statSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
@@ -28,6 +29,7 @@ import type { PreparedContentImport } from './prepared-import.ts';
 import { persistenceFileHash, type PreparedMutation } from './coordinator.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
 import { databaseOnlyPublication, prepareFileTarget, preparePrivateTransition } from './page-prepare.ts';
+import { materializedSnapshot } from './segmented-apply.ts';
 import { sourceCanonicalGit } from './git-door.ts';
 import { isPrivacyPrivatePage } from '../search/private-visibility.ts';
 import { assertPhysicalRoot } from './physical-root.ts';
@@ -50,7 +52,10 @@ import { readConnectorV2Cutoff } from './connector-checkpoint-migration.ts';
 import { declarePersistenceProtocol } from './protocol.ts';
 import { intentCarriesPurgedContent } from './purged-intent.ts';
 import { PERSISTENCE_IPC_MAX_BYTES } from './ipc.ts';
+import { prepareFactsBackstop, type FactsBackstopStatus } from './effect-facts.ts';
+import { CONNECTOR_FACTS_PAGE_LIMIT } from '../connectors/api-source.ts';
 import type { GoogleSourceConfig } from '../google/types.ts';
+import { isTrustTier, minTrust } from '../trust/tier.ts';
 
 interface ConnectorLease { handle: DbLockHandle; signal: AbortSignal; }
 type ConnectorIntentKind = 'connector_v2_import' | 'connector_v2_delete' | 'connector_v2_checkpoint' | 'connector_v2_google_receipts';
@@ -135,8 +140,12 @@ interface ConnectorIntent extends Record<string, unknown> {
   googlePageId?: number;
   noEmbed: boolean;
   noSchemaPack: boolean;
+  /** #9552: a Slack or meetings import queues no automatic fact extraction (`--no-extract`, or past the run's limit). Not part of the request identity. */
+  noExtract?: true;
   checkpointKey: string;
   checkpointBefore: unknown[];
+  /** #9681: the run that admitted a page write; its own later cursor saves do not conflict with it. Not part of the request identity. */
+  checkpointRun?: string;
   checkpointAfter?: unknown[];
   receipts?: string[];
   fresh?: boolean;
@@ -214,6 +223,11 @@ function connectorBindingRoot(engine: object, sourceId: string, source: Connecto
  * changes their request identity, so an ordinary rerun still replays the same
  * receipt. Checkpoint intents keep the full checkpoint.
  */
+/** #9681: the cursor a checkpoint receipt writes; a replayed save keeps the entry (and run stamp) its first admission stored. */
+function savedCursor(row: WriteRequest, next: unknown[]): unknown[] {
+  return (row.intent as ConnectorIntent | null)?.checkpointAfter ?? next;
+}
+
 function cursorOnly(checkpoint: unknown): unknown[] {
   return (Array.isArray(checkpoint) ? checkpoint : []).map(entry => {
     const state = (entry as { state?: unknown } | null)?.state ?? null;
@@ -266,6 +280,11 @@ async function strictPrivateFile(engine: BrainEngine, row: Pick<WriteRequest, 's
   return { file: turning ? await preparePrivateTransition(engine, row, snapshot) : undefined };
 }
 
+/** #9552: the connectors whose imports queue fact extraction, as an unmanaged sync does; never Google mail or GitHub. */
+function factsConnector(connector: ConnectorKind): boolean {
+  return connector === 'slack' || connector === 'meetings' || connector === 'imessage';
+}
+
 export async function beginConnectorSync(engine: BrainEngine, sourceId: string, connector: ConnectorKind,
   suppliedConfig: unknown, opts: SyncOpts & { resetCheckpoint?: boolean }, lease?: ConnectorLease): Promise<ManagedConnectorSync | null> {
   if (!await readManagedMode(engine)) return null;
@@ -303,6 +322,7 @@ export async function beginConnectorSync(engine: BrainEngine, sourceId: string, 
   const canonicalRoot = connectorBindingRoot(engine, sourceId, source, binding);
   const session = new ManagedConnectorSync(engine, sourceId, identity, source, authority, binding, canonicalRoot, opts.noEmbed === true, opts.noSchemaPack === true,
     opts.retryFailed === true, lease, opts.resetCheckpoint === true, opts.githubItem !== undefined, opts.full === true);
+  session.extractFacts = opts.noExtract !== true;
   await session.load();
   return session;
 }
@@ -384,6 +404,14 @@ export class ManagedConnectorSync {
   private outstandingCap = 90;
   private intentByteCap = 16 * 1024 ** 2;
   private lastSaveCommitted = false;
+  /** #9681: stamped on the cursor entries this run saves and on its page writes. */
+  private readonly runId = randomUUID();
+  /** #9681: cursor saves not yet published, oldest first, each with the page receipts that must commit before it may. */
+  private staged: Array<{ state: unknown; fresh: boolean; newestContentAt?: string; receipts: string[] }> = [];
+  /** #9681: the one staged cursor save admitted and not yet seen to commit. */
+  private inflight: { row: WriteRequest; next: unknown[]; entry: ConnectorPendingEntry } | null = null;
+  /** Page receipts of this run that ended without committing; a staged save that lists one never publishes. */
+  private failedIds = new Set<string>();
   private stopped = false;
   private blockedByCheckpoint = false;
   private pendingCheckpoint: ConnectorPendingEntry | null = null;
@@ -403,6 +431,9 @@ export class ManagedConnectorSync {
   /** The stable key plus its #6561 alias keys: retry approvals recorded under an alias still apply. */
   private readonly checkpointKeys: string[];
   private readonly connector: ConnectorKind;
+  /** #9552: whether this run queues fact extraction for the pages it imports, and how many imports have queued it. */
+  extractFacts = true;
+  private factsOffered = 0;
   constructor(private engine: BrainEngine, readonly sourceId: string, private identity: ConnectorIdentity,
     private source: ConnectorSource, private authority: SyncAuthority, private binding: WorktreeBinding | null,
     private canonicalRoot: string | null, private noEmbed: boolean, private noSchemaPack: boolean, private retryFailed = false,
@@ -556,7 +587,7 @@ export class ManagedConnectorSync {
   }
   private async retryBlocker(engine: BrainEngine): Promise<WriteRequest | undefined> {
     const [row] = await engine.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
-      WHERE ((r.source_id=$1 OR r.worktree_id=$2::uuid) AND (r.state IN ('queued','running','recovering') OR r.recovery IS NOT NULL))
+      WHERE ((r.source_id=$1 OR r.worktree_id=$2::uuid) AND (r.state IN ('queued','deferred','running','recovering') OR r.recovery IS NOT NULL))
         OR EXISTS (SELECT 1 FROM persistence_effects e WHERE e.request_id=r.id AND e.recovery IS NOT NULL
           AND (e.source_id=$1 OR e.worktree_id=$2::uuid)) ORDER BY r.sequence LIMIT 1`, [this.sourceId, this.binding?.worktree_id ?? null]);
     return row;
@@ -586,8 +617,11 @@ export class ManagedConnectorSync {
   private async recover(slug: string): Promise<void> {
     const binding = await this.validate(this.engine, slug);
     if (!binding) return;
+    // #9681: a page write of this run that the owner is still publishing is not retained: the run tracks its receipt,
+    // and the owner publishes nothing else on this worktree until it settles.
     const retained = () => this.engine.executeRaw<WriteRequest>(
-      'SELECT * FROM persistence_requests WHERE worktree_id=$1::uuid AND recovery IS NOT NULL ORDER BY sequence LIMIT 1', [binding.worktree_id]);
+      `SELECT * FROM persistence_requests WHERE worktree_id=$1::uuid AND recovery IS NOT NULL
+        AND NOT (id=ANY($2::uuid[]) AND state='running') ORDER BY sequence LIMIT 1`, [binding.worktree_id, [...this.pendingRows.keys()]]);
     let [row] = await retained();
     if (!row) return;
     startPersistenceConsumer(this.engine, loadConfig() ?? { engine: this.engine.kind });
@@ -628,15 +662,16 @@ export class ManagedConnectorSync {
   async page(slug: string) {
     slug = slugifyPath(`${slug}.md`);
     await this.recover(slug);
-    const snapshot = await this.engine.readPageSnapshot(slug, { sourceId: this.sourceId });
+    const snapshot = await materializedSnapshot(this.engine, await this.engine.readPageSnapshot(slug, { sourceId: this.sourceId }));
     if (snapshot && this.binding) await prepareFileTarget(this.engine,
       { source_id: this.sourceId, worktree_id: this.binding.worktree_id, slug }, snapshot, serializePageToMarkdown(snapshot.page, snapshot.tags));
     return snapshot?.page ?? null;
   }
-  async importMarkdown(sourcePath: string, content: string): Promise<{ slug: string; chunks: number; status: 'imported' | 'skipped'; created: boolean }> {
+  /** `purged` marks a skip because the content matches a page purge tombstone (#8938), so the caller derives nothing from it. */
+  async importMarkdown(sourcePath: string, content: string): Promise<{ slug: string; chunks: number; status: 'imported' | 'skipped'; created: boolean; purged?: true }> {
     const slug = slugifyPath(sourcePath);
     const done = await this.submit('connector_v2_import', slug, sourcePath, { content });
-    if (!done.row) return { slug, chunks: 0, status: 'skipped', created: false };
+    if (!done.row) return { slug, chunks: 0, status: 'skipped', created: false, ...(done.purged ? { purged: true as const } : {}) };
     if (done.pending) return { slug, chunks: 0, status: 'imported', created: done.created };
     return { slug, chunks: Number(done.row.outcome?.chunks ?? 0), status: done.row.outcome?.noop ? 'skipped' : 'imported', created: done.row.outcome?.status === 'created' };
   }
@@ -654,30 +689,64 @@ export class ManagedConnectorSync {
     return (done.row!.intent as ConnectorIntent).googleReceipts!;
   }
   /**
-   * Saves the connector cursor once every page receipt of this run has
-   * committed. With writes still pending the save is deferred: the cursor stays
-   * at the last fully committed position and the pending set is recorded at
-   * the end of the run. An unchanged cursor costs no admission; when that save
-   * would have stamped freshness, the source is stamped directly under the lease.
+   * Saves the connector cursor once every page receipt it covers has
+   * committed. The save is staged with the receipts admitted so far; staged
+   * saves publish newest-ready first, one cursor publication in flight at a
+   * time, so a sweep that outlives its wait budget still banks each position
+   * whose writes are durable (#9681). A save whose receipts are pending or
+   * failed stays unpublished: the cursor never passes an uncommitted page. An
+   * unchanged cursor costs no admission; when that save would have stamped
+   * freshness, the source is stamped directly under the lease.
    */
   async saveState(state: unknown, fresh = false, newestContentAt?: string): Promise<void> {
     await this.drainPending();
     // A targeted refresh must not move the cursor past a carried failure it did not revisit.
     const blocked = this.targeted && this.unreachedCarried().some(entry => entry.itemRef !== CHECKPOINT_SLUG);
-    if (this.pendingRows.size || this.failedPending.length || blocked) { this.deferred = true; this.lastSaveCommitted = false; return; }
+    this.lastSaveCommitted = false;
+    if (this.failedPending.length || blocked) this.deferred = true;
+    else this.staged.push({ state: structuredClone(state), fresh, ...(newestContentAt ? { newestContentAt } : {}), receipts: [...new Set([...this.receipts, ...this.pendingRows.keys()])] });
+    await this.publishStaged();
+  }
+  /** #9681: publishes the newest staged save whose receipts all committed, dropping the older ones it supersedes but keeping their freshness stamp; never waits past the budget. */
+  private async publishStaged(): Promise<void> {
+    if (!await this.settleInflight()) { this.deferred = true; return; }
+    let index = this.staged.length - 1;
+    while (index >= 0 && this.staged[index]!.receipts.some(id => this.pendingRows.has(id) || this.failedIds.has(id))) index--;
+    if (index < this.staged.length - 1) this.deferred = true;
+    if (index < 0) return;
+    const stage = this.staged[index]!;
+    const superseded = this.staged.splice(0, index + 1);
+    const fresh = superseded.some(s => s.fresh);
+    const newestContentAt = superseded.map(s => s.newestContentAt).filter(Boolean).sort().at(-1);
+    const covered = new Set(stage.receipts);
+    this.receipts = this.receipts.filter(id => !covered.has(id));
+    for (const later of this.staged) later.receipts = later.receipts.filter(id => !covered.has(id));
+    const newest = !this.staged.length && !this.failedPending.length;
     // A cursor resumed from an alias key is always saved once, so it moves to the stable key.
-    if (digest(this.checkpoint) === digest(this.checkpointRow) && this.checkpoint.length && digest((this.checkpoint[0] as { state?: unknown }).state ?? null) === digest(state ?? null)) {
+    if (digest(this.checkpoint) === digest(this.checkpointRow) && this.checkpoint.length && digest((this.checkpoint[0] as { state?: unknown }).state ?? null) === digest(stage.state ?? null)) {
       if (fresh) await this.stampFreshness(newestContentAt);
-      this.receipts = [];
-      this.lastSaveCommitted = true;
+      this.lastSaveCommitted = newest;
       return;
     }
-    const next = [{ generation: Number((this.checkpoint[0] as { generation?: number } | undefined)?.generation ?? 0) + 1, state: structuredClone(state) }];
-    await this.submit('connector_v2_checkpoint', CHECKPOINT_SLUG, null,
-      { checkpointAfter: next, receipts: [...this.receipts], fresh, ...(newestContentAt ? { newestContentAt } : {}) });
+    const next = [{ generation: Number((this.checkpoint[0] as { generation?: number } | undefined)?.generation ?? 0) + 1, state: stage.state, run: this.runId }];
+    const done = await this.submit('connector_v2_checkpoint', CHECKPOINT_SLUG, null,
+      { checkpointAfter: next, receipts: stage.receipts, fresh, ...(newestContentAt ? { newestContentAt } : {}) }, true);
+    if (done.pending) { this.deferred = true; return; }
+    this.checkpoint = this.checkpointRow = savedCursor(done.row!, next);
+    this.lastSaveCommitted = newest;
+  }
+  /** #9681: whether no cursor publication of this run is still in flight; a committed one becomes the cursor, a failed one ends the run. */
+  private async settleInflight(): Promise<boolean> {
+    if (!this.inflight) return true;
+    let row = await getWriteRequestById(this.engine, this.inflight.row.id) ?? this.inflight.row;
+    if (!isTerminal(row) && this.remainingWait() > 0) row = await this.budgetedWait(row);
+    if (!isTerminal(row)) { this.inflight.row = row; return false; }
+    const { next } = this.inflight;
+    this.inflight = null;
+    writeResponse(row);
     this.checkpoint = this.checkpointRow = next;
-    this.receipts = [];
-    this.lastSaveCommitted = true;
+    this.lastSaveCommitted = !this.staged.length && !this.failedPending.length;
+    return true;
   }
   /** Carried pending entries this run has not re-submitted, by request identity or by item. */
   private unreachedCarried(): ConnectorPendingEntry[] {
@@ -718,7 +787,7 @@ export class ManagedConnectorSync {
       if (!row || row.state === 'committed') { this.pendingRows.delete(id); continue; }
       if (isTerminal(row)) {
         this.pendingRows.delete(id);
-        if (!purgedRefusal(row)) this.failedPending.push(pending.entry);
+        if (!purgedRefusal(row)) { this.failedPending.push(pending.entry); this.failedIds.add(id); }
         else {
           if (pending.counted) this.counts[pending.counted]--;
           this.skipPurged(pending.entry.itemRef, row);
@@ -729,7 +798,7 @@ export class ManagedConnectorSync {
     }
   }
   /** Waits, within the run's budget, for every outstanding receipt. */
-  private async drainPending(): Promise<void> {
+  async drainPending(): Promise<void> {
     await this.refreshPending();
     while (this.pendingRows.size && this.remainingWait() > 0) {
       const [oldest] = this.pendingRows.values();
@@ -785,9 +854,12 @@ export class ManagedConnectorSync {
    */
   async finish(failure?: unknown): Promise<void> {
     await this.refreshPending().catch(() => {});
+    // #9681: a staged save whose writes committed since is published now; one still in flight is resolved by the next run.
+    await this.publishStaged().catch(() => {});
+    if (this.inflight) this.pendingCheckpoint = this.inflight.entry;
     const now = new Date().toISOString();
     const outstanding = [...this.pendingRows.values()].map(pending => pending.entry);
-    const complete = this.lastSaveCommitted && !outstanding.length && !this.failedPending.length && !this.stopped;
+    const complete = this.lastSaveCommitted && !outstanding.length && !this.failedPending.length && !this.pendingCheckpoint && !this.stopped;
     // Only a complete --full sweep (which also reconciles deletions) proves that a failed item it never reached
     // was deleted upstream. Delta and targeted runs keep every unreached carried entry for its automatic retry.
     const unreached = this.unreachedCarried();
@@ -822,11 +894,22 @@ export class ManagedConnectorSync {
    * same content until the owner clears the tombstone (`gbrain pages unpurge <slug>`).
    */
   private skipPurged(slug: string, row: WriteRequest | null): void {
-    if (row) this.receipts = this.receipts.filter(id => id !== row.id);
+    if (row) {
+      this.receipts = this.receipts.filter(id => id !== row.id);
+      for (const stage of this.staged) stage.receipts = stage.receipts.filter(id => id !== row.id);
+    }
     this.counts.purged_skipped++;
     this.purged.push({ slug, request_id: row?.request_id ?? null, at: new Date().toISOString() });
     process.stderr.write(`[connector] ${this.sourceId}: skipped ${slug}: its content matches a page purge tombstone${row ? ` (request ${row.request_id})` : ''}; `
       + `the rest of the sync continues. To let it back in: gbrain pages unpurge ${slug}\n`);
+  }
+  /**
+   * #9011: slugs this run skipped because the pages guard refused their admitted receipt as purged content; with
+   * `persisted`, also those earlier runs recorded (a refusal can resolve after a run's cleanup).
+   */
+  refusedPurgedSlugs(persisted = false): string[] {
+    const items = persisted ? [...this.purged, ...(this.connectorState.purged_items ?? [])] : this.purged;
+    return [...new Set(items.filter(item => item.request_id !== null).map(item => item.slug))];
   }
   /**
    * #6831: screens a page import against the source's page purge tombstones before admission, with the content hash
@@ -868,6 +951,10 @@ export class ManagedConnectorSync {
    */
   async publishHolds(empty: Record<string, unknown>, holds: unknown, extra: Record<string, unknown> = {}): Promise<boolean> {
     if (this.resetRequested || this.stopped) return false;
+    // #9681: holds build on the committed cursor, so the staged saves publish first; a cursor save in flight holds them for the next run.
+    try { await this.publishStaged(); } catch { return false; }
+    if (this.inflight) return false;
+    this.staged = [];
     const committed = (this.checkpoint[0] as { state?: Record<string, unknown> | null } | undefined)?.state ?? null;
     const state = { ...empty, ...(committed ?? {}), ...extra, item_holds: holds };
     if (digest({ ...(committed ?? {}), item_holds: committed?.item_holds ?? { version: 1, items: {} } }) === digest({ ...(committed ?? {}), ...extra, item_holds: holds })) return true;
@@ -919,8 +1006,9 @@ export class ManagedConnectorSync {
       return false;
     }
   }
-  private async submit(kind: ConnectorIntentKind, slug: string, sourcePath: string | null, extra: Partial<ConnectorIntent>):
-    Promise<{ row: WriteRequest | null; pending: boolean; created: boolean }> {
+  /** `inflight`: a cursor save still pending after its wait is kept as the run's in-flight save instead of stopping the sweep. */
+  private async submit(kind: ConnectorIntentKind, slug: string, sourcePath: string | null, extra: Partial<ConnectorIntent>, inflight = false):
+    Promise<{ row: WriteRequest | null; pending: boolean; created: boolean; purged?: true }> {
     await this.awaitPagePending(slug);
     await this.awaitPageMirror(slug);
     await this.recover(slug);
@@ -946,10 +1034,13 @@ export class ManagedConnectorSync {
       configHash: this.identity.digest, syncAuthority: this.authority, expected_revision: snapshot?.revision ?? null,
       sourcePath, noEmbed: this.noEmbed, noSchemaPack: this.noSchemaPack, checkpointKey: this.checkpointKey,
       checkpointBefore: kind === 'connector_v2_checkpoint' ? this.checkpointRow : cursorOnly(this.checkpointRow),
+      ...(kind === 'connector_v2_checkpoint' ? {} : { checkpointRun: this.runId }),
       ownerEpoch: this.binding ? String(this.binding.owner_epoch) : null, canonicalRoot: this.canonicalRoot,
-      filePath: file?.path ?? null, fileBeforeHash: file?.expectedBeforeHash ?? null, ...extra };
-    const callerIntent = { ...intent, syncAuthority: undefined, newestContentAt: undefined,
-      ...(kind === 'connector_v2_checkpoint' ? { receipts: undefined } : {}) };
+      filePath: file?.path ?? null, fileBeforeHash: file?.expectedBeforeHash ?? null, ...extra,
+      ...(kind === 'connector_v2_import' && factsConnector(this.connector) && (!this.extractFacts || this.factsOffered >= CONNECTOR_FACTS_PAGE_LIMIT) ? { noExtract: true as const } : {}) };
+    // #9681: the run stamp on a saved cursor entry is not part of the request identity, so a cursor save replays across runs.
+    const callerIntent = { ...intent, syncAuthority: undefined, newestContentAt: undefined, noExtract: undefined, checkpointRun: undefined,
+      ...(kind === 'connector_v2_checkpoint' ? { receipts: undefined, checkpointAfter: intent.checkpointAfter?.map(entry => ({ ...entry as object, run: undefined })) } : {}) };
     const principal = this.authority.writer.principal;
     const baseRequestId = stableId({ principal, sourceId: this.sourceId, incarnation: this.source.incarnation, callerIntent });
     const page = kind === 'connector_v2_import' || kind === 'connector_v2_delete';
@@ -980,7 +1071,7 @@ export class ManagedConnectorSync {
     // #6831: a replayed purged refusal stays skipped (even under --retry-failed) while its tombstone stands; once the
     // owner cleared it, the item gets one automatic retry through the guarded retry path below.
     if (kind === 'connector_v2_import' && row && purgedRefusal(row) && row.request_id === (this.retryApprovals.get(baseRequestId) ?? baseRequestId)) {
-      if (await this.purgedNow(slug, extra.content)) { this.skipPurged(slug, row); return { row: null, pending: false, created: false }; }
+      if (await this.purgedNow(slug, extra.content)) { this.skipPurged(slug, row); return { row: null, pending: false, created: false, purged: true }; }
       this.autoRetry.add(baseRequestId);
     }
     const automatic = this.autoRetry.has(baseRequestId);
@@ -1043,7 +1134,7 @@ export class ManagedConnectorSync {
       }
       if (kind === 'connector_v2_import' && await this.carriesPurgedPage(slug, extra.content)) {
         this.skipPurged(slug, null);
-        return { row: null, pending: false, created: false };
+        return { row: null, pending: false, created: false, purged: true };
       }
       row = await this.engine.transaction(async tx => {
         await this.assertLease(tx);
@@ -1057,6 +1148,7 @@ export class ManagedConnectorSync {
     }
     if (admitted) {
       if (page) this.counts.page_admissions++;
+      if (kind === 'connector_v2_import' && factsConnector(this.connector) && !intent.noExtract) this.factsOffered++;
       if (kind === 'connector_v2_checkpoint') this.counts.checkpoint_admissions++;
     }
     if (kind === 'connector_v2_google_receipts') {
@@ -1068,7 +1160,11 @@ export class ManagedConnectorSync {
     row = await this.budgetedWait(row!);
     if (kind === 'connector_v2_checkpoint') {
       if (!isTerminal(row)) {
-        this.pendingCheckpoint = { itemRef: CHECKPOINT_SLUG, requestId: row.request_id, baseRequestId, admittedAt: new Date(row.created_at).toISOString() };
+        const entry = { itemRef: CHECKPOINT_SLUG, requestId: row.request_id, baseRequestId, admittedAt: new Date(row.created_at).toISOString() };
+        // #9681: only this run's own save stays in flight; a replayed save another run admitted stops the sweep as before.
+        const saved = savedCursor(row, extra.checkpointAfter!);
+        if (inflight && (saved[0] as { run?: unknown } | undefined)?.run === this.runId) { this.inflight = { row, next: saved, entry }; return { row, pending: true, created: false }; }
+        this.pendingCheckpoint = entry;
         this.stopped = true;
         throw new ConnectorWaitBudgetStop(row);
       }
@@ -1076,7 +1172,7 @@ export class ManagedConnectorSync {
       return { row, pending: false, created: false };
     }
     if (isTerminal(row)) {
-      if (page && purgedRefusal(row)) { this.skipPurged(slug, row); return { row: null, pending: false, created: false }; }
+      if (page && purgedRefusal(row)) { this.skipPurged(slug, row); return { row: null, pending: false, created: false, purged: true }; }
       if (row.state !== 'committed') this.lastFailedItem = { slug, requestId: row.request_id };
       writeResponse(row);
       this.receipts.push(row.id);
@@ -1126,7 +1222,9 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
     }
     if (p.kind !== 'connector_v2_checkpoint') {
       const [checkpoint] = await tx.executeRaw<{ completed_keys: unknown[] }>("SELECT completed_keys FROM op_checkpoints WHERE op='managed-connector' AND fingerprint=$1", [p.checkpointKey]);
-      if (digest(cursorOnly(checkpoint?.completed_keys)) !== digest(cursorOnly(p.checkpointBefore))) throw connectorPublicationRefusal('revision_conflict', 'The connector checkpoint changed before publication.', row,
+      // #9681: the run that admitted this write may have saved its own cursor since; only another run's save conflicts.
+      const ownRun = p.checkpointRun !== undefined && (checkpoint?.completed_keys?.[0] as { run?: unknown } | undefined)?.run === p.checkpointRun;
+      if (!ownRun && digest(cursorOnly(checkpoint?.completed_keys)) !== digest(cursorOnly(p.checkpointBefore))) throw connectorPublicationRefusal('revision_conflict', 'The connector checkpoint changed before publication.', row,
         `Another run moved the connector cursor of ${row.source_id} before this write published.`);
     }
   };
@@ -1147,7 +1245,8 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
       [row.source_id, row.source_incarnation, p.newestContentAt ?? null]);
     return { status: 'checkpointed', source_id: row.source_id };
   } };
-  const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
+  // #9062: a page stored in segments is read back as strings (up to PAGE_MAX_BYTES), so its re-render carries its timeline and fences like an inline page's.
+  const snapshot = await materializedSnapshot(engine, await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true }));
   if ((snapshot?.revision ?? null) !== p.expected_revision || (snapshot?.page.id ?? null) !== row.page_id ||
       snapshot?.page.source_path != null && snapshot.page.source_path !== p.sourcePath) {
     throw connectorPublicationRefusal('revision_conflict', 'The connector page changed after admission.', row,
@@ -1197,12 +1296,17 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
     ? serializePageToMarkdown({ ...snapshot.page, ...parsed, compiled_truth: fenced, timeline: carried.timeline, type: parsed.typeExplicit ? parsed.type : snapshot.page.type }, parsed.tags)
     : p.content;
   let prepared: PreparedContentImport | undefined;
+  const tier = 'external_untrusted';
   const result = await importFromContent(engine, row.slug, content, { sourceId: row.source_id, sourcePath: p.sourcePath,
     filename: basename(p.sourcePath).replace(/\.mdx?$/i, ''), noEmbed: true, allowEmptyOverwrite: true, activePack,
     // #5575 A3: connector free text (mail bodies, invite descriptions, issue text) is external and gated.
-    writeGate: { tier: 'external_untrusted', origin: { channel: `connector:${p.connector}`, connector: String(p.connector), source_uri: p.sourcePath }, requestId: row.id },
+    writeGate: { tier, origin: { channel: `connector:${p.connector}`, connector: String(p.connector), source_uri: p.sourcePath }, requestId: row.id },
     prepareFrontmatter: page => {
       if (snapshot?.page.frontmatter.visibility === 'private') page.frontmatter.visibility = 'private';
+      // #9676: every import renders the marker (#8052 carried an existing one only), as the least trusted of the stored marker
+      // and this import's tier, so the file and the stored tier agree from the first write and a marker never raises the page.
+      const stored = snapshot?.page.frontmatter.trust_tier;
+      page.frontmatter.trust_tier = isTrustTier(stored) ? minTrust(tier, stored) : tier;
     },
     prepare: async value => { prepared = value; return value.result; } });
   if (!prepared || prepared.slug !== row.slug) throw connectorPublicationRefusal('revision_conflict', result.error ?? 'A different page owns this connector content.', row,
@@ -1211,6 +1315,9 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
   if (ready.observedRevision !== (snapshot?.revision ?? null)) throw connectorPublicationRefusal('revision_conflict', 'The connector page changed during preparation.', row,
     `Page ${row.slug} in ${row.source_id} changed while this connector write was being prepared.`);
   const project = await prepareCanonicalProjections(engine, ready.parsedPage, row.slug, row.source_id, snapshot, 'preserving');
+  // #9552: the publication outbox queues the page's fact extraction, as it does for a page write.
+  const facts = ready.noop || p.noExtract || !factsConnector(p.connector) ? undefined
+    : await prepareFactsBackstop(engine, row, ready.parsedPage, snapshot).catch((): FactsBackstopStatus => ({ skipped: 'backstop_error' }));
   const tags = [...new Set([...(snapshot?.tags ?? []), ...ready.parsedPage.tags])].sort();
   const page: Page = { ...(snapshot?.page ?? { id: 0, slug: row.slug, source_id: row.source_id, created_at: new Date(row.created_at), updated_at: new Date(row.created_at) }), ...ready.parsedPage };
   const strictPrivate = await strictPrivateFile(engine, row, p.content, p.sourcePath, snapshot);
@@ -1222,11 +1329,13 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
     `The canonical file of ${row.slug} in ${row.source_id} changed on disk while this connector write was being prepared.`);
   return { observedRevision: ready.observedRevision, sourceExclusive: true,
     validate: async tx => { await validate(tx); await ready.validate(tx); },
-    file, ...databaseOnlyPublication(row, file), noop: ready.noop, deferEmbedding: p.noEmbed, apply: async tx => {
-    await ready.apply(tx);
-    if (!ready.noop) { await project(tx); await sealPageTextProjection(tx, row.slug, row.source_id); }
+    file, ...databaseOnlyPublication(row, file), noop: ready.noop, deferEmbedding: p.noEmbed,
+    ...(ready.afterCommit ? { afterCommit: (target: BrainEngine) => ready.afterCommit!(target) } : {}), apply: async tx => {
+    const installed = await ready.apply(tx);
+    // A body stored in segments was sealed by its import's apply when complete (sealSegmentedPage); the inline text seal reads the whole timeline.
+    if (!ready.noop) { await project(tx); if (!installed?.segmented) await sealPageTextProjection(tx, row.slug, row.source_id); }
     return { status: ready.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
-      chunks: result.chunks, noop: ready.noop, imported_file: true, connector_database: !row.worktree_id };
+      chunks: result.chunks, noop: ready.noop, imported_file: true, connector_database: !row.worktree_id, ...(facts ? { facts_backstop: facts } : {}) };
   } };
 }
 

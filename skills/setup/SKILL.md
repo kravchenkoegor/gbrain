@@ -39,6 +39,7 @@ Use the user's existing context; do not repeat choices they already made.
 | --- | --- |
 | Add memory inside Grok Bot | First choice: use the brain on your own computer over MCP — [remote-mcp](../remote-mcp/SKILL.md) publishes it (`--funnel`, the Bot runs in the vendor cloud), then [hosted harness access](https://github.com/garrytan/gbrain/blob/master/docs/guides/hosted-harness-access.md) installs the private handoff in the Bot. No always-on machine: follow [Grok Bot](https://github.com/garrytan/gbrain/blob/master/docs/guides/grok-bot.md) and the isolated [setup helper](https://github.com/garrytan/gbrain/blob/master/docs/guides/in-agent-setup.md). Root: `/workspace/gbrain`, with data under `.gbrain`. |
 | Add memory inside Muse | First choice: use the brain on your own computer over MCP — [remote-mcp](../remote-mcp/SKILL.md) publishes it (`--funnel`), then [hosted harness access](https://github.com/garrytan/gbrain/blob/master/docs/guides/hosted-harness-access.md) installs the private handoff in Muse. No always-on machine: follow [Muse](https://github.com/garrytan/gbrain/blob/master/docs/guides/muse.md). Either way, establish its durable user-files location first. Do not invent `MUSE.md`, a persistent path, or a native MCP mechanism. |
+| Memory for a bot that answers several people | `gbrain setup <harness> --serves several --members <id,...>`; ask the user who the people are, never guess. With no owner set it names one (`--owner <id>`, default the login name); relay its `unbound` lines, and rescope a key only on the user's word. Relay key file paths, never keys, and the `open pages` lines: ask who reads each folder (`--labelled-only` only on their word); keep the owner in every `--readers` list, and pass `--allow-without-owner` only on their word. On `setup_history_choice_required`, ask whether the existing pages stay private (`--labelled-only`) or every member reads them (`--open-history`); never choose for the user. When a re-run's `company/` rule readers wait for `gbrain access apply`, relay it and approve only on the user's word. Fix a `setup_serves_several`, `requester_scope_required` or `credential_scope_required` refusal with its `fix`. Pass `--stdio-member <id>` (claude-code, codex) only for a harness one person uses: it binds that harness's entry alone; refused where OpenClaw or Hermes runs. With `--shape company` setup ties its own entry to the owner; relay each call's readers line. [Guide](https://github.com/garrytan/gbrain/blob/master/docs/guides/setup.md#a-brain-that-serves-several-people). |
 | Add memory to another existing agent | Follow [INSTALL_FOR_AGENTS.md](https://github.com/garrytan/gbrain/blob/master/INSTALL_FOR_AGENTS.md); the [coding-agent tutorial](https://github.com/garrytan/gbrain/blob/master/docs/tutorials/connect-coding-agent.md) covers Claude Code and Codex. |
 | Connect an existing hosted brain | Follow [mcp-access](../mcp-access/SKILL.md) and [hosted harness access](https://github.com/garrytan/gbrain/blob/master/docs/guides/hosted-harness-access.md). Select native OAuth/PKCE or a private machine handoff for the intended harness. |
 | Use the brain from other devices, apps or cloud agents over MCP | Follow [remote-mcp](../remote-mcp/SKILL.md): `gbrain mcp expose` publishes the local server on the Tailscale tailnet (Funnel only for cloud agents), then [mcp-access](../mcp-access/SKILL.md) / hosted access selects native OAuth or a private machine handoff for each consumer. |
@@ -73,7 +74,7 @@ For other local installations, resolve conflicting routing before following
 the canonical distribution and keyless initialization:
 
 ```bash
-bun install -g github:garrytan/gbrain#latest-stable
+bun install -g github:garrytan/gbrain#stable
 gbrain init --pglite --no-embedding
 ```
 
@@ -83,9 +84,10 @@ npm package named `gbrain`, or `bun add` in the user's current project.
 Local/thin-client conversion requires explicit intent and preservation of the
 previous configuration.
 
-**Required search-mode choice:** initialization may select a noninteractive
-default and print a nine-cell cost matrix with `[AGENT]` markers. Relay that
-matrix and confirm the operator's choice before continuing. Follow Step 3.5 of
+**Search mode in effect:** initialization selects a noninteractive default and
+prints a nine-cell cost matrix with `[AGENT]` markers. Connect memory first,
+then relay that matrix and the mode in effect in the reply that reports the
+install; apply the operator's choice when they give it. Follow Step 3.5 of
 [INSTALL_FOR_AGENTS.md](https://github.com/garrytan/gbrain/blob/master/INSTALL_FOR_AGENTS.md); use the printed matrix,
 not remembered prices. Illustrative model API costs are separate from a
 harness subscription. This choice does not enable paid APIs or capture.

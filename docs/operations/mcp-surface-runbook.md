@@ -52,6 +52,25 @@ that `starter` lacks, with their CLI equivalents:
 
 A call to either on a starter session gets the hidden-tool hint below.
 
+**Parameters follow the surface.** A narrower surface hides some parameters of the
+tools it lists (to keep the starter list small), and dispatch refuses them too: a
+starter caller that passes one, such as `include_deleted` on `get_page` or
+`list_pages`, gets `param_not_on_surface` and nothing runs. Its fix is the same
+widen as for a hidden tool (`request_tools {"surface":"full"}`) where the
+connection may widen, and otherwise asks the user, because only the operator widens
+a pinned client. `STARTER_CALLABLE_PARAMS` in `src/mcp/surface.ts` lists the few
+hidden parameters a starter caller may still pass, each with its reason (page
+windows, the shared-skill follower, the thin client's source binding, the
+connection check, a delegating client's `submit_agent` `queue`, `model` and
+`allowed_slug_prefixes`, `list_pages` paging with `offset`). An agent job (`submit_agent`)
+records the surface of the connection that submitted it, and its tool calls are refused
+the same way; a job queued before the surface was recorded keeps the full surface until
+it finishes. A queued or running job keeps the surface it was submitted under even if the
+operator later narrows the client; cancelling the job or withdrawing the grant stops it. `request_tools {tools}` describes only the parameters the caller's surface
+may pass. Structured fixes never name a parameter the caller's
+surface refuses (`page_not_found` offers a search instead of `include_deleted`);
+plain-text suggestions may still name one.
+
 **Session widening.** On the owner's stdio pipe, `request_tools {surface}`
 widens this session's tool set (never past `--access read-only` or
 `GBRAIN_MCP_FORCE_SURFACE`), sends `tools/list_changed`, and returns the new
@@ -122,7 +141,9 @@ surface) lists that surface in full.
   lists in a long-lived session go stale until it does.
 - An audit row lands in `mcp_request_log` (`operation='surface_change'`,
   params carrying actor/old/new/via) — every surface mutation writes one
-  (rescope CLI, admin endpoint, request_tools persist):
+  (rescope CLI, admin endpoint, request_tools persist). Request-log retention
+  never prunes these rows; other request rows older than its window are gone
+  ([retention](../mcp/ADMIN.md#request-log-retention)):
 
 ```sql
 SELECT created_at, params FROM mcp_request_log
@@ -147,6 +168,8 @@ Dual-plane read (DB > file), applied on each client's next request,
 ceiling-bounded like everything else; unset means NULL-surface clients
 resolve to the server ceiling. Pre-seed important
 clients with an explicit `rescope-client --surface full` before flipping it.
+The default applies to OAuth clients only; legacy bearer tokens keep the
+server ceiling and stay bounded by their scope, source and operation grants.
 
 ## Move 3 — flip strict params from warn to reject
 
@@ -176,7 +199,7 @@ gbrain config set mcp.strict_params reject
 
 **Expected outcome (schema emission change):** besides rejecting unknown
 args, tools/list schemas change shape — each `inputSchema` closes with
-`additionalProperties: false` and declares the `_meta`/`dry_run`
+`additionalProperties: false` and declares the `_meta`/`dry_run`/`room`
 passthrough keys (D14.1), keeping schema-validating clients aligned with
 the server's reject posture. Read per request; flipping back to `warn`
 reopens the schemas on the next list. A transient config-read failure
@@ -222,6 +245,11 @@ analytics ops `find_orphans` / `get_recent_salience` / `find_anomalies` /
 the database before limits and aggregate calculations. A gated page reads exactly
 like a missing one (no existence oracle), and link/graph output never
 enumerates private slugs.
+
+Facts are separate: a fact stamped `private` (as every fact was before
+`facts.default_visibility` became `world`) stays hidden from remote callers
+that are not the owner until the operator opens it with
+`gbrain repair open-facts` (docs/guides/repair.md); no remote path opens it.
 
 Single-user brains where every connected agent is equally trusted can opt
 out:

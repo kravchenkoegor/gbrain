@@ -34,6 +34,14 @@ each entry by its sha256 fingerprint. Transcript capture (`SessionEnd`, with
 setup reports `native-verified` when it owns the trusted `UserPromptSubmit`
 hook. Details: [setup guide](../guides/setup.md#codex).
 
+Codex starts an MCP server with a short list of environment variables, so a key
+you exported in your shell does not reach gbrain on its own. Setup therefore
+lists the provider key names (`OPENAI_API_KEY`, `VOYAGE_API_KEY`,
+`ANTHROPIC_API_KEY` and the other provider `*_API_KEY` and `*_BASE_URL` names)
+under `env_vars` in `[mcp_servers.gbrain]`. Codex forwards each one that is set
+and skips the rest, so a key you already use gives the session semantic search.
+Only names are written, never values.
+
 ## Install as a Codex plugin (recommended)
 
 gbrain ships as a native Codex plugin — MCP server + a curated brain-first
@@ -59,7 +67,7 @@ branch carries the variant trees already, so enabling is a two-line
 marketplace edit once verified — TODOS.md follow-up).
 
 **Prerequisites.** The plugin cannot ship the gbrain binary; install it once
-(`bun install -g github:garrytan/gbrain#latest-stable` — the npm package
+(`bun install -g github:garrytan/gbrain#stable` — the npm package
 named `gbrain` is unrelated, never `npm install -g gbrain`) and create a
 brain (`gbrain init` — zero-config local PGLite by default). The bundled
 `setup` skill walks both. With no binary, the plugin's MCP server exits with
@@ -118,7 +126,7 @@ signal — if its server isn't working, fix the binary, or remove the plugin.
 
 **Upgrading** has two halves: `codex plugin marketplace upgrade` refreshes
 the plugin snapshot (skills + manifests); the `gbrain-upgrade` skill or a
-`bun install -g github:garrytan/gbrain#latest-stable` re-run refreshes the
+`bun install -g github:garrytan/gbrain#stable` re-run refreshes the
 binary the launcher resolves.
 
 ## Connect without the plugin
@@ -263,8 +271,10 @@ codex mcp remove gbrain
 
 ## Notes
 
-- The token is a long-lived, full-access secret. Keep `GBRAIN_REMOTE_TOKEN` out of
-  version control and prefer a scoped token if your host supports one.
+- The token is a long-lived secret that carries its grant's scopes (a
+  `gbrain auth create` token minted without `--scopes` is full-access). Keep
+  `GBRAIN_REMOTE_TOKEN` out of version control and prefer a scoped token if
+  your host supports one.
 - Local stdio also works if you run the brain on the same machine:
   `gbrain setup codex` registers `serve --surface starter --advertise verbs` behind
   gbrain's launcher, so the session directory's `bunfig.toml` and `.env` never load

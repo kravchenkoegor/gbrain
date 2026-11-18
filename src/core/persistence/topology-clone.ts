@@ -7,7 +7,7 @@ import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
 import { parseRemoteUrl } from '../git-remote.ts';
-import { isOwnedClone } from '../sources-ops.ts';
+import { isOwnedClone, lfsDownloadsOff } from '../sources-ops.ts';
 import { parseSourceConfig } from '../sources-load.ts';
 import type { SourceLifecycleInput } from './source-lifecycle.ts';
 import type { TopologyCloneRecovery } from './topology-clone-model.ts';
@@ -33,7 +33,7 @@ const recoveryCapacityFix=():Action=>readFix('Shows the configured per-worktree 
 
 /** Provider seam only for deterministic storage-boundary tests. */
 export interface CloneLifecycleHooks {
-  clone?:(url:string,stage:string,budget:number)=>Promise<void>;
+  clone?:(url:string,stage:string,budget:number,options:{skipLfs:boolean})=>Promise<void>;
   boundary?:(name:'reserved'|'prepared'|'old_moved'|'new_moved'|'committed')=>Promise<void>;
 }
 export async function runManagedSourceClone(engine:BrainEngine,input:SourceLifecycleInput,principal:string,requestId:string,intent:unknown,
@@ -92,6 +92,7 @@ export async function runManagedSourceClone(engine:BrainEngine,input:SourceLifec
       `Another gbrain process holds the coordination lock for ${target}, so source ${input.sourceId} was not cloned. Run the command again once that process has finished.`,
       {fix:writerStatusFix()});}
     let accepted:TopologyChange|undefined;
+    let lockedConfig:unknown=input.config;
     try{
       const before=existsSync(target)?worktreeManifest(target,{progress:humanManifestProgress()}):null;
       const limits=await readJournalLimits(engine);
@@ -115,6 +116,7 @@ export async function runManagedSourceClone(engine:BrainEngine,input:SourceLifec
         }
         const sources=await lockTopologyRows(tx,input.sourceId,bindings);
         const [current]=await tx.executeRaw<{incarnation:string;last_commit:string|null;config:unknown}>('SELECT incarnation,last_commit,config FROM sources WHERE id=$1',[input.sourceId]);
+        if(current)lockedConfig=current.config;
         const replay=await priorTopologyChange(tx,principal,requestId,intent);if(replay)return replay;
         if((current?.incarnation??null)!==(source?.incarnation??null)||current?.last_commit!==source?.last_commit
           ||current&&parseSourceConfig(current.config).remote_url!==source?.config.remote_url)throw opError('source_changed','The source changed before clone admission.',
@@ -166,7 +168,7 @@ export async function runManagedSourceClone(engine:BrainEngine,input:SourceLifec
           await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
           await tx.executeRaw("UPDATE persistence_topology_changes SET recovery=$2::text::jsonb,updated_at=now() WHERE id=$1::uuid AND state='recovering'",[accepted!.id,JSON.stringify(recovery)]);
         });
-        await (hooks.clone??cloneTopologyCheckout)(url,recovery.stage,recovery.cloneBudget);
+        await (hooks.clone??cloneTopologyCheckout)(url,recovery.stage,recovery.cloneBudget,{skipLfs:lfsDownloadsOff(lockedConfig)});
         const stageBytes=await topologyDirectoryBytes(recovery.stage,recovery.cloneBudget);
         const candidate=worktreeManifest(recovery.stage,{progress:humanManifestProgress(),scope:recovery.hashScope});
         if(recovery.manifest&&candidate.digest!==recovery.manifest.digest)throw opError('writer_manifest_mismatch','The cloned checkout differs from the verified canonical manifest, including deletions.',

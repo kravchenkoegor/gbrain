@@ -66,14 +66,14 @@ export function assertManagedFilesystemWrite(path: string): void {
   const error = new OperationError('writer_coordinator_required',
     `This path belongs to the managed canonical worktree ${managed.root}${managed.sourceId ? ` (source ${managed.sourceId})` : ''}.`,
     staleEnclosingMarker(managed)
-      ? `The evidence is ${managed.evidence}, which an older gbrain wrote in a repository that only encloses a managed root (#7988); gbrain no longer writes it there. `
+      ? `The evidence is ${managed.evidence}, which an older gbrain wrote in a Git directory that only encloses a managed root (#7988, #9430); gbrain no longer writes it there. `
         + 'Deactivation removes it: preview with gbrain sources writer deactivate --dry-run --json, run the printed command after the user agrees, then activate again.'
       : 'Submit the change through the persistence coordinator; check the root with gbrain sources writer status.');
   error.detail = `root=${managed.root} source=${managed.sourceId ?? 'unknown'} evidence=${managed.evidence}`;
   throw error;
 }
 /** #7988: a Git-metadata marker whose checkout encloses registered roots but tracks none of them. */
-function staleEnclosingMarker(managed: ManagedFilesystemRoot): boolean {
+export function staleEnclosingMarker(managed: ManagedFilesystemRoot): boolean {
   if (basename(managed.evidence) !== 'gbrain-managed.json') return false;
   const roots = registeredManagedRootRecords().map(record => record.root).filter(root => root !== managed.root && encloses(managed.root, root));
   return roots.length > 0 && roots.every(root => checkoutGitMetadata(root) !== dirname(managed.evidence));

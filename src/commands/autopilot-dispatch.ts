@@ -9,6 +9,7 @@ import { assertNever, type BrainHealth } from '../core/types.ts';
 import { syncIntervalMinutes } from '../core/meetings/source-config.ts';
 import { MEETINGS_DEFAULT_SYNC_INTERVAL_MIN } from '../core/meetings/types.ts';
 import { SLACK_DEFAULT_SYNC_INTERVAL_MIN } from '../core/slack/types.ts';
+import { IMESSAGE_DEFAULT_SYNC_INTERVAL_MIN } from '../core/imessage/types.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
 import { loadAllSources, parseSourceConfig, sourceConfigHasRemoteUrl, sourceLocalPathSkipWarning, type SourceRow } from '../core/sources-load.ts';
 import { isConnectorSourceKind } from '../core/persistence/connector-identity.ts';
@@ -17,7 +18,7 @@ import { connectorAccountMismatches, connectorAccountMismatchSkipWarning } from 
 import { AUTOPILOT_GIT_PULL_KEY, automaticGitPullDisabled, automaticSyncPull } from '../core/persistence/automatic-sync-policy.ts';
 import { isSyncDisabledConfig } from '../core/sync-policy.ts';
 import { automaticSyncSkip, loadActivationPendingSourceIds, reportAutomaticSyncSkip, skipActivationPendingSync } from '../core/sync-policy.ts';
-import { resolveAutopilotAutoDrainBounds, resolveAutopilotDispatchTimeoutMs } from './autopilot-timeout.ts';
+import { autoDrainWindowClampReason, resolveAutopilotAutoDrainBounds, resolveAutopilotDispatchTimeoutMs } from './autopilot-timeout.ts';
 import {
   autopilotRemediationIdempotencyKey,
   autopilotTargetedSteps,
@@ -157,6 +158,17 @@ export async function dispatchAutopilotTick(
         await maybeDispatchConnectorSyncs(engine, queue, { slot, timeoutMs: fullCycleTimeoutMs, jsonMode });
       } catch (e) {
         if (jsonMode) process.stderr.write(JSON.stringify({ event: 'connector_sync_dispatch_failed', error: e instanceof Error ? e.message : String(e) }) + '\n');
+      }
+      // GST-2768: the conversation archive, beside the connectors. It runs only while it resolves on (personal brains
+      // by default), at most once per transcripts.archive.maintenance_floor_min, and never fails the tick: its
+      // outcome is recorded for doctor's transcript_archive_freshness.
+      try {
+        const { runArchiveMaintenance } = await import('../core/transcripts/archive-maintenance.ts');
+        const archived = await runArchiveMaintenance(engine, { runner: 'autopilot' });
+        if (jsonMode && archived.status === 'ran') process.stderr.write(JSON.stringify({ event: 'transcript_archive', status: archived.record?.status, written: archived.record?.written ?? 0, code: archived.code }) + '\n');
+        else if (!jsonMode && archived.status === 'ran') console.log(`[dispatch] transcript archive: ${archived.message}`);
+      } catch (e) {
+        if (jsonMode) process.stderr.write(JSON.stringify({ event: 'transcript_archive_failed', error: e instanceof Error ? e.message : String(e) }) + '\n');
       }
       // On restart the process-local clock starts overdue. If persisted
       // source timestamps say every source is fresh, advance the local
@@ -573,6 +585,7 @@ export function connectorSyncIntervalMs(config: unknown, baseIntervalMs: number)
     case 'github': return baseIntervalMs;
     case 'meetings': return syncIntervalMinutes(parsed, MEETINGS_DEFAULT_SYNC_INTERVAL_MIN)! * 60_000;
     case 'slack': return syncIntervalMinutes(parsed, SLACK_DEFAULT_SYNC_INTERVAL_MIN)! * 60_000;
+    case 'imessage': return syncIntervalMinutes(parsed, IMESSAGE_DEFAULT_SYNC_INTERVAL_MIN)! * 60_000;
     default: return assertNever(kind);
   }
 }
@@ -704,7 +717,9 @@ export async function submitAutoDrains(
   };
   const threshold = parsePosInt(await engine.getConfig('autopilot.auto_drain.threshold'), 25);
   const { AI_CHAT_TIMEOUT_MS } = await import('../core/ai/gateway.ts');
-  const bounds = resolveAutopilotAutoDrainBounds(timeoutMs, parsePosInt(await engine.getConfig('autopilot.auto_drain.window_seconds'), 120), AI_CHAT_TIMEOUT_MS);
+  const requestedWindowSeconds = parsePosInt(await engine.getConfig('autopilot.auto_drain.window_seconds'), 120);
+  const bounds = resolveAutopilotAutoDrainBounds(timeoutMs, requestedWindowSeconds, AI_CHAT_TIMEOUT_MS);
+  const clampReason = autoDrainWindowClampReason(requestedWindowSeconds, bounds, AI_CHAT_TIMEOUT_MS);
   const maxUsdPerDay = parseNonNegFloat(await engine.getConfig('autopilot.auto_drain.max_usd_per_day'), 2.0);
   // Each drain attempt runs under one BudgetTracker capped at ~$0.30
   // (cycle.extract_atoms.budget_usd); bound the brain-wide daily attempt
@@ -797,6 +812,10 @@ export async function submitAutoDrains(
       );
       submittedToday++;
       next = kind === 'checkout' ? 'connector' : 'checkout';
+      if (clampReason) {
+        process.stderr.write((jsonMode ? JSON.stringify({ event: 'auto_drain_window_clamped', job_id: job.id, source_id: src.id,
+          requested_window_seconds: requestedWindowSeconds, window_seconds: bounds.windowSeconds, timeout_ms: bounds.timeoutMs, reason: clampReason }) : clampReason) + '\n');
+      }
       if (jsonMode) {
         process.stderr.write(JSON.stringify({
           event: 'dispatched', job_id: job.id, mode: 'auto-drain',

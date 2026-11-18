@@ -7,7 +7,8 @@
  * `--resume` path, then refreshes; owner recovery completes an orphaned
  * `syncing` row once its members synced to the target or a descendant of it;
  * writer status and sync status name the recorded holder, whether it is
- * orphaned, and a fix naming `--resume`.
+ * orphaned, and a fix naming `--resume`; with the PR B barrier on, a write deferred behind the orphan commits once
+ * the next refresh finishes it.
  * Regression it catches: every scheduled refresh refusing `refresh_in_progress`
  * forever after a crash (and every page write to the worktree refusing
  * `worktree_refreshing`), owner recovery skipping `syncing` rows, status that
@@ -29,7 +30,11 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { printRefreshOutcome, runSourcesRefresh } from '../src/commands/sources-refresh.ts';
 import { _resetCliExitVerdictForTests } from '../src/core/cli-force-exit.ts';
 import { runPersistenceAdministration } from '../src/core/persistence/administration.ts';
-import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
+import { disposePersistenceConsumer, waitForWrite } from '../src/core/persistence/service.ts';
+import { getWriteRequestById } from '../src/core/persistence/journal.ts';
+import { resetWriteSwitches } from '../src/core/persistence/switches.ts';
+import type { WriteRequest } from '../src/core/persistence/model.ts';
+import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { readSyncStatus } from '../src/core/persistence/sync-status.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { refreshWorktree, resumeWorktreeRefreshes } from '../src/core/persistence/worktree-refresh.ts';
@@ -131,6 +136,28 @@ test('#7679: a refresh killed mid-syncing is reported orphaned with its holder, 
   });
 }, 300_000);
 
+test('PR B: a write deferred behind a refresh whose process was killed commits once the next refresh finishes the orphan', async () => {
+  for (const item of cases) await withKilledRefresh(item, async ({ f, orphan }) => {
+    await withEnv({ GBRAIN_REFRESH_BARRIER: '1' }, async () => {
+      resetWriteSwitches();
+      try {
+        const result = await dispatchToolCall(f.engine, 'put_page', { slug: 'notes/deferred-past-kill', content: page('Deferred past a kill', 'admitted while the refresh was orphaned') },
+          { remote: true, transport: 'stdio', sourceId: f.beta, admissionOrigin: 'interactive' });
+        const body = JSON.parse(result.content[0]!.text) as Record<string, any>;
+        expect(result.isError === true).toBe(false);
+        expect(body).toMatchObject({ status: 'pending', deferred: { refresh_id: orphan.id } });
+        const [row] = await f.engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE request_id=$1::uuid', [body.request_id]);
+        expect(row!.state).toBe('deferred');
+        expect(await refreshWorktree(f.engine, f.alpha)).toMatchObject({ recovered: { refresh_id: orphan.id, state: 'completed' } });
+        const done = await waitForWrite(f.engine, (await getWriteRequestById(f.engine, row!.id))!, { engine: f.engine.kind } as never, 30_000);
+        expect(done.state).toBe('committed');
+        const [{ n }] = await f.engine.executeRaw<{ n: number }>('SELECT count(*)::int AS n FROM pages WHERE source_id=$1 AND slug=$2 AND deleted_at IS NULL', [f.beta, 'notes/deferred-past-kill']);
+        expect(Number(n)).toBe(1);
+      } finally { resetWriteSwitches(); }
+    });
+  });
+}, 300_000);
+
 test('#7679: owner recovery completes an orphaned syncing refresh once every member synced past its target, and leaves one whose members lag', async () => {
   for (const item of cases) await withKilledRefresh(item, async ({ f, target, orphan }) => {
     expect(await resumeWorktreeRefreshes(f.engine)).toBe(0);
@@ -168,6 +195,9 @@ test('#7679: a live refresh is never stolen: owner recovery, a plain refresh and
           // Both members caught up while the holder is paused: still not the owner scan's to complete.
           for (const id of [f.alpha, f.beta]) await performManagedSync(f.engine, { sourceId: id, noPull: true, noEmbed: true });
           expect(await f.lastCommit(f.alpha)).toBe(target);
+          expect(await resumeWorktreeRefreshes(f.engine)).toBe(0);
+          // #9649: a row older than the sync budget is still its live holder's: the reclaim takes only a refresh whose lock is free.
+          await f.engine.executeRaw(`UPDATE persistence_worktree_refreshes SET updated_at=now()-interval '1 hour' WHERE id=$1::uuid`, [held.id]);
           expect(await resumeWorktreeRefreshes(f.engine)).toBe(0);
           const refused = await refusedWith(refreshWorktree(f.engine, f.alpha), 'refresh_in_progress');
           expect(refused.message).toContain(`pid ${process.pid}`);
@@ -259,3 +289,24 @@ test('#7679: a plain refresh that cannot read the checkout HEAD leaves an orphan
     expect(await f.lastCommit(f.alpha)).toBe(target);
   });
 }, 300_000);
+
+test('#9649: owner recovery reclaims an orphaned syncing refresh that made no progress for the refresh sync budget, so writes to its sources are admitted again', async () => {
+  for (const item of cases) await withKilledRefresh(item, async ({ f, target, old, orphan }) => {
+    // A fresh orphan whose members lag is still left to the next refresh (the #7679 contract above), and a write names it with its age.
+    expect(await resumeWorktreeRefreshes(f.engine)).toBe(0);
+    const refused = await refusedWith(f.put(f.beta, 'notes/while-stuck', page('While stuck', 'refused')), 'worktree_refreshing');
+    expect(refused.message).toContain(`refresh ${orphan.id}`);
+    expect(refused.message).toMatch(/syncing, running \d+ s/);
+    // No progress on the row for longer than the refresh sync budget, set on the database clock: no wall-clock wait.
+    await f.engine.executeRaw(`UPDATE persistence_worktree_refreshes SET updated_at=now()-interval '1 hour' WHERE id=$1::uuid`, [orphan.id]);
+    expect(await resumeWorktreeRefreshes(f.engine)).toBe(1);
+    const [row] = await f.refreshRows() as Row[];
+    expect(row).toMatchObject({ id: orphan.id, state: 'completed', outcome: { completed_by: 'owner_reclaim', sync_deferred: [f.alpha, f.beta] } });
+    // The checkout stays at the target and the members stay where they were: their next sync imports it, as after a deferred member (#8072).
+    expect(f.head()).toBe(target);
+    expect(await f.lastCommit(f.alpha)).toBe(old);
+    expect((await f.put(f.beta, 'notes/after-reclaim', page('After reclaim', 'admitted'))).state ?? 'committed').toBe('committed');
+    expect(await writerRefreshes(f, f.beta)).toEqual([]);
+  });
+}, 300_000);
+

@@ -47,13 +47,14 @@ import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { ParsedPage } from '../import-file.ts';
 import { importFromContent } from '../import-file.ts';
-import { ownerImportTrust, ownerSourceGateInput } from '../trust/channel.ts';
+import { ownerGateInput, ownerImportTrust, ownerSourceGateInput } from '../trust/channel.ts';
+import { withoutSafetyAssessments } from './reconcile-safety.ts';
 import { ContentSanityBlockError } from '../content-sanity.ts';
 import { loadImportSanityConfig, type ContentRefusal, type ImportSanityConfig } from '../import-screen.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 import { comparableFrontmatter, parseMarkdown, resolveParsedSubtype, type ParseOpts } from '../markdown.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
-import { opError, type OperationContext } from '../ops/contract.ts';
+import { OperationError, opError, type OperationContext } from '../ops/contract.ts';
 import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
 import { assertPageRevision, type PageSnapshot } from '../page-state/types.ts';
@@ -74,7 +75,8 @@ import { screenSyncImport } from './sync-prepare.ts';
 import type { SyncRename } from './sync-discovery.ts';
 import type { PreparedContentImport } from './prepared-import.ts';
 import type { PreparedMutation } from './coordinator.ts';
-import { contentRepairCommit, fenceRepairCommit } from './effect-model.ts';
+import { contentRepairCommit, fenceRepairCommit, localEditAdoptionCommit } from './effect-model.ts';
+import { ADOPTED_CHANGE_REASON, adoptedHeadHolds, assertAdoptionCaller, commitAdoptedLocalEdit, conflictOrOperation, landedAdoptionCommit } from './local-edit-adoption.ts';
 import { recordSlugLineAlias } from '../page-state/rename-alias.ts';
 import type { WriteRequest } from './model.ts';
 import { bindOrigin } from './origin-guard.ts';
@@ -103,6 +105,8 @@ export interface ManagedFileRepairIntent extends Record<string, unknown> {
   contentRepair?: ContentRepairReceipt;
   /** #6696 C8: the hold observation the repair read; the publication clears the path's hold only while it is that observation (a newer hold stays). */
   holdObservedAt?: string;
+  /** GST-1601: an adopted one-sided local edit (local-edit-adoption.ts): the worktree blob and the revision it replaces. */
+  adoptLocalEdit?: { blob: string; replaced_revision: string; head: string | null; caller?: { id: string; token: string | null } };
 }
 
 /** The repair command a refusal names (D6 router): a fence repair's, the content repair's, or the frontmatter repair's. */
@@ -198,9 +202,9 @@ export function fileSha256(path: string): string {
   return sha256(readFileSync(path));
 }
 
-/** The canonical page fields a publication stores; what the preview hash binds besides the bytes. */
+/** The canonical page fields a publication stores; what the preview hash binds besides the bytes. The gate's markers are re-derived from the bytes, so they are not bound. */
 export function canonicalRepairFields(page: Pick<ParsedPage, 'type' | 'title' | 'compiled_truth' | 'timeline' | 'frontmatter'>, tags: string[]) {
-  return { type: page.type, title: page.title, body: page.compiled_truth, timeline: page.timeline ?? '', frontmatter: comparableFrontmatter(page.frontmatter), tags: [...new Set(tags)].sort() };
+  return { type: page.type, title: page.title, body: page.compiled_truth, timeline: page.timeline ?? '', frontmatter: comparableFrontmatter(withoutSafetyAssessments(page.frontmatter)), tags: [...new Set(tags)].sort() };
 }
 
 export interface RepairPublicationInput {
@@ -235,11 +239,12 @@ export async function prepareRepairPublication(engine: BrainEngine, input: Repai
   let result;
   try {
     result = await importFromContent(engine, renamed ? input.base!.page.slug : input.slug, content, { sourceId: input.sourceId, noEmbed: true, remote: false, preserveGateMarkers: true,
-      overrideTier: (await ownerSourceGateInput(engine, input.sourceId, parsedInput.frontmatter)).tier,
+      writeGate: await ownerSourceGateInput(engine, input.sourceId, parsedInput.frontmatter, input.sourcePath),
       activePack: input.activePack, filename: basename(input.sourcePath).replace(/\.mdx?$/i, ''), sourcePath: input.sourcePath, allowEmptyOverwrite: true,
       prepare: async value => { prepared = value; return value.result; } });
   } catch (error) {
     if (error instanceof ContentSanityBlockError) return { status: 'refused', refusal: { code: 'content_rejected', message: error.message } };
+    if (error instanceof OperationError && error.code === 'write_gate_rejected') return { status: 'refused', refusal: { code: 'write_gate_rejected', message: error.message } };
     throw error;
   }
   if (!prepared) return { status: 'refused', refusal: result.refusal ?? { code: 'invalid_frontmatter', reason: 'yaml_parse', message: result.error ?? 'The file could not be prepared.' } };
@@ -327,19 +332,29 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
   }
   const fenceRepair = checkedFenceRepair(p, row.source_id);
   const contentRepair = checkedContentRepair(p, row.source_id);
+  const adopted = p.adoptLocalEdit;
+  if (adopted !== undefined && (typeof adopted?.blob !== 'string' || typeof adopted.replaced_revision !== 'string' || (typeof adopted.head !== 'string' && adopted.head !== null) || p.expected_revision !== adopted.replaced_revision)) {
+    throw opError('invalid_params', 'The local edit adoption intent is incomplete.', `Adoption request ${row.request_id} in source ${row.source_id} names no worktree blob or replaced revision, so it published nothing.`);
+  }
   const binding = await getWorktreeBinding(engine, row.source_id);
   if (!row.worktree_id || !binding?.local_path || String(binding.owner_epoch) !== p.ownerEpoch) throw opError('owner_unavailable', 'A managed file repair requires its accepted canonical owner.',
     `Source ${row.source_id}'s canonical owner changed or went away after repair request ${row.request_id} was accepted, so it published nothing. Check the owner, then preview the repair again on the host that owns the source.`,
     { fix: ownerStatusFix(row.source_id) });
   const root = join(binding.local_path, binding.relative_path);
+  const adoptNote = adopted ? localEditAdoptionCommit(p.path, adopted.blob, adopted.replaced_revision) : undefined;
   const bytes = Buffer.from(p.content, 'utf8');
   const fileChanges = sha256(bytes) !== p.beforeHash;
+  if (adopted && fileChanges) throw opError('invalid_params', 'A local edit adoption may not rewrite the file it adopts.',
+    `Adoption request ${row.request_id} in source ${row.source_id} would change ${p.path} instead of recording it as it is, so it published nothing.`);
   const checkFile = () => {
     const target = confinedRepairTarget(root, p.path, row.source_id, kind);
     if (fileSha256(target) !== p.beforeHash) throw changedSincePreview(row.source_id, p.path, 'the file bytes differ from the previewed hash', kind);
     return target;
   };
   const target = checkFile();
+  // #8824: the caller's claim is checked only before the adoption's commit lands; a replay after it publishes that commit.
+  const adoptionLanded = () => adopted ? landedAdoptionCommit(root, target, { path: p.path, ...adopted }) : Promise.resolve(null);
+  if (adopted && !await adoptionLanded()) await assertAdoptionCaller(engine, row, adopted.caller);
   const source = { sourceId: row.source_id };
   const snapshot = await engine.readPageSnapshot(row.slug, { ...source, includeDeleted: true });
   assertPageRevision(snapshot, { expectedRevision: p.expected_revision ?? null }); // null: admitted against an absent page; still a revision_conflict if one appeared (#5385)
@@ -367,21 +382,27 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
   const ready = publication.ready;
   const project = await prepareCanonicalProjections(engine, ready.parsedPage, row.slug, row.source_id, base, 'file');
   const importContent = p.content.replace(/^\uFEFF/, '');
-  const overrideTier = (await ownerSourceGateInput(engine, row.source_id, parseMarkdown(importContent, `${row.slug}.md`, { activePack: screenConfig.activePack }).frontmatter)).tier;
-  const importOptions = { ...source, noEmbed: true, remote: false, preserveGateMarkers: true, overrideTier, activePack: screenConfig.activePack, filename: basename(p.sourcePath).replace(/\.mdx?$/i, ''), sourcePath: p.sourcePath, allowEmptyOverwrite: true };
+  const writeGate = await ownerGateInput(engine, row, parseMarkdown(importContent, `${row.slug}.md`, { activePack: screenConfig.activePack }).frontmatter, p.sourcePath);
+  const importOptions = { ...source, noEmbed: true, remote: false, preserveGateMarkers: true, writeGate, activePack: screenConfig.activePack, filename: basename(p.sourcePath).replace(/\.mdx?$/i, ''), sourcePath: p.sourcePath, allowEmptyOverwrite: true };
   // afterCommit follows the import that published (a page stored in segments chunks what its publication left unsealed).
   let published = ready;
   return { observedRevision: snapshot?.revision ?? null, noop: ready.noop && !fileChanges && !moved, contentUnchanged: ready.noop && !fileChanges && !moved,
     trust: await ownerImportTrust(engine, row, ready.parsedPage.frontmatter, p.sourcePath), deferEmbedding: p.noEmbed, ...(moved ? { additionalPageKeys: [{ sourceId: row.source_id, slug: moved.slug }] } : {}),
     ...(ready.afterCommit || moved ? { afterCommit: async (target: BrainEngine) => { await published.afterCommit?.(target); } } : {}),
-    ...(fileChanges ? { file: { root, path: target, content: bytes, expectedBeforeHash: p.beforeHash,
-      ...(fenceRepair ? { commit: fenceRepairCommit(p.path, fenceRepair.classes, fenceRepair.tier) } : contentRepair ? { commit: contentRepairCommit(p.path, contentRepair) } : {}) } } : {}),
+    ...(fileChanges || adopted ? { file: { root, path: target, content: bytes, expectedBeforeHash: p.beforeHash,
+      ...(adoptNote ? { commit: adoptNote }
+        : fenceRepair ? { commit: fenceRepairCommit(p.path, fenceRepair.classes, fenceRepair.tier) } : contentRepair ? { commit: contentRepairCommit(p.path, contentRepair) } : {}) } } : {}),
+    ...(adoptNote ? { afterEffects: (tx: BrainEngine, outcome: Record<string, unknown>) => commitAdoptedLocalEdit(tx, row.source_id, binding, target, adoptNote, outcome) } : {}),
     validate: async tx => {
       const current = await getWorktreeBinding(tx, row.source_id);
       if (!current || current.worktree_id !== row.worktree_id || String(current.owner_epoch) !== p.ownerEpoch) throw opError('owner_unavailable', 'The repair owner changed.',
         `Source ${row.source_id}'s canonical owner changed while repair request ${row.request_id} was prepared, so it published nothing. Check the owner, then preview the repair again.`,
         { fix: ownerStatusFix(row.source_id) });
       checkFile();
+      if (adopted && !await adoptedHeadHolds(binding, root, target, adopted.head, adopted.blob)) throw changedSincePreview(row.source_id, p.path, 'git HEAD moved after its local edit was read', kind);
+      // #8755: the caller's claim and the index are read again here, where the adoption commits: a cancel or a conflict may come after preparation.
+      if (adopted && !await adoptionLanded()) await assertAdoptionCaller(tx, row, adopted.caller, true);
+      if (adopted && adopted.head !== null && await conflictOrOperation(root, target)) throw changedSincePreview(row.source_id, p.path, 'a merge, rebase or conflicted path appeared after its local edit was read', kind);
       if (contentRepair?.declared_alias) await assertDeclaredSlugAbsent(tx, row.source_id, root, p, contentRepair.declared_alias, row.slug, kind);
       await assertRenameSource(tx);
       await ready.validate(tx);
@@ -398,7 +419,9 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
         applied = movedImport;
       }
       published = applied;
+      const [last] = adopted && snapshot ? await tx.executeRaw<{ id: number | string | null }>('SELECT max(id) AS id FROM page_versions WHERE page_id=$1', [snapshot.page.id]) : [];
       const installed = await applied.apply(tx);
+      if (adopted && snapshot) await tx.executeRaw('UPDATE page_versions SET change_reason=$2 WHERE page_id=$1 AND id>$3', [snapshot.page.id, ADOPTED_CHANGE_REASON, Number(last?.id ?? 0)]);
       await bindOrigin(tx, { sourceId: row.source_id, slug: row.slug, sourcePath: p.sourcePath });
       // A body stored in segments was sealed by its import's apply when complete (sealSegmentedPage); the inline text seal reads the whole timeline.
       if (!applied.noop) { await project(tx); if (!installed?.segmented) await sealPageTextProjection(tx, row.slug, row.source_id); }
@@ -410,6 +433,7 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
         raw_sha256: sha256(importContent), gbrain_version: VERSION, revision: page.revision, parser: syncImportParserFor(p.sourcePath, screenConfig.packIdentity), ...syncDiskProvenance(bytes, null) });
       return { status: moved ? 'renamed' : applied.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
         chunks: applied.result.chunks, imported_file: true, file_repaired: fileChanges, hold_cleared: holdCleared, ...(moved ? { renamed_from: moved.slug } : {}),
-        ...(fenceRepair ? { fence_repair: fenceRepair } : {}), ...(contentRepair ? { content_repair: contentRepair } : {}) };
+        ...(fenceRepair ? { fence_repair: fenceRepair } : {}), ...(contentRepair ? { content_repair: contentRepair } : {}),
+        ...(adopted ? { adopted_local_edit: { path: p.path, blob: adopted.blob, replaced_revision: adopted.replaced_revision } } : {}) };
     } };
 }

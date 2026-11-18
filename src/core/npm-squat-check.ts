@@ -16,6 +16,7 @@
 import { closeSync, openSync, readFileSync, readSync, realpathSync } from 'node:fs';
 import { dirname, join, sep } from 'node:path';
 import type { Action } from './agent-output.ts';
+import { INSTALL_PIN } from './install-ref.ts';
 
 export type GbrainBinaryKind = 'real' | 'foreign' | 'broken' | 'unknown';
 
@@ -58,10 +59,10 @@ export interface ClassifyGbrainBinaryOptions {
 /** Repository marker identifying this project's package.json. */
 const REAL_REPO_MARKER = 'garrytan/gbrain';
 
-/** The documented install command (the `latest-stable` release ref). */
-const INSTALL_ARGV = ['bun', 'install', '-g', `github:${REAL_REPO_MARKER}#latest-stable`];
+/** The documented install command (INSTALL_PIN, the one install ref in core/install-ref.ts). */
+const INSTALL_ARGV = ['bun', 'install', '-g', INSTALL_PIN];
 
-/** #218 recovery: a Bun global install can skip the postinstall that applies schema migrations. */
+/** #218 recovery: a fresh install runs no migrations; this applies them. */
 const SCHEMA_RECOVERY_ARGV = ['gbrain', 'apply-migrations', '--yes', '--no-autopilot-install'];
 
 /** The documented install/remediation path, reused in doctor output. */
@@ -241,11 +242,11 @@ function squatFix(foreign: ClassifiedGbrainBinary, realElsewhere: boolean, opts:
   }
   const reinstall: Action = {
     argv: INSTALL_ARGV, consent: ['persistent_install'], actor: 'agent', requires_exclusive: false, verify,
-    why: 'No real gbrain is left on PATH. This installs it from the latest-stable release ref, the only supported source.',
+    why: 'No real gbrain is left on PATH. This installs it from the stable release ref, the only supported source.',
     then: {
       argv: SCHEMA_RECOVERY_ARGV, consent: [], actor: 'agent', requires_exclusive: false,
       verify: { argv: ['gbrain', 'doctor', '--json'] }, docs: 'README.md#install',
-      why: 'A Bun global install can skip the postinstall that applies schema migrations (#218). This applies them and exits 0 only when the schema is at head; exit 1 with migrations_pending means run gbrain doctor --json and relay what it reports.',
+      why: 'The install itself runs no migrations (#218). This applies them and exits 0 only when the schema is at head; exit 1 with migrations_pending means run gbrain doctor --json and relay what it reports.',
     },
   };
   return {

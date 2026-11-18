@@ -1,8 +1,10 @@
 import type { BrainEngine } from '../engine.ts';
 import { assertRecoveryVersion } from './recovery-version.ts';
+import { isHoldingSlug } from '../facts-fence.ts';
 
 export type Principal = { kind: 'oauth_client' | 'legacy_token' | 'local_cli' | 'local_stdio' | 'application'; id: string };
-export type RequestState = 'queued' | 'running' | 'recovering' | 'committed' | 'conflict' | 'failed' | 'cancelled';
+/** `deferred` (PR B, docs/designs/REFRESH_WRITE_BARRIER.md): admitted during a worktree refresh, unclaimable until it is released. */
+export type RequestState = 'queued' | 'deferred' | 'running' | 'recovering' | 'committed' | 'conflict' | 'failed' | 'cancelled';
 export interface WriteAuthority {
   /** The caller's self-declared agent label (X-Gbrain-Agent-Label). Unverified text: nothing authorizes on it. */
   agentLabel?: string;
@@ -21,9 +23,28 @@ export interface WriteAuthority {
    * link from the id to the same enabled member, so an unlink, a disabled member or a revoked right refuses it.
    */
   actingFor?: string[] | { system: string; external_id: string; member: string };
+  /**
+   * GST-363: the member a local_stdio writer's serve was started with (`gbrain serve --stdio-member`). Preparation and
+   * publication re-resolve it live (a disabled member reads as nobody); absent, they read config mcp.stdio_member.
+   */
+  stdioMember?: string;
   /** GST-359 D: the attested operation this write serves when it differs from the stored one (memory_write as remember). */
   attestedOp?: string;
-  databaseOnlyReason?: 'subagent_sandbox' | 'disabled_by_config' | 'no_repo_configured' | 'connector_database' | 'unbound_source' | 'overwrite_restore' | 'detached';
+  /** GST-1113: the scope source an attested memory_write named instead of the principal's own; publication re-checks attest_sources. */
+  attestedSource?: string;
+  /**
+   * GST-2492: the entity a remember held on memory/unattributed is for (a strict source, the entity has no page). The
+   * write is authorized as a write to that entity (its slug fences, grant prefixes and visibility), never to the
+   * holding page, which is gbrain's own companion to it.
+   */
+  heldFor?: string;
+  /**
+   * GST-2091: the brain owner (`member:<id>`) whose own credential, with write scope and speaking for itself, made this
+   * page write (put_page, edit_page or append_page; put_pages and page uploads store those). Preparation and publication
+   * lift the privacy part of the writer's read policy only while storedOwnerWrite still holds; member access always applies.
+   */
+  ownerWrite?: string;
+  databaseOnlyReason?: 'subagent_sandbox' | 'disabled_by_config' | 'no_repo_configured' | 'relative_root' | 'connector_database' | 'unbound_source' | 'overwrite_restore' | 'detached' | 'entity_page_missing';
   autoLinkTrusted?: boolean;
   restrictedNamespace?: boolean;
   sourceId: string;
@@ -39,6 +60,11 @@ export interface WriteAuthority {
   /** Actual holders touched by a published take mutation; retained after intent compaction. */
   takeHoldersUsed?: string[];
 }
+/** GST-2492: the slug a write is authorized as: a held remember's entity in place of the holding page, else the page itself. */
+export function authorizedSlug(authority: Pick<WriteAuthority, 'heldFor'>, slug: string): string {
+  return authority.heldFor && isHoldingSlug(slug) ? authority.heldFor : slug;
+}
+
 /**
  * One file's publication recovery. The prior bytes are embedded (`before`, base64), except for a prior file over the
  * single-string ceiling (large-file.ts): `before` is null and the bytes are the staged copy `staging.before` (path,
@@ -123,6 +149,10 @@ export interface WriteRequest {
   authority: WriteAuthority;
   sequence: string | number;
   state: RequestState;
+  /** The refresh a deferred write was admitted behind; kept after it drains, so its claim runs the refresh-change check. */
+  deferred_refresh_id?: string | null;
+  /** GST-1582: the source's last imported commit ('' for none) when a claimed write was held for an import; kept after it lands. */
+  deferred_import_from?: string | null;
   execution_token: string | null;
   claim_expires_at: Date | string | null;
   recovery: RecoveryRecord | null;
@@ -173,9 +203,9 @@ export interface JournalLimits {
 export const DEFAULT_JOURNAL_LIMITS: Readonly<JournalLimits> = Object.freeze({
   principalOutstanding: 100, brainOutstanding: 1000,
   principalIntentBytes: 64 * 1024 ** 2, brainIntentBytes: 256 * 1024 ** 2,
-  // #6696 (A2): sized for 5,000 admissions a day for a year (docs/guides/concurrent-writes.md#growth-model).
-  principalLifetimeIds: 2_000_000, brainLifetimeIds: 8_000_000,
-  principalTerminalBytes: 16 * 1024 ** 3, brainTerminalBytes: 64 * 1024 ** 3,
+  // GBRA-108: the cumulative caps are opt-in (Infinity until persistence.limits.* sets one); housekeeping and doctor bound receipt storage.
+  principalLifetimeIds: Infinity, brainLifetimeIds: Infinity,
+  principalTerminalBytes: Infinity, brainTerminalBytes: Infinity,
   brainRecoveryBytes: 1024 ** 3, worktreeRecoveryBytes: 256 * 1024 ** 2,
 });
 export type SqlEngine = Pick<BrainEngine, 'executeRaw'>;

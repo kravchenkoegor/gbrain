@@ -51,7 +51,7 @@ enforced structurally by actionlint on every workflow change.
   fetched over TLS; it does NOT independently verify the attestation's Sigstore
   signature (the Fulcio certificate chain or Rekor inclusion).
 - **From-source and pinned-tag installs remain trust-on-first-use.**
-  `bun install -g github:garrytan/gbrain#latest-stable` follows a force-moved
+  `bun install -g github:garrytan/gbrain#stable` follows a force-moved
   tag, and the `codex-plugin` branch / template repo are force-published; these
   paths trust TLS + GitHub without an independent integrity check. From-source
   installs also serve the committed `admin/dist` bundle (devDeps for a fresh
@@ -172,7 +172,8 @@ for their own subtree. This costs nothing when the working directory has no
   `GBRAIN_ALLOW_SHELL_JOBS`, `GBRAIN_ALLOW_PRIVATE_REMOTES`,
   `GBRAIN_ALLOW_UNVERIFIED_REMOTE`, `GBRAIN_GIT_ALLOW_FILE_TRANSPORT`,
   `GBRAIN_ALLOW_MASS_RECONCILE`, `GBRAIN_ALLOW_DEFAULT_WRITE`,
-  `GBRAIN_NO_SANITY`, `GBRAIN_REMOTE_PRIVATE_PAGES`.
+  `GBRAIN_NO_SANITY`, `GBRAIN_REMOTE_PRIVATE_PAGES`, and the stdio MCP tool
+  surface `GBRAIN_SURFACE`.
 - The variable families through which a checkout could hijack the programs
   gbrain spawns rather than gbrain itself (`CWD_DOTENV_PROTECTED_PREFIXES`,
   `CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS`): the `LD_*`/`DYLD_*` dynamic-loader
@@ -513,6 +514,11 @@ window):
 On exhaustion the server returns `429 Too Many Requests` with a
 `Retry-After` header.
 
+`gbrain serve --http` applies each bucket only when its env var is set
+(`GBRAIN_HTTP_RATE_LIMIT_IP=30 GBRAIN_HTTP_RATE_LIMIT_TOKEN=60` gives the
+defaults above); with neither set it does not rate-limit `/mcp`. The legacy
+bearer transport always applies the defaults.
+
 **Caveat for tunneled deployments (ngrok, Tailscale Funnel, Cloudflare
 Tunnel):** all requests share one egress IP, so the pre-auth IP bucket
 becomes effectively shared by all clients on that tunnel. The
@@ -569,8 +575,9 @@ forwarded-for headers and using the socket peer address.
 
 ### Body size cap
 
-Default 1 MiB, stream-counted (chunked transfers without
-`Content-Length` are still capped). Override:
+Default 4 MiB on `gbrain serve --http` and 1 MiB on the legacy bearer
+transport, stream-counted (chunked transfers without `Content-Length` are
+still capped). `GBRAIN_HTTP_MAX_BODY_BYTES` overrides both:
 
 ```bash
 GBRAIN_HTTP_MAX_BODY_BYTES=2097152 gbrain serve --http   # 2 MiB
@@ -634,7 +641,9 @@ complete. If you find a live credential in a page:
    value; rewrite/re-push or regenerate those as needed.
 4. Add a value's fingerprint (printed with every `gbrain sources push` finding)
    to `<workspace>/.gbrain-scan-allow` ONLY for values you have confirmed are
-   not credentials.
+   not credentials. A `path:<glob> pattern:<rule>` line allows one rule in the
+   files the glob matches and keeps every other rule active there; a malformed
+   line or an unknown rule name allows nothing and is reported.
 
 **Say to your agent:** *"a secret leaked into a brain page — rotate it and
 purge the page"* (your agent rotates the credential, then runs

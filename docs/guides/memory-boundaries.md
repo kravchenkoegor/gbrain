@@ -21,13 +21,23 @@ instructions. Do not put secrets in memory pages. A durable decision about a
 setup can be recorded without copying its credentials or assuming that setup is
 active in another harness.
 
-Automatic capture is opt-in. Installing the harness hooks opts into the
+Automatic capture is opt-in, except the [conversation archive](conversation-archive.md): on a
+personal brain it is on by default and keeps one redacted page per conversation
+per day from the harness sessions on this machine (nothing leaves a keyless
+machine; `gbrain transcripts archive off` stops it, and a shared brain is only
+offered it). It extracts no facts. Installing the harness hooks opts into the
 compaction and SessionEnd capture lanes; `gbrain config set
 memory.auto_writeback off` stops every capture lane, and `gbrain bootstrap
 harness --remove` stops the hooks from banking session text at all (see
 [ambient writeback](ambient-writeback.md#capture-lanes-and-the-off-switch)).
 Time-limited facts need an explicit TTL; ordinary
 saved facts do not expire just because they describe a temporary situation.
+
+In a shared chat, the owner's own questions are answered at the owner's full
+scope, with every item marked by whether the people in the room could have
+read it ([rooms](rooms.md)). The marks are for the agent's judgment about what
+to say; they do not keep the raw results out of a group transcript, so the
+harness must.
 `forget` withdraws a fact from active recall, not from all source material,
 history, or private backups. To remove the text itself from live stores, the
 owner runs a [purge](#purge) on the brain host. See [ambient writeback](ambient-writeback.md).
@@ -297,7 +307,7 @@ wrong with the page.
 | Markdown import and sync (`gbrain import`, `gbrain sync`, the managed sync blob read) | the page ceiling: 256 MiB on Postgres, 128 MiB on PGLite (24 MiB while segmented storage is off); above 24 MiB on a source backed by files, only from the file's own place in the checkout | — |
 | CLI stdin (`gbrain put`, `gbrain capture --stdin`) | 24 MiB (was 5 MB) | `gbrain import` the file |
 | MCP stdio (local agents, `gbrain serve`) | 64 MiB per JSON-RPC message (the MCP SDK default of 10 MiB is raised), so a JSON-escaped page at the ceiling fits | — |
-| MCP over HTTP (`gbrain serve --http`) | 4 MiB request body (the MCP SDK default) | an [upload session](#adding-to-a-large-page), or sync or the CLI on the brain host |
+| MCP over HTTP (`gbrain serve --http`) | 4 MiB request body (the MCP SDK default; `GBRAIN_HTTP_MAX_BODY_BYTES` overrides it) | an [upload session](#adding-to-a-large-page), or sync or the CLI on the brain host |
 | Legacy HTTP transport | 1 MiB (`GBRAIN_HTTP_MAX_BODY_BYTES`) | the same |
 | `put_pages` batch | 8 MiB per batch | send large pages one per `put_page`, or by file |
 | Persistence journal | 64 MiB of outstanding JSON-escaped write intent per principal (was 32 MiB), 256 MiB per brain | nothing: a second large write waits for the first |
@@ -388,6 +398,30 @@ receive the relevant retrieved content or source text. Self-hosted providers hav
 their own deployment boundary. The connected agent's own model also receives
 whatever memory its harness includes in context, even on a keyless GBrain setup.
 
+Access designations decide who reads a page, not which configured providers
+process it, and they do not exclude a page from processing that is turned on.
+A page with `readable_by`, a folder rule or `visibility: private` is embedded
+like every other page, so the configured embedding provider receives its text.
+Private facts and takes are embedded on their own, so the provider receives
+their text too. When contextual retrieval runs at the synopsis tier, the chat
+model also receives the page's title and text (with private fact rows and takes
+removed). GBrain cannot tell a local endpoint from a remote one, because a
+recipe's base URL can point anywhere. A self-hosted embedding provider (and
+synopsis model) on hardware you control keeps restricted text in house for
+embedding and contextual retrieval only. Every other enabled provider, such as
+a reranker or a chat model, can still receive restricted text, so self-host or
+turn off each one that must not. The decision provider is stricter by default:
+while `decide.egress.private` is `deny` (the default), System One calls to
+TypeSafe withhold restricted pages, private facts and conversation text, except
+for the reranking slot and the fact and conversation items of a slot turned on
+by the key-aware default. An `llm:` decision provider, or setting
+`decide.egress.private allow`, removes that guard.
+
+Reporting back through Wakeshift (off by default, owner opt-in) sends a watched
+job's, write request's or cron's id, status and times (and a removed member's
+hashed id to forget), never page text, titles or slugs; see
+[what leaves the machine](wakeshift.md#what-leaves-the-machine).
+
 Enable paid capabilities and automatic capture only with consent, using the
 provider's actual data-handling policy. See [installation capabilities](../../INSTALL_FOR_AGENTS.md#step-2-api-keys)
 and [spend controls](../operations/spend-controls.md). A spending cap is not a
@@ -401,6 +435,14 @@ files or database credentials. Stdio is local access, not an HTTP client grant.
 Read [brains and sources](../architecture/brains-and-sources.md#what-confines-remote-callers-and-what-does-not)
 before choosing a sharing topology. Tests cover specific boundaries, not a
 universal security guarantee.
+
+A brain that serves several people (two or more enabled members, or config
+`access.serves = several`) refuses remote reads from a connection bound to no
+member (`requester_scope_required`, after a 14-day grace for connections that
+already existed), so a shared bot cannot read everyone's unmarked notes for
+whoever is asking. That covers reads only: writes keep their own rules, and a
+page that names no readers is still read by every member.
+[The refusal and its fix](write-refusals.md#requester_scope_required).
 
 <a id="fence-markers-in-code"></a>
 **Fence markers quoted in code.** Since 0.60.97.0 the readers (the fence
@@ -419,13 +461,27 @@ in a form the scanner does not match (split it, or describe it) or move the
 mention after the real fence. Pinned by `test/fence-marker-code-context.test.ts`
 ("remote privacy boundary" and "remote page replacement").
 
+<a id="full-backup"></a>
 Markdown export is a portable view of pages, **not a full database backup**.
-DB-only facts and pages, revision history, the belief ledger (what the brain
+DB-only facts and pages (extract receipts included), revision history, the belief ledger (what the brain
 had recorded, and when; `gbrain beliefs`), withdrawal state, jobs, settings,
-and authentication records may not be recoverable from Markdown. Use the engine's
-full backup/restore path and verify a restore into a separate location. Treat
-database backups as sensitive. See the [system-of-record contract](../architecture/system-of-record.md)
-and [isolated local backup guide](in-agent-setup.md#6-back-up-the-complete-local-database).
+and authentication records may not be recoverable from Markdown. On a brain with
+several sources or members, an import of an export puts every page in one source
+with no members, tokens or facts, so a page from a personal source comes back
+readable by everyone in that source. Use the engine's full backup/restore path
+and verify a restore into a separate location:
+
+- **PGLite:** `gbrain backup create --output <absolute path>`, restored with
+  `gbrain backup restore` ([isolated local backup guide](in-agent-setup.md#6-back-up-the-complete-local-database)).
+- **Postgres:** a dump of the brain's database, `pg_dump --format=custom --file <dump> --dbname <database>`,
+  restored into a new, empty database with `pg_restore --no-owner --dbname <new database> <dump>`;
+  `gbrain init --url <new database>` under a separate `GBRAIN_HOME` then opens it with its
+  sources, members, tokens, folder rules and facts. `gbrain backup create` refuses on Postgres.
+  The restored brain's sources still name the original's content folders, so keep
+  only one of the two brains writing to them. See [embedding migrations](../embedding-migrations.md)
+  for a quiesced dump with service files that keep the password off the command line.
+
+Treat database backups as sensitive. See the [system-of-record contract](../architecture/system-of-record.md).
 
 <a id="purge"></a>
 ## Expire versus purge
@@ -487,10 +543,16 @@ What one purge does, in one transaction:
 - drops the row (not a strike) from the page's facts or takes fence, from the
   stored page body and from every saved page version, then rebuilds that page's
   chunks; the canonical file is rewritten by the owner and committed as
-  `gbrain: purge fact <hash8>` (no claim text in the commit);
-- redacts stored write intents that carry the claim (a pending write blocks
-  the purge with `purge_blocked_pending_recovery` until it finishes; retry with
-  the same request id), deletes legacy query-cache rows and drops the fact's
+  `gbrain: purge fact <hash8>` (no claim text in the commit). A purge of a
+  fact held on a holding page (`memory/unattributed`, or a folder's
+  `<folder>/memory/unattributed`) for an entity with no page also drops every
+  copy of the same claim text on that page, whether it is held for another
+  entity or has no entity;
+- redacts stored write intents that carry the claim (a write that is running
+  or recovering blocks the purge with `purge_blocked_pending_recovery` until it
+  finishes; retry with the same request id; a write still queued, or deferred
+  behind a `gbrain sources refresh`, whose staged body holds the claim is
+  cancelled with `purged_content` instead), deletes legacy query-cache rows and drops the fact's
   rewording-review rows (close active matches are returned first as
   `similar_active`);
 - hides rows a model derived from the fact (through the derivation edges
@@ -499,7 +561,10 @@ What one purge does, in one transaction:
 - records a text-free tombstone: the claim's fingerprint, its source,
   visibility, entity, request id and reason. Any later write of the same
   normalized claim is refused with `purged_content`, and a stale file, re-sync
-  or revert drops the row on import.
+  or revert drops the row on import. The tombstone applies to the whole brain:
+  it refuses a member's save on its own member page too, even when that member
+  could never read the purged fact, so a member who saves matching text learns
+  that a purge exists.
 
 On a terminal the CLI prints the dry-run receipt and asks you to type the
 fact's 8-character token; without a terminal it needs `--yes` and
@@ -542,6 +607,19 @@ An edited file imports normally. Its response carries the same store-by-store
 the purged page's facts. A write refused because it carries purged content,
 or accepted as a no-op after its purged rows were dropped, keeps no copy of
 that content in its stored write request.
+
+An owner purge held to keep a derived page private (`derived_origin_parked`)
+stays owed until its page is removed or restored: whichever purge later removes
+the page, the automatic one included, writes the purge tombstones.
+
+<a id="purge-mirror"></a>
+A restore replays every purge newer than the backup from the purge mirror,
+`purge-events.jsonl` in gbrain's config directory (`$GBRAIN_HOME/.gbrain`,
+else `~/.gbrain`), and a replayed page purge sweeps the same stores as the
+live purge. A host that runs each gbrain writer in a home directory it removes
+after the run loses that mirror, so run every writer with `GBRAIN_HOME` set to
+one durable directory. `gbrain doctor --only purge_mirror` warns when a purge
+from the last 30 days has no line in the mirror this process uses.
 
 ## Verify in the actual harness
 

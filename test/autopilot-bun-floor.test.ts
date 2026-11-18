@@ -21,6 +21,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { VERSION } from '../src/version.ts';
+import { writeChannelCache } from './helpers/update-cache.ts';
 
 const AUTOPILOT_TS = join(import.meta.dir, '..', 'src', 'commands', 'autopilot.ts');
 const TARGET = '99.0.0.0';
@@ -45,9 +46,9 @@ function harness(label: string): Harness {
   writeFileSync(join(dotG, 'config.json'), JSON.stringify({
     engine: 'pglite',
     database_path: join(dotG, 'brain.pglite'),
-    self_upgrade: { mode: 'auto', quiet_hours: { start: hour, end: (hour + 2) % 24, tz: 'UTC' } },
+    self_upgrade: { mode: 'auto', channel: 'alpha', quiet_hours: { start: hour, end: (hour + 2) % 24, tz: 'UTC' } },
   }));
-  writeFileSync(join(dotG, 'last-update-check'), `UPGRADE_AVAILABLE ${VERSION} ${TARGET}\n`);
+  writeChannelCache(dotG, `UPGRADE_AVAILABLE ${VERSION} ${TARGET}`);
   const shims = join(root, 'bin');
   mkdirSync(shims);
   const argvLog = join(root, 'argv.log');
@@ -70,7 +71,7 @@ function writeDriver(path: string, h: Harness): void {
     'const realExit = process.exit.bind(process);',
     "process.exit = ((code?: number) => { console.log('FETCHED ' + JSON.stringify(fetched)); console.log('EXIT_CALLED ' + code); realExit(code); }) as typeof process.exit;",
     `const { attemptAutopilotSelfUpgrade } = await import(${JSON.stringify(AUTOPILOT_TS)});`,
-    `await attemptAutopilotSelfUpgrade({ kind: 'pglite', db: { query: async () => ({ rows: [] }) } } as never, 'pglite', ${JSON.stringify(join(h.root, 'autopilot.lock'))});`,
+    `await attemptAutopilotSelfUpgrade({ kind: 'pglite', db: { query: async () => ({ rows: [] }) }, readCycleLocks: async () => [] } as never, 'pglite', ${JSON.stringify(join(h.root, 'autopilot.lock'))});`,
     "console.log('FETCHED ' + JSON.stringify(fetched));",
     "console.log('RETURNED');",
     '',

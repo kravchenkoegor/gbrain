@@ -227,6 +227,8 @@ for (const backend of testBackends()) {
       const put = await cli(['put', 'notes/huge-private', '--file', file('huge-private.md', `---\nVisibility: Private\n---\n${hugeBody('Huge private')}`)]);
       expect(put.code).not.toBe(0);
       expect(put.stderr).toContain('visibility_not_applied');
+      expect(put.stderr).toContain('page notes/huge-private would stay world-readable, so nothing was written');
+      expect(put.stderr).not.toContain('import the file again');
       expect(await sql<{ n: number }>('SELECT count(*)::int AS n FROM pages WHERE slug = $1', ['notes/huge-private'])).toEqual([{ n: 0 }]);
     }, 600_000);
 
@@ -238,11 +240,15 @@ for (const backend of testBackends()) {
       expect(gated.code).toBe(1);
       expect(gated.stderr).toContain('the write gate scans the whole body of a agent_written page');
       expect((await cli(['config', 'set', 'write_gate.agent_mode', 'off'])).code).toBe(0);
+      const started = Date.now();
       const capture = await cli(['capture', '--file', path, '--json']);
+      const ended = Date.now();
       expect(capture.code, capture.stderr).toBe(0);
       const receipt = JSON.parse(capture.stdout);
       const hash = sha(normalizeForHash(raw));
-      expect(receipt).toMatchObject({ content_hash: hash, source_kind: 'capture-cli', slug: `inbox/${new Date().toISOString().slice(0, 10)}-${hash.slice(0, 8)}` });
+      expect(Date.parse(receipt.captured_at)).toBeGreaterThanOrEqual(started);
+      expect(Date.parse(receipt.captured_at)).toBeLessThanOrEqual(ended);
+      expect(receipt).toMatchObject({ content_hash: hash, source_kind: 'capture-cli', slug: `inbox/${receipt.captured_at.slice(0, 10)}-${hash.slice(0, 8)}` });
       expect(await stored(receipt.slug)).toMatchObject({ body_storage: 'segmented', source_path: null, source_uri: 'cli-file' });
       expect(await uploads()).toBe(before);
       const read = await cli(['get', receipt.slug]);

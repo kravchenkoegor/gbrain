@@ -24,6 +24,7 @@ import { cliRenderContext, renderAction, type Action, type RenderedAction } from
 import { managedSyncResumeArgs, syncResumeCommand } from '../sync-reconcile.ts';
 import { isWriteCapacityWait, outstandingCapacityOf } from './admission-retry.ts';
 import { clearDrainStep, DrainPassAbandoned, markPassAbandoned, readDrainStep } from './drain-step.ts';
+import { abortStop } from './sync-stop-class.ts';
 import { PUBLICATION_CEILING_DEFAULT_MS, readPublicationCeilingMs } from './publication-deadline.ts';
 import { isOwnerThisProcess, stampLastSql, WAITING_ON, type ClaimLastSql, type WaitingOn } from './claim-phase.ts';
 import { describeHostConsumer, headBlockedNext, headBlockerText, headClaimability, type HeadBlocker } from './head-blocker.ts';
@@ -45,7 +46,9 @@ export type DrainStopReason = 'deadline' | 'drain_stalled' | 'database_contentio
   /** #6712 PR 1: another drainer holds the source's drain lease (or took it from this run); resumable, the next run follows it. */
   | 'drain_lease_held'
   /** #6712 PR 4b (design v3.2 §9): the live pass's stops. `not_converged` and `admission_paused` are resumable; the rest need the host or a report. */
-  | 'not_converged' | 'admission_paused' | 'grant_scope' | 'reconcile_host_required' | 'reconcile_read_incomplete';
+  | 'not_converged' | 'admission_paused' | 'grant_scope' | 'reconcile_host_required' | 'reconcile_read_incomplete'
+  /** GST-2869: `gbrain sync` took SIGTERM or SIGHUP and stopped its pass; resumable, the same command continues it. */
+  | 'terminated';
 /** The pass's status reasons that end a drain, with their outcome (design v3.2 §9). */
 const PASS_STOPS: Partial<Record<string, { outcome: DrainOutcome; reason: DrainStopReason }>> = {
   not_converged: { outcome: 'resumable', reason: 'not_converged' }, admission_paused: { outcome: 'resumable', reason: 'admission_paused' },
@@ -260,7 +263,8 @@ function transientDelay(error: unknown, attempt: number, refreshWaitedMs: number
   if (error instanceof OperationError && error.code === 'worktree_refreshing') {
     if (refreshWaitedMs >= REFRESH_WAIT_MS) return null;
     const hinted = Number(/retry_after_ms=(\d+)/.exec(String(error.detail ?? ''))?.[1]);
-    return Number.isFinite(hinted) && hinted > 0 ? hinted : 1000;
+    // GST-1623: never past the drain's refresh budget, so a long hint ends the wait on time instead of oversleeping it.
+    return Math.min(Number.isFinite(hinted) && hinted > 0 ? hinted : 1000, REFRESH_WAIT_MS - refreshWaitedMs);
   }
   // Admission gave up on lock contention (a concurrent publication holds the shared counters); the frozen request ID is kept.
   if (error instanceof OperationError && error.detail === 'database_contention') return refreshWaitedMs >= REFRESH_WAIT_MS ? null : 1000;
@@ -269,6 +273,9 @@ function transientDelay(error: unknown, attempt: number, refreshWaitedMs: number
   if (!contention && !isRetryableConnError(error) && !isStatementTimeoutError(error) && getCode(error) !== '57014') return null;
   return baseMs * 4 ** (attempt - 1);
 }
+
+/** Test seam: the drain's retry delay for one failed pass. */
+export const _transientDelayForTests = transientDelay;
 
 /** The error's message (or code), with anything that looks like a connection URL removed. */
 function errorText(error: unknown): string {
@@ -370,10 +377,24 @@ function stallText(index: number, total: number | null, stalledMs: number, claim
     + `${seen.consumer ? ` · consumer=${seen.consumer}` : ''}${seen.blocked_by ? ` · blocked_by=${headBlockerText(seen.blocked_by)}` : ''}`;
 }
 
+/**
+ * The in-pass line's age of an unclaimed head. A head that moved since the last read is the writer making progress (it
+ * commits requests queued ahead of this pass, a dead owner's in-flight writes among them), so the age counts from that
+ * read, never from before `floor` (the drain's own last commit). Every head read feeds it, a claimed head's included,
+ * whose line keeps the claim's own step age when it has one.
+ */
+function inPassHeadAge(): (requestId: string | null | undefined, at: number, floor: number, claimAgeMs?: number | null) => number {
+  let seen: { id: string | null | undefined; at: number; since: number } | null = null;
+  return (id, at, floor, claimAgeMs) => {
+    seen = { id, at, since: seen && seen.id !== id ? seen.at : seen?.since ?? floor };
+    return claimAgeMs ?? at - Math.max(floor, seen.since);
+  };
+}
+
 /** Re-enter `pass` until the managed cursor is done, the caller stops it, or it is blocked. */
 export async function runDrain(input: DrainInput): Promise<SyncResult> {
   const clock = input.clock ?? Date.now;
-  const startedAt = clock();
+  const startedAt = clock(), headAge = inPassHeadAge();
   const coop = cooperativeDeadline(input.deadlineAtMs);
   const signal = coop.signal && input.signal ? AbortSignal.any([input.signal, coop.signal]) : coop.signal ?? input.signal;
   /** #6706: the drain's own deadline (not the caller's cancellation) stopped it, so the stop is a resumable report. */
@@ -409,7 +430,7 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
     Promise.resolve().then(() => probe.head!()).then(head => {
       if (!head || !inPass || stall || clock() - lastCommitAt < every || tickAt - lastLine < every) return;
       lastLine = tickAt;
-      serr(stallText(index, total, head.claim?.step_age_ms ?? clock() - lastCommitAt, head.claim, head.head_state, head));
+      serr(stallText(index, total, headAge(head.request_id, clock(), lastCommitAt, head.claim?.step_age_ms), head.claim, head.head_state, head));
     }).catch(() => undefined).finally(() => { readingHead = false; });
   }, every) : null;
   stallLine?.unref?.();
@@ -602,11 +623,11 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
         if (passStop) return finish(result, passStop.outcome, passStop.reason);
         if (result.status === 'blocked_by_failures') return finish(result, 'blocked', 'blocked_by_failures');
         if (result.managedWrite && result.managedWrite.write_error !== 'write_pending') return finish(result, 'blocked', 'blocked_by_failures');
-        if (result.status === 'partial' && (result.reason === 'timeout' || signal?.aborted)) return finish(result, 'resumable', 'deadline');
+        if (result.status === 'partial' && (result.reason === 'timeout' || signal?.aborted)) return finish(result, 'resumable', abortStop(signal) === 'terminated' ? 'terminated' : 'deadline');
         const outcome = syncOutcome({ ...result, drain: undefined });
         return finish(result, outcome, outcome === 'resumable' ? 'deadline' : undefined);
       }
-      if (signal?.aborted) return finish(result, 'resumable', 'deadline');
+      if (signal?.aborted) return finish(result, 'resumable', abortStop(signal) === 'terminated' ? 'terminated' : 'deadline');
       const wait = result.writeWait;
       if (wait?.status === 'blocked') {
         return finish(result, 'blocked', BLOCKED_HEAD_REASONS.has(wait.cause) ? wait.cause as DrainStopReason : 'recovery_required');
@@ -940,6 +961,7 @@ const STOP_DOCS: Record<DrainStopReason, CatalogueName> = {
   connection_lost: 'sync_drain_connection_lost', capacity_paused: 'sync_drain_capacity_paused', drain_lease_held: 'sync_drain_lease_held',
   not_converged: 'sync_drain_not_converged', admission_paused: 'sync_drain_admission_paused', grant_scope: 'sync_drain_grant_scope',
   reconcile_host_required: 'sync_drain_reconcile_host_required', reconcile_read_incomplete: 'sync_drain_reconcile_read_incomplete',
+  terminated: 'sync_drain_deadline',
 };
 
 /**
@@ -1039,6 +1061,7 @@ export function drainNext(result: SyncResult, resumeCommand: string, sourceId: s
       why: abandoned
         ? `A write's preparation outran its budget in this process${d?.stall?.step ? ` (stuck at step ${d.stall.step}${d.stall.waiting_on && d.stall.waiting_on !== 'unknown' ? `, waiting on ${d.stall.waiting_on}` : ''})` : ''}, so the sync exited to end it; `
           + 'its cursor and accepted writes are intact. The same command resumes where it stopped, and an entry that stalls again is held instead of re-entered.'
+        : d?.stop_reason === 'terminated' ? 'The sync stopped on a termination signal (SIGTERM or SIGHUP) and recorded its pass with its cursor and accepted writes intact; the same command resumes where it stopped.'
         : 'The sync stopped at its deadline with its cursor and accepted writes intact; the same command resumes where it stopped.', ...(docs ? { docs } : {}) };
   }
   if (d?.stop_reason === 'preparation_systemic') {
@@ -1131,7 +1154,7 @@ export function drainNext(result: SyncResult, resumeCommand: string, sourceId: s
         + `Run the sync from a process that can write the source's lock directory (the owner's gbrain serve, or this command outside the sandbox), then rerun: ${resumeCommand}`,
       ...(docs ? { docs } : {}) };
   }
-  const writerBlocked = d?.stop_reason && d.stop_reason !== 'blocked_by_failures' && d.stop_reason !== 'deadline';
+  const writerBlocked = d?.stop_reason && d.stop_reason !== 'blocked_by_failures' && d.stop_reason !== 'deadline' && d.stop_reason !== 'terminated';
   if (writerBlocked) {
     return { command: `gbrain sources writer status ${sourceId}`, safe_to_loop: false, retry_after_ms: 0, ...estimate,
       why: d!.stop_reason === 'drain_stalled'
@@ -1216,8 +1239,10 @@ export interface ManagedSyncBacklog {
 }
 
 /**
- * Unfinished managed cursors with their remaining entries and the rate of
- * their latest drain window (CEO-A18), readable from any process.
+ * Unfinished managed cursors of registered sources with their remaining
+ * entries and the rate of their latest drain window (CEO-A18), readable from
+ * any process. A cursor left by a removed source (#8741), or recorded for an
+ * earlier incarnation of a source re-created under the same id, is not a backlog.
  * #6712 PR 4b (design v3.2 §3.7): plus every source whose pass row is not
  * `nothing_pending` (`passHealth`: converged at the checkout's HEAD and the
  * newest pass ended `synced` or `up_to_date`); a source's pass entry replaces
@@ -1226,7 +1251,9 @@ export interface ManagedSyncBacklog {
 export async function readManagedSyncBacklog(engine: BrainEngine, sourceIds?: string[]): Promise<ManagedSyncBacklog[]> {
   const rows = await engine.executeRaw<{ header: { sourceId: string; index: number; total: number; done?: boolean; discoveredAt?: string; progress?: { startedAt: number; startIndex: number; lastAt: number; lastIndex: number };
     counts?: { held?: number }; processingOptions?: { noEmbed?: boolean; noExtract?: boolean; noSchemaPack?: boolean }; syncOptions?: Parameters<typeof managedSyncResumeArgs>[0]['syncOptions'] } }>(
-    `SELECT completed_keys->0 AS header FROM op_checkpoints WHERE op='managed-sync' AND COALESCE(completed_keys->0->>'done','false')<>'true'`);
+    `SELECT completed_keys->0 AS header FROM op_checkpoints WHERE op='managed-sync' AND COALESCE(completed_keys->0->>'done','false')<>'true'
+      AND EXISTS (SELECT 1 FROM sources s WHERE s.id = completed_keys->0->>'sourceId'
+        AND s.incarnation::text = COALESCE(completed_keys->0->>'incarnation', s.incarnation::text))`);
   const { readPassReadings, passResumeArgs, passStuck, passStuckSince } = await import('./sync-pass-readers.ts');
   const passes: ManagedSyncBacklog[] = (await readPassReadings(engine, { sourceIds })).filter(r => !r.health.nothing_pending).map(({ source_id, row, head, health }) => {
     const t = row.value.telemetry, args = passResumeArgs(source_id, row), stuck = passStuck(health) ? health.reason as 'blocked' | 'not_converged' | 'settle_mismatch' : null;

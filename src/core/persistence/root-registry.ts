@@ -38,16 +38,26 @@ export function enclosingGitMetadata(root: string): string | null {
 /**
  * #7988: the git metadata directory of the checkout `root` belongs to: its own `.git`, or an enclosing checkout whose HEAD
  * tracks `root` (a committed subdirectory). A directory a checkout only encloses (a connector clone or a plain directory
- * under a dotfiles home) belongs to none. A Git read that fails for another reason keeps the enclosing checkout.
+ * under a dotfiles home) belongs to none, and so does a `.git`, its own or an enclosing one, that is not a repository
+ * (#9430). A Git read that fails for another reason keeps the enclosing checkout, unless the root has its own invalid
+ * `.git`: an empty file or a gitdir file pointing nowhere fails every Git read there, so nothing proves the enclosing
+ * checkout tracks it.
  */
 export function checkoutGitMetadata(root: string): string | null {
   const own = gitMetadataDirectory(root);
-  if (own) return own;
-  const enclosing = enclosingGitMetadata(root);
+  if (own && isGitDirectory(own)) return own;
+  const enclosing = enclosingGitMetadata(dirname(root));
   if (!enclosing) return null;
   try { execFileSync('git', ['-C', root, 'rev-parse', '--verify', '--quiet', 'HEAD:./'], { stdio: 'ignore', timeout: 10_000, env: gitChildEnv() }); }
-  catch (error) { if ((error as { status?: unknown }).status === 1) return null; }
+  catch (error) { if ((error as { status?: unknown }).status === 1 || existsSync(join(root, '.git')) || !isGitDirectory(enclosing)) return null; }
   return enclosing;
+}
+/** #9430: Git's own test for a repository directory: HEAD, plus objects/ and refs/ in its common directory (`commondir` in a linked worktree). */
+function isGitDirectory(metadata: string): boolean {
+  if (!existsSync(join(metadata, 'HEAD'))) return false;
+  let common = metadata;
+  try { common = resolve(metadata, readFileSync(join(metadata, 'commondir'), 'utf8').trim()); } catch { /* not a linked worktree */ }
+  return existsSync(join(common, 'objects')) && existsSync(join(common, 'refs'));
 }
 /** An idle refresh must not touch inode metadata, so chmod only when the mode differs (#5297). */
 function ensureMode(path: string, mode: number): void {
@@ -180,7 +190,13 @@ export function registeredManagedRootRecords(): Array<{ root: string; source_id?
   const directory = registryDirectory();
   let files: string[];
   try { files = readdirSync(directory); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return [];
+    // GST-1623: an unlistable registry is a typed refusal, never a raw error.
+    throw opError('writer_coordinator_required', 'Managed-root ownership records cannot be listed.',
+      `gbrain could not read ${directory} (${code ?? 'unknown error'}), so it cannot tell which checkouts this brain manages and refuses the command. Fix the path's permissions for this user (or move aside a file standing where that directory belongs), then run the command again.`);
+  }
   const records: Array<{ root: string; source_id?: string }> = [];
   for (const file of files.filter(file => file.endsWith('.json'))) {
     try {

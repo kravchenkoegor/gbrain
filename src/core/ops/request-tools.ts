@@ -159,7 +159,7 @@ const request_tools: Operation = {
   name: 'request_tools',
   idempotent: false,
   outputRedaction: 'no_stored_text',
-  description: 'More tools and params: no arguments lists your catalog; {tools: [names]} returns full schemas, every optional param included; {surface} widens it (per client or stdio session).',
+  description: 'More tools and params: no arguments lists your catalog; {tools: [names]} returns schemas with every param you may pass; {surface} widens it (per client or stdio session).',
   area: 'discovery',
   // FOV-4: callable by read OR agent scope — discovery for every token class.
   agentCallable: true,
@@ -187,18 +187,16 @@ const request_tools: Operation = {
     // callers were never surface-bounded.
     const ceiling = ctx.surfaceCeiling ?? 'full';
 
-    // D5: the three branches are mutually exclusive. {surface, tools}
-    // together is ambiguous (persist vs descriptor fetch) — reject loudly
-    // rather than silently persisting and ignoring the tools list.
+    // GBRA-449: {surface, tools} together runs the surface branch exactly as a surface-only call (its refusals
+    // included), then the descriptor branch against the resulting surface; surface_change carries the first answer.
     if (p.surface !== undefined && p.tools !== undefined) {
-      throw opError(
-        'invalid_params',
-        'pass either {surface} (persist) or {tools} (descriptor fetch), not both.',
-        'Call request_tools once with `tools` to fetch descriptors, and separately with `surface` to change this client\'s tool surface.',
-      );
+      const surfaceChange = await request_tools.handler(ctx, { surface: p.surface }) as Record<string, unknown>;
+      const changed = !surfaceChange.dry_run && (surfaceChange.persisted === true || surfaceChange.scope === 'session') && isMcpSurface(surfaceChange.surface as string);
+      const described = changed ? { ...ctx, surface: surfaceChange.surface as OperationContext['surface'] } : ctx;
+      return { ...(await request_tools.handler(described, { tools: p.tools }) as Record<string, unknown>), surface_change: surfaceChange };
     }
 
-    // ── persist branch (D5: accepts ONLY {surface}) ─────────────────────
+    // ── persist branch ({surface}) ──────────────────────────────────────
     if (p.surface !== undefined) {
       const requested = p.surface as string;
       if (!isMcpSurface(requested)) {
@@ -315,8 +313,11 @@ const request_tools: Operation = {
     // ── descriptor branch (D5: read-only) ───────────────────────────────
     if (p.tools !== undefined) {
       const requested = (p.tools as unknown[]).filter((t): t is string => typeof t === 'string');
-      // Registry definitions, not the surface-filtered ones: dispatch accepts a starter op's full-surface-only params, so the details path names them.
+      // Registry definitions less the params dispatch refuses on this connection's surface (#9669): a starter op keeps the
+      // full-surface-only params on its reviewed list (STARTER_CALLABLE_PARAMS) and drops the rest.
       const { operations } = await import('../operations.ts');
+      const { paramCallable } = await import('../../mcp/surface.ts');
+      const surfaceParams = (op: Operation): Operation => ({ ...op, params: Object.fromEntries(Object.entries(op.params).filter(([key]) => paramCallable(op, key, ctx.surface ?? 'full'))) });
       const visibleSet = new Set(visible.map(o => o.name));
       const byName = new Map(operations.filter(o => visibleSet.has(o.name)).map(o => [o.name, o]));
       const picked: Operation[] = [];
@@ -325,7 +326,7 @@ const request_tools: Operation = {
         if (seen.has(name)) continue;
         seen.add(name);
         const op = byName.get(name);
-        if (op) picked.push(op); // invisible names silently omitted (D5)
+        if (op) picked.push(surfaceParams(op)); // invisible names silently omitted (D5)
       }
       if (picked.length === 0) {
         // D1: an empty or unknown-only list gets the catalog instead of `{tools: []}`.
@@ -346,8 +347,16 @@ const request_tools: Operation = {
       const { resolveStrictParamsMode } = await import('../../mcp/validate-params.ts');
       const strictParams = (await resolveStrictParamsMode(ctx.engine, ctx.config)) === 'reject';
       if (ctx.revealTools) {
-        ctx.revealTools(picked.map(o => o.name));
-        return { tools: buildToolDefs(picked, { strictParams }), listed: true, note: 'These tools are now in your tool list (tools/list_changed was sent); call them directly.' };
+        // A widenable session's catalog reaches past what it serves; only tools it can call now are listed.
+        const callable = catalogCeiling === ceiling ? visibleSet : new Set((await visibleOpsForCaller(ctx, ceiling)).map(o => o.name));
+        const reachable = picked.filter(o => callable.has(o.name)).map(o => o.name);
+        const outside = picked.filter(o => !callable.has(o.name)).map(o => `\`${o.name}\``);
+        if (reachable.length) ctx.revealTools(reachable);
+        if (!outside.length) return { tools: buildToolDefs(picked, { strictParams }), listed: true, note: 'These tools are now in your tool list (tools/list_changed was sent); call them directly.' };
+        return {
+          tools: buildToolDefs(picked, { strictParams }), listed: false,
+          note: `${reachable.length ? `${reachable.map(n => `\`${n}\``).join(', ')} are now in your tool list (tools/list_changed was sent). ` : ''}${outside.join(', ')} are outside this session's '${ceiling}' surface, so they are not listed and cannot be called yet: call request_tools {"surface":"full"} to add them to this session, then call them by name.`,
+        };
       }
       return { tools: buildToolDefs(picked, { strictParams }) };
     }

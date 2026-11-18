@@ -32,6 +32,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import type { OperationContext } from '../ops/contract.ts';
 import { runTranscriptsIngest } from '../transcripts/ingest.ts';
 import type { TranscriptsIngestResult } from '../transcripts/ingest.ts';
 import { submitEmbedBackfill } from '../embed-backfill-submit.ts';
@@ -119,6 +120,10 @@ export interface ConnectorSyncResult {
    * request ceiling or deadline (#7515: MAX_CONNECTOR_REQUESTS_PER_RUN, --max-requests, --deadline).
    */
   stopReason?: 'consecutive_fetch_failures' | 'max_requests' | 'deadline';
+  /** Dry run: whether the listing reached its end; a listing that stopped early makes the preview `partial`. */
+  listComplete?: boolean;
+  /** Dry run: conversations a real run would fetch from what was listed. */
+  wouldFetch?: number;
   hint?: string;
 }
 
@@ -190,6 +195,8 @@ export interface ConnectorSyncOpts {
   /** Epoch ms after which the run starts no request (#7515). */
   deadlineAt?: number;
   signal?: AbortSignal;
+  /** The CLI's trusted-local operation context, handed to the transcripts ingest: a writer-claimed brain refuses the direct import without it. */
+  context?: OperationContext;
   onProgress?: (p: { phase: 'list' | 'fetch' | 'ingest'; listed: number; fetched: number; imported: number }) => void;
   deps?: ConnectorSyncDeps;
 }
@@ -268,7 +275,7 @@ export async function runConnectorSync(
   const probe = await provider.probe(client, opts.signal);
   if (!probe.ok) {
     const term = PROBE_TERMINAL[probe.kind];
-    if (term === 'auth_required') await stampAuthError(engine, opts.provider, now);
+    if (term === 'auth_required' && !opts.dryRun) await stampAuthError(engine, opts.provider, now);
     if (term) return { ...base, status: term, hint: probe.kind === 'invalid_credential' ? probe.detail : terminalHint(term, provider) };
     // drift / network → surface as forbidden-ish partial with the detail.
     return { ...base, status: 'partial', hint: `probe failed: ${probe.detail}` };
@@ -301,7 +308,7 @@ export async function runConnectorSync(
     if (e instanceof ConnectorRunLimitError) base.stopReason = e.reason;
     const term = classifyThrow(e);
     if (term) {
-      if (term === 'auth_required') await stampAuthError(engine, opts.provider, now);
+      if (term === 'auth_required' && !opts.dryRun) await stampAuthError(engine, opts.provider, now);
       return { ...base, status: term, hint: terminalHint(term, provider) };
     }
     log(`[connector] list error: ${e instanceof Error ? e.message : String(e)}`);
@@ -321,7 +328,7 @@ export async function runConnectorSync(
   }
 
   if (stubs.length === 0 && !listErrored && Object.keys(failed).length === 0) {
-    await writeConnectorState(engine, opts.provider, sourceId, 'last_sync_at', new Date(now()).toISOString());
+    if (!opts.dryRun) await writeConnectorState(engine, opts.provider, sourceId, 'last_sync_at', new Date(now()).toISOString());
     return { ...base, status: 'nothing_new' };
   }
 
@@ -339,7 +346,8 @@ export async function runConnectorSync(
   const toFetch = [...plan.retries, ...plan.listed];
 
   if (opts.dryRun) {
-    return { ...base, status: 'dry_run', listed: stubs.length, unresolved: Object.keys(failed).length, hint: `${toFetch.length} conversation(s) would be fetched` };
+    const hint = listErrored ? `the listing stopped early; ${toFetch.length} conversation(s) listed so far would be fetched` : `${toFetch.length} conversation(s) would be fetched`;
+    return { ...base, status: listErrored ? 'partial' : 'dry_run', listed: stubs.length, unresolved: Object.keys(failed).length, listComplete: !listErrored, wouldFetch: toFetch.length, hint };
   }
 
   // FETCH details + spool + ingest, in batches (memory-bounded; banks progress).
@@ -419,6 +427,7 @@ export async function runConnectorSync(
           sourceId,
           format: spoolFormat,
           embed: opts.embed ?? false,
+          context: opts.context,
         });
         importedTotal += r.pages.imported;
         skippedTotal += r.pages.skipped;

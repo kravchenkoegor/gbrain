@@ -636,7 +636,7 @@ async function assemblePack(
     for (const { name, sources: nameSources } of entities) {
       if (deadlineAt !== null && Date.now() >= deadlineAt) return;
       try {
-        const res = await buildEntityCard(engine, nameSources[0]!, name, { remote, eligibility: policy, omitQuarantined: opts.includeQuarantined !== true, sources: nameSources });
+        const res = await buildEntityCard(engine, nameSources[0]!, name, { remote, readerRemote: opts.untrusted === true, eligibility: policy, omitQuarantined: opts.includeQuarantined !== true, sources: nameSources });
         if (res.found && res.card && !acc.cards.some((c) => keyOf(c) === keyOf(res.card!))) {
           // The card's OWN source decides activation: a same-slug page in another source never gates or admits it.
           const ref = { source_id: res.card.entity.source_id, slug: res.card.entity.slug };
@@ -773,7 +773,7 @@ async function assembleDelta(
           overflow: pages.length > DELTA_PAGE_FETCH_LIMIT,
           rows: window.flatMap((p) => {
             const v = verdicts.get(pageKey({ source_id: opts.sourceId, slug: p.slug }));
-            return v && !v.belowFloor ? [{ p, trust: { ...trustFields(v.tier, v.origin), ...(v.unconfirmed ? { unconfirmed: true as const } : {}) } }] : [];
+            return v && !v.belowFloor ? [{ p, trust: { ...trustFields(v.tier, v.origin), ...(v.unconfirmed ? { unconfirmed: true as const } : {}), ...('guest' in v && v.guest ? { origin: 'guest', guest: v.guest } : {}) } }] : [];
           }).map(({ p, trust }) => ({
             slug: p.slug,
             source_id: opts.sourceId,
@@ -798,8 +798,8 @@ async function assembleDelta(
     if (!pastDeadline()) {
       try {
         const after = opts.factsAfter ?? (since ? { at: since, id: null } : null);
-        const visibility = remote ? (['world'] as ('private' | 'world')[]) : undefined;
-        const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+        const { resolveExcludePrivatePages, worldOnlyFacts } = await import('../search/private-visibility.ts');
+        const visibility = worldOnlyFacts(remote) ? (['world'] as ('private' | 'world')[]) : undefined;
         const excludePrivate = await resolveExcludePrivatePages(engine, remote ? undefined : false);
         const rows = await engine.listFactsKeyset(
           opts.sourceId,
@@ -852,7 +852,7 @@ async function assembleDelta(
     for (const name of entities) {
       if (pastDeadline()) return;
       try {
-        const res = await buildEntityCard(engine, opts.sourceId, name, { remote, eligibility: { floor: policy.floor }, omitQuarantined: true });
+        const res = await buildEntityCard(engine, opts.sourceId, name, { remote, readerRemote: opts.untrusted === true, eligibility: { floor: policy.floor }, omitQuarantined: true });
         if (res.found && res.card) {
           for (const t of res.card.open_threads ?? []) {
             if (!since || (t.date && isAfter(t.date, since))) items.push(t);
@@ -924,8 +924,8 @@ export const CHECKPOINT_LINKS_RENDER_CAP = 10;
 // emits, so `text` honors budget_tokens instead of overshooting it.
 // #5575 A6: an item carrying a trust tier renders its compact label (an
 // external item is wrapped inline as data); an unlabeled item renders as before.
-const labelOf = (item: { trust_tier?: TrustTier; origin?: string }): TrustFields =>
-  ({ trust_tier: item.trust_tier ?? 'unknown', origin: item.origin ?? 'legacy' });
+const labelOf = (item: { trust_tier?: TrustTier; origin?: string; guest?: TrustFields['guest'] }): TrustFields =>
+  ({ trust_tier: item.trust_tier ?? 'unknown', origin: item.origin ?? 'legacy', ...(item.guest ? { guest: item.guest } : {}) });
 const labeled = (item: { trust_tier?: TrustTier; origin?: string }, text: string): string =>
   item.trust_tier ? renderTrustedInline(text, labelOf(item)) : text;
 const cardSummary = (c: EntityCard, text: string): string =>

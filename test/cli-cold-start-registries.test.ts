@@ -95,7 +95,9 @@ describe('load-time registries under per-op loading', () => {
   test('every op loaded alone misses only registrations that cannot be observed incomplete', async () => {
     const registering = new Set(Object.keys(REGISTRATIONS));
     const full = (await loadedModules("await import('./src/core/operations.ts');")).filter(f => registering.has(f));
-    const names = Object.keys(OPERATION_LOADERS);
+    const byLoader = new Map<unknown, string>();
+    for (const [name, [load]] of Object.entries(OPERATION_LOADERS)) if (!byLoader.has(load)) byLoader.set(load, name);
+    const names = [...byLoader.values()];
     const missing = new Map<string, Set<string>>();
     for (let i = 0; i < names.length; i += 8) {
       await Promise.all(names.slice(i, i + 8).map(async (name) => {
@@ -120,6 +122,6 @@ describe('load-time registries under per-op loading', () => {
     };
     const alone = probe('');
     expect(alone).toEqual(probe("await import('./src/core/operations.ts');"));
-    expect(alone).toEqual(['forget', 'lower_page', 'supersede_fact', 'supersede_take']);
+    expect(alone).toEqual(['confirm', 'forget', 'lower_page', 'supersede_fact', 'supersede_take']);
   });
 });

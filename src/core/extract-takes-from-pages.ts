@@ -27,6 +27,7 @@ import {
   resolveTakesRepoDir,
   resolveTakesWritePath,
   TakesWriteError,
+  withStoredTakesFence,
 } from './takes-write.ts';
 import { getWorktreeBinding, managedPersistenceEnabled } from './persistence/ownership.ts';
 import { isWriteThroughDisabled, resolvePageWriteTarget } from './write-through.ts';
@@ -58,8 +59,13 @@ Max 15 claims per page; output [] if no gradeable claims are present.`;
 export interface ExtractTakesFromPagesOpts {
   /** Required: must be true for any work to happen (A12). */
   bootstrapEnabled: boolean;
-  /** Dry-run: classify but don't write to takes table. */
+  /**
+   * Dry-run: write nothing. Without `yes` it only lists the candidate pages
+   * and calls no model; with `yes` it also classifies them.
+   */
   dryRun?: boolean;
+  /** The user passed --yes: page content may be sent to the chat model. */
+  yes?: boolean;
   /** Scope to a single source. */
   sourceIdFilter?: string;
   /** Max pages to classify per run (caps cost). Default 50. */
@@ -93,7 +99,12 @@ export interface ExtractTakesFromPagesOpts {
 
 export interface ExtractTakesFromPagesResult {
   pages_scanned: number;
-  claims_extracted: number;
+  /** Null on a dry run without `yes`: no claims were classified. */
+  claims_extracted: number | null;
+  /** Set on a dry run without `yes`: candidates listed, nothing sent to the model. */
+  dry_run?: true;
+  /** The candidate pages a dry run without `yes` listed. */
+  candidates?: Array<{ slug: string; source_id: string }>;
   /**
    * Where the next run should resume, as `<updated_at text>,<page id>`: the
    * position of the last page this run finished with, or null if it finished
@@ -202,7 +213,9 @@ export async function extractTakesFromPages(
     };
   }
 
-  if (!isAvailable('chat')) {
+  const dryRun = opts.dryRun ?? false;
+  const listOnly = dryRun && !opts.yes;
+  if (!listOnly && !isAvailable('chat')) {
     return {
       pages_scanned: 0,
       claims_extracted: 0,
@@ -212,7 +225,6 @@ export async function extractTakesFromPages(
     };
   }
 
-  const dryRun = opts.dryRun ?? false;
   const managedJournalWrites = await managedPersistenceEnabled(engine);
   const maxPages = opts.maxPages ?? 50;
   const holder = opts.holder ?? 'system';
@@ -249,6 +261,19 @@ export async function extractTakesFromPages(
       LIMIT ${maxPages}`,
     params,
   );
+
+  if (listOnly) {
+    return {
+      ...emptyTail,
+      dry_run: true,
+      pages_scanned: pages.length,
+      claims_extracted: null,
+      next_before: pages.at(-1)?.resume_at ?? null,
+      consent_gate_blocked: false,
+      llm_unavailable: false,
+      candidates: pages.map((page) => ({ slug: page.slug, source_id: page.source_id })),
+    };
+  }
 
   let pagesScanned = 0;
   let claimsExtracted = 0;
@@ -374,9 +399,16 @@ export async function extractTakesFromPages(
     // Never append a claim the page's takes fence already holds (a rerun with
     // includeCovered, or a hand-added take): duplicate gradeable takes skew
     // calibration. The fence is canonical, so dedupe against its active rows.
-    const duplicateBody = fromDatabase
-      ? serializePageToMarkdown(managedSnapshot!.page, managedSnapshot!.tags)
-      : readFileSync(mdPath!, 'utf-8');
+    let duplicateBody: string;
+    try {
+      duplicateBody = await withStoredTakesFence(engine, page.id, fromDatabase
+        ? serializePageToMarkdown(managedSnapshot!.page, managedSnapshot!.tags)
+        : readFileSync(mdPath!, 'utf-8'));
+    } catch (err) {
+      if (!(err instanceof TakesWriteError)) throw err;
+      skipPage(page.slug, err.code);
+      continue;
+    }
     const held = new Set(parseTakesFence(duplicateBody).takes
       .filter((t) => t.active).map((t) => claimKey(t.claim, t.holder)));
     const safeClaims = claims.filter((c) => {
@@ -399,7 +431,7 @@ export async function extractTakesFromPages(
           source: 'cli:takes-bootstrap-from-pages',
         }));
       if (fromDatabase) {
-        const body = await materializeTakeResolutions(engine, managedSnapshot!.page.id, serializePageToMarkdown(managedSnapshot!.page, managedSnapshot!.tags));
+        const body = await materializeTakeResolutions(engine, managedSnapshot!.page.id, duplicateBody);
         const composed = appendTakesToPageBody(body, rows);
         const { operations } = await import('./operations.ts');
         const putPage = operations.filter(operation => !operation.localOnly).find(operation => operation.name === 'put_page');

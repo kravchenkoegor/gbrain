@@ -5,13 +5,14 @@
  *   bun scripts/ci-reuse.ts --workflow test|e2e --sha <push sha> --repo <owner/name>
  *        --output <GITHUB_OUTPUT> [--summary <GITHUB_STEP_SUMMARY>] [--record <reuse.json>]
  *
- * A push to master is a merge commit M. Its run may reuse the full run of the
- * same workflow that already ran the complete full suite on M's tree: the
- * workflow_dispatch on the PR head branch (full-ci.yml, or a hand-run
- * `gh workflow run`) or an earlier push run. Pull-request runs are the cheap
- * tier and never candidates. Fail-closed: reuse=true only when
- *   (a) M is a merge commit (two parents) whose tree equals the candidate's
- *       recorded tree;
+ * A push to master is a merge commit M or a one-parent (squashed) commit S. Its
+ * run may reuse the full run of the same workflow that already ran the complete
+ * full suite on its tree: the workflow_dispatch on the PR head branch
+ * (full-ci.yml, or a hand-run `gh workflow run`) or an earlier push run.
+ * Pull-request runs are the cheap tier and never candidates. Fail-closed:
+ * reuse=true only when
+ *   (a) the push is a merge commit (two parents) or a one-parent commit, and
+ *       its tree equals the candidate's recorded tree;
  *   (b) the candidate is a same-repository workflow_dispatch or push run
  *       whose LATEST attempt completed with conclusion success;
  *   (c) its full-suite job (`full-suite` / `e2e-full-suite`, by name, exactly
@@ -23,9 +24,16 @@
  * A diagnostic dispatch (test.yml native_only, race_hunt, stress_*; e2e.yml
  * full_corpus, order_hunt) skips the full-suite job, so (c) rejects it.
  * Candidates on head M^2 (the merged PR head) come first, newest first; then
- * recent successful dispatch and push runs whose head tree equals M's tree. Any
- * API error, cancelled, failed or in-progress attempt, missing or cheap
- * artifact, tree mismatch or non-merge push gives reuse=false with a reason.
+ * recent successful dispatch and push runs whose head tree equals M's tree. S
+ * has no merged head, so its tree alone decides: the heads with S's tree are
+ * the heads GitHub names for S (commits/<sha>/pulls), each with the first
+ * parents that still have that tree (a merge of master that changed no file),
+ * and the heads of recent dispatch and push runs with that tree. Their newest
+ * dispatch or push run decides, as in the remote gate: a newer failed or
+ * in-progress full run gives no reuse, a cancelled run or one that skipped the
+ * full job looks further back. Any API error, cancelled, failed or in-progress attempt,
+ * missing or cheap artifact, tree mismatch or root commit gives reuse=false
+ * with a reason.
  *
  * Writes reuse, source_run_id, source_run_attempt, source_sha, tree and reason
  * to --output, one summary line (the reused run URL, or the fallback reason)
@@ -64,6 +72,10 @@ export interface ReuseDeps {
   commit(sha: string): Promise<Commit>;
   runsForHead(file: string, sha: string): Promise<FullRun[]>;
   recentSuccessfulRuns(file: string): Promise<FullRun[]>;
+  /** Head commits of the pull requests GitHub associates with commit `sha` (a squashed landing names its pull request); a fork head's runs are refused like any fork run. */
+  pullHeads(sha: string): Promise<string[]>;
+  /** The newest workflow_dispatch and push runs of `file`, whatever their status (a failed run counts against its tree too). */
+  recentRuns(file: string): Promise<FullRun[]>;
   jobs(runId: number, attempt: number): Promise<JobRow[]>;
   artifact(runId: number, name: string): Promise<{ value?: unknown; reason?: string }>;
 }
@@ -105,7 +117,8 @@ export async function decide(deps: ReuseDeps, p: Profile, sha: string, repo: str
   try {
     const push = await deps.commit(sha);
     tree = push.tree;
-    if (push.parents.length !== 2) return { reuse: false, reason: 'not_merge_commit', detail: `push ${sha} has ${push.parents.length} parent(s); only a two-parent merge commit can reuse its merged head's run`, tree, rejected };
+    if (push.parents.length === 1) return await decideOneParent(deps, p, sha, tree, repo, rejected);
+    if (push.parents.length !== 2) return { reuse: false, reason: 'not_merge_commit', detail: `push ${sha} has ${push.parents.length} parent(s); only a merge commit or a one-parent commit can reuse a run`, tree, rejected };
     const head = push.parents[1]!;
     const headTree = (await deps.commit(head)).tree;
     const primary = (await deps.runsForHead(p.file, head)).filter(r => r.head_sha === head && isCandidate(r)).sort((a, b) => b.id - a.id);
@@ -134,6 +147,64 @@ export async function decide(deps: ReuseDeps, p: Profile, sha: string, repo: str
   return { reuse: false, reason: rejected[0]!.reason, detail: rejected.map(r => r.detail).join('; '), tree, rejected };
 }
 
+/**
+ * A one-parent push (a squashed landing, a hand revert, a direct push) has no merged head, so its tree alone decides:
+ * the newest full run on any head with that tree, as in the remote gate. The landed pull request's head counts, and
+ * so do its first parents with the same tree, since a merge of master that changed no file leaves the full run on the
+ * commit before it.
+ */
+async function decideOneParent(deps: ReuseDeps, p: Profile, sha: string, tree: string, repo: string, rejected: Rejection[]): Promise<Decision> {
+  const seeds: string[] = [];
+  for (const head of new Set(await deps.pullHeads(sha))) {
+    let at = head;
+    for (let i = 0; i < MAX_FALLBACK_HEADS && at !== sha && !seeds.includes(at); i++) {
+      const c = await deps.commit(at);
+      if (c.tree !== tree) break;
+      seeds.push(at);
+      if (!c.parents[0]) break;
+      at = c.parents[0];
+    }
+  }
+  const found = await newestFullRun(deps, p, await sameTreeHeads(deps, p, tree, repo, seeds, sha), tree, repo, rejected);
+  if (found && !found.why) return accept(found.run, tree, rejected, `head ${found.run.head_sha.slice(0, 12)} (same tree as the one-parent push)`);
+  if (found?.why) return { reuse: false, reason: found.why.reason, detail: `the newest full run on tree ${tree} decides: ${found.why.detail}`, tree, rejected };
+  if (!rejected.length) return { reuse: false, reason: 'no_candidate', detail: `no ${p.workflow} workflow_dispatch or push run exists on a head with tree ${tree} (the pull request heads GitHub names for one-parent push ${sha} or recent runs)`, tree, rejected };
+  return { reuse: false, reason: rejected[0]!.reason, detail: rejected.map(r => r.detail).join('; '), tree, rejected };
+}
+
+/** `seeds` plus the heads of recent dispatch and push runs whose commit has `tree`, never `skip` (the push itself). */
+async function sameTreeHeads(deps: ReuseDeps, p: Profile, tree: string, repo: string, seeds: string[], skip?: string): Promise<string[]> {
+  const shas = [...seeds];
+  const trees = new Map<string, string>();
+  for (const run of (await deps.recentRuns(p.file)).sort((a, b) => b.id - a.id)) {
+    if (!isCandidate(run) || run.head_sha === skip || shas.includes(run.head_sha) || run.head_repository?.full_name !== repo || trees.has(run.head_sha)) continue;
+    if (trees.size >= MAX_FALLBACK_HEADS) break;
+    trees.set(run.head_sha, (await deps.commit(run.head_sha)).tree);
+    if (trees.get(run.head_sha) === tree) shas.push(run.head_sha);
+  }
+  return shas;
+}
+
+/**
+ * The newest full run across `shas` that decides: a passed complete one (no `why`), or one in progress, failed or with
+ * a failed full job (`why` says which). A run that skipped its full job or lacks it (a diagnostic dispatch, a push
+ * that reused) and any other rejected run is recorded in `rejected` and passed over. Undefined when none decides.
+ */
+async function newestFullRun(deps: ReuseDeps, p: Profile, shas: string[], tree: string, repo: string, rejected: Rejection[]): Promise<{ run: FullRun; why?: Omit<Rejection, 'run_id'> } | undefined> {
+  const runs = (await Promise.all(shas.map(async sha => (await deps.runsForHead(p.file, sha)).filter(r => r.head_sha === sha && isCandidate(r) && r.head_repository?.full_name === repo)))).flat().sort((a, b) => b.id - a.id);
+  for (const run of runs) {
+    const full = (await deps.jobs(run.id, run.run_attempt)).filter(j => j.name === p.job);
+    if (full.some(j => j.conclusion === 'skipped') || (run.status === 'completed' && full.length === 0)) {
+      rejected.push({ run_id: run.id, reason: 'full_suite_missing', detail: `run ${run.id} attempt ${run.run_attempt} did not run ${p.job} (not a full-profile run)` });
+      continue;
+    }
+    const why = await reject(deps, p, run, repo, tree, tree);
+    if (!why || why.reason === 'run_in_progress' || why.reason === 'run_failed' || why.reason === 'full_suite_not_success') return { run, why };
+    rejected.push({ run_id: run.id, ...why });
+  }
+  return undefined;
+}
+
 function accept(run: FullRun, tree: string, rejected: Rejection[], where: string): Decision {
   return { reuse: true, reason: 'identical_tree_full_run', detail: `run ${run.id} attempt ${run.run_attempt} on ${where} ran the complete full suite on tree ${tree}`, tree, source: { run_id: run.id, run_attempt: run.run_attempt, sha: run.head_sha }, rejected };
 }
@@ -160,8 +231,6 @@ export interface ExecutedCounts { tests: number; failed: number; partial?: numbe
 export const LEDGER_JOB = 'executed-receipts';
 export interface GateDecision { state: GateState; detail: string; tests?: number; failed?: number; partial?: number; url?: string }
 export interface GateDeps extends ReuseDeps {
-  /** The newest workflow_dispatch and push runs of `file`, whatever their status (a failed run counts against its tree too). */
-  recentRuns(file: string): Promise<FullRun[]>;
   /** Executed (pass, fail) test identities in the run's executed-identities artifact, each job at its newest attempt (`ledgerAttempt` when an earlier attempt wrote it), or why they cannot be read. */
   executed(run: FullRun): Promise<ExecutedCounts | { reason: string; transient?: boolean }>;
 }
@@ -171,30 +240,13 @@ export async function decideGate(deps: GateDeps, p: Profile, head: string, tree:
   try {
     const headTree = (await deps.commit(head)).tree;
     if (headTree !== tree) return { state: 'none', detail: `${p.workflow}: commit ${head} has tree ${headTree} on GitHub, not the working tree ${tree}` };
-    const shas = [head];
-    const trees = new Map<string, string>();
-    for (const run of (await deps.recentRuns(p.file)).sort((a, b) => b.id - a.id)) {
-      if (!isCandidate(run) || run.head_sha === head || run.head_repository?.full_name !== repo || trees.has(run.head_sha)) continue;
-      if (trees.size >= MAX_FALLBACK_HEADS) break;
-      trees.set(run.head_sha, (await deps.commit(run.head_sha)).tree);
-      if (trees.get(run.head_sha) === tree) shas.push(run.head_sha);
+    const found = await newestFullRun(deps, p, await sameTreeHeads(deps, p, tree, repo, [head]), tree, repo, rejected);
+    if (found && !found.why) {
+      const d = await gateAccept(deps, p, found.run, tree, repo);
+      return d.state === 'rejected' && found.run.head_sha !== head ? { ...d, state: 'none' } : d;
     }
-    const runs = (await Promise.all(shas.map(async sha => (await deps.runsForHead(p.file, sha)).filter(r => r.head_sha === sha && isCandidate(r))))).flat().sort((a, b) => b.id - a.id);
-    for (const run of runs) {
-      const full = (await deps.jobs(run.id, run.run_attempt)).filter(j => j.name === p.job);
-      if (full.some(j => j.conclusion === 'skipped') || (run.status === 'completed' && full.length === 0)) {
-        rejected.push({ run_id: run.id, reason: 'full_suite_missing', detail: `run ${run.id} attempt ${run.run_attempt} did not run ${p.job} (not a full-profile run)` });
-        continue;
-      }
-      const why = await reject(deps, p, run, repo, tree, tree);
-      if (!why) {
-        const d = await gateAccept(deps, p, run, tree, repo);
-        return d.state === 'rejected' && run.head_sha !== head ? { ...d, state: 'none' } : d;
-      }
-      if (why.reason === 'run_in_progress') return { state: 'pending', detail: `${p.workflow} ${why.detail}` };
-      if (why.reason === 'run_failed' || why.reason === 'full_suite_not_success') return { state: 'failed', detail: `${p.workflow} ${why.detail}`, url: runUrl(repo, run) };
-      rejected.push({ run_id: run.id, ...why });
-    }
+    if (found?.why?.reason === 'run_in_progress') return { state: 'pending', detail: `${p.workflow} ${found.why.detail}` };
+    if (found?.why) return { state: 'failed', detail: `${p.workflow} ${found.why.detail}`, url: runUrl(repo, found.run) };
   } catch (e) {
     return { state: 'none', detail: `${p.workflow}: reading commits, runs, jobs or artifacts failed: ${e instanceof Error ? e.message : String(e)}` };
   }
@@ -293,6 +345,13 @@ export function apiDeps(client: GitHubClient): ReuseDeps {
       const pages = await Promise.all(CANDIDATE_EVENTS.map(event => client.request<{ workflow_runs: FullRun[] }>('GET', `repos/{repo}/actions/workflows/${file}/runs?event=${event}&status=success&per_page=100`)));
       return pages.flatMap(p => p.workflow_runs);
     },
+    async pullHeads(sha) {
+      return (await client.request<Array<{ head: { sha: string } }>>('GET', `repos/{repo}/commits/${sha}/pulls`)).map(pr => pr.head.sha);
+    },
+    async recentRuns(file) {
+      const pages = await Promise.all(CANDIDATE_EVENTS.map(event => client.request<{ workflow_runs: FullRun[] }>('GET', `repos/{repo}/actions/workflows/${file}/runs?event=${event}&per_page=100`)));
+      return pages.flatMap(p => p.workflow_runs);
+    },
     jobs: (runId, attempt) => attemptJobs(client, runId, attempt),
     artifact: (runId, name) => fetchArtifactJson(client, runId, name, TREE_FILE),
   };
@@ -301,10 +360,6 @@ export function apiDeps(client: GitHubClient): ReuseDeps {
 export function gateDeps(client: GitHubClient): GateDeps {
   return {
     ...apiDeps(client),
-    async recentRuns(file) {
-      const pages = await Promise.all(CANDIDATE_EVENTS.map(event => client.request<{ workflow_runs: FullRun[] }>('GET', `repos/{repo}/actions/workflows/${file}/runs?event=${event}&per_page=100`)));
-      return pages.flatMap(p => p.workflow_runs);
-    },
     async executed(run) {
       const got = await fetchArtifactJson(client, run.id, 'executed-identities', 'executed-identities.json');
       if (got.reason) return got.transient ? { reason: got.reason, transient: true } : { reason: got.reason };

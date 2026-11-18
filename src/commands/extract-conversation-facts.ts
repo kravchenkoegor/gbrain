@@ -80,7 +80,7 @@ import { countConversationFacts, enqueueManagedPage, flushManagedBatch, managedC
 import { ConversationRunClaims, listConversationPagesBySlug } from '../core/facts/conversation-enumeration.ts';
 import { BudgetTracker, BudgetExhausted, loadPricingOverrides, type BudgetReason, type NoPricingGuidance } from '../core/budget/budget-tracker.ts';
 import { noPricingMessage } from '../core/budget/no-pricing.ts';
-import { conversationFactsCostCap } from '../core/facts/conversation-budget.ts';
+import { conversationEstimateLine, conversationFactsCostCap, conversationRunEstimate } from '../core/facts/conversation-budget.ts';
 import { listSources } from '../core/sources-ops.ts';
 import {
   loadOpCheckpoint,
@@ -293,6 +293,11 @@ export interface ExtractConversationFactsCoreOpts {
    * unless dryRun; bypasses the fresh-outcome skip.
    */
   grammar?: string | null;
+  /**
+   * #7068: given a copy of the run's counters when the run ends in a thrown error, taken after the managed flush published
+   * the pages that finished, so a caller can report work that committed. The error is still thrown.
+   */
+  onInterrupted?: (partial: ExtractConversationFactsResult) => void;
 }
 
 export { extractExitCode, extractRunStatus };
@@ -347,10 +352,11 @@ export interface ExtractConversationFactsResult {
   facts_inserted: number;
   /** #7438: extracted claims left out because they match a purge tombstone (the rest of the page still publishes). */
   facts_skipped_purged?: number;
-  /** Entity values that reached the shipped deterministic fallback slug path. */
-  fallback_slugify_count: number;
+  /** Entity values that reached the shipped deterministic fallback slug path; GBRA-574 `unbacked_keys` of them kept a name key with no page. */
+  fallback_slugify_count: number; unbacked_keys?: number;
   /** Entity values kept raw after a best-effort resolution failure. */
   resolution_errors: number;
+  /** GBRA-574: windows whose slot-tagging call failed; their facts were kept without slots (--force tags them again). */ slot_tagging_failed?: number;
   /** Managed brains: pages whose publication was accepted but is still pending (retried next run). */
   pages_pending?: number;
   /** Managed brains: pages whose extraction generation is blocked until the page changes (no model call). */
@@ -991,7 +997,7 @@ async function processPage(
     pageRows.push(...window.rows);
     rowNum += window.extracted;
     mergeSaveTimeResolutionCounts(pageResolution, window.resolution);
-    state.result.fallback_slugify_count += window.resolution.fallback_slugify_count;
+    state.result.fallback_slugify_count += window.resolution.fallback_slugify_count; if (window.resolution.unbacked_key_count) state.result.unbacked_keys = (state.result.unbacked_keys ?? 0) + window.resolution.unbacked_key_count;
     state.result.resolution_errors += window.resolution.resolution_errors;
 
     newestEnd = seg.endIso;
@@ -1396,6 +1402,7 @@ export async function runExtractConversationFactsCore(
       // surface. NOT a thrown failure.
       return result;
     }
+    opts.onInterrupted?.(structuredClone(result));
     throw err;
   }
 
@@ -1797,8 +1804,9 @@ export async function runExtractConversationFacts(
       aggregate.segments_processed += perSource.segments_processed;
       aggregate.facts_extracted += perSource.facts_extracted;
       aggregate.facts_inserted += perSource.facts_inserted;
-      aggregate.fallback_slugify_count += perSource.fallback_slugify_count;
+      aggregate.fallback_slugify_count += perSource.fallback_slugify_count; if (perSource.unbacked_keys) aggregate.unbacked_keys = (aggregate.unbacked_keys ?? 0) + perSource.unbacked_keys;
       aggregate.resolution_errors += perSource.resolution_errors;
+      if (perSource.slot_tagging_failed) aggregate.slot_tagging_failed = (aggregate.slot_tagging_failed ?? 0) + perSource.slot_tagging_failed;
       if (perSource.pages_pending) aggregate.pages_pending = (aggregate.pages_pending ?? 0) + perSource.pages_pending;
       if (perSource.pages_blocked) aggregate.pages_blocked = (aggregate.pages_blocked ?? 0) + perSource.pages_blocked;
       if (perSource.pages_detection_ambiguous) aggregate.pages_detection_ambiguous = (aggregate.pages_detection_ambiguous ?? 0) + perSource.pages_detection_ambiguous;
@@ -1821,9 +1829,10 @@ export async function runExtractConversationFacts(
   // expecting an envelope. Emit the same counters as the Done: summary as one
   // JSON object on stdout; progress and diagnostics stay on stderr.
   const runStatus = extractRunStatus(aggregate);
+  const estimate = parsed.dryRun ? await conversationRunEstimate(engine, aggregate.segments_processed) : null;
   if (parsed.json) {
     console.log(JSON.stringify({
-      ...aggregate,
+      ...aggregate, ...(estimate ? { estimate } : {}),
       status: runStatus,
       ...(aggregate.pages_failed > 0 ? { next: { action: 'rerun', why: 'Failed pages stay unfinished and are retried by re-running the same command; pages that succeeded are not redone.' } } : {}),
       sources: sourceIds,
@@ -1842,6 +1851,7 @@ export async function runExtractConversationFacts(
       `Spent ~$${totalSpent.toFixed(4)}.`,
     );
     if (parsed.dryRun && parsed.slugs?.length) console.log(`  Targets: ${parsed.slugs.join(', ')}`); // #6764: the preview names what the paid run would re-extract
+    if (estimate) console.log(conversationEstimateLine(estimate));
     if (aggregate.pages_skipped > 0) {
       console.log(`  Skipped ${aggregate.pages_skipped} page(s) without eligible segments or outside the selected types:`);
       console.log(`    ${aggregate.pages_skipped_unparsed} with no parseable speaker turns (retryable); ${aggregate.pages_skipped_type_mismatch} with a type mismatch; ${aggregate.pages_skipped_insufficient_turns} with insufficient turns; ${aggregate.pages_skipped_since} with no eligible segments after --since; ${aggregate.pages_skipped_unrecognized_speaker} declined for speaker attribution.`);
@@ -1882,11 +1892,12 @@ export async function runExtractConversationFacts(
       console.log(`  Cleaned ${aggregate.orphan_facts_cleaned} orphan fact(s) from prior partial runs (D11 replay safety).`);
     }
     if (aggregate.fallback_slugify_count > 0) {
-      console.log(`  Preserved ${aggregate.fallback_slugify_count} fact(s) without an entity target after unresolved fallback_slugify.`);
+      console.log(`  Preserved ${aggregate.fallback_slugify_count - (aggregate.unbacked_keys ?? 0)} fact(s) without an entity target after unresolved fallback_slugify${aggregate.unbacked_keys ? `; kept ${aggregate.unbacked_keys} under a name key with no page (facts.unbacked_entity_keys)` : ''}.`);
     }
     if (aggregate.resolution_errors > 0) {
       console.log(`  Preserved ${aggregate.resolution_errors} fact(s) without an entity target after best-effort resolution errors.`);
     }
+    if (aggregate.slot_tagging_failed) console.log(`  Kept the facts of ${aggregate.slot_tagging_failed} window(s) without slots after slot tagging failed; --force tags them again.`);
     if (anyBudgetExhausted) {
       console.log(unpricedModels.size > 0
         ? `  no_pricing: ${[...unpricedModels].join(', ')}. Raising --max-cost-usd cannot resolve missing pricing.`

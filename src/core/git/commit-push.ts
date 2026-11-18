@@ -25,16 +25,27 @@
  * (#7010; the owner's Git effects publish this way). CLI-only; never exposed
  * over MCP (it pushes with host credentials).
  */
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, relative, resolve } from 'node:path';
-import { execFileSync } from '../spawn.ts';
-import { gitChildEnv, literalPathspecs } from '../git-env.ts';
-import { GIT_ENV, GIT_ENV_AUTH, GIT_SSRF_SUBCOMMAND_FLAGS, durableSsrfFlags } from '../git-transport.ts';
+import { rangeSecretRefusal, scanRange } from './range-secret-scan.ts';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { literalPathspecs } from '../git-env.ts';
+import { git, gitOk, type GitRun } from './git-run.ts';
+export type { SkippedPath } from './skipped-paths.ts';
+import { assertNoUnmergedPaths, withoutUnmergedPaths, checkoutBehindStrayGitfile, directoryStatus, worktreeOfGitdir, flaggedChanges, stagedRemovals, STAGED_FOR_REMOVAL_WHY, unindexedFiles, unstagedPaths, type SkippedPath } from './skipped-paths.ts';
+import { GIT_SSRF_SUBCOMMAND_FLAGS, ownRemoteTransportFlags as transportFlags } from '../git-transport.ts';
+import { canonicalFilesystemPath } from '../persistence/root-registry.ts';
 import { assertManagedFilesystemWrite, hasFilesystemPublication, managedFilesystemRootFor, type ManagedFilesystemRoot } from '../persistence/filesystem-guard.ts';
 import { acquireNativeLock, acquireNativeLockSync, type NativeLockSyncHandle } from '../persistence/native-lock.ts';
+import { pushableHead, recordCommit, recordIntent } from './commit-ledger.ts';
+import { CREDENTIAL_STATE_NAME, credentialRefusal, pushCredentialRefusedError, readCredentialRefusalFile, recordCredentialRefusalFile, type CredentialRefusalState } from './push-credential.ts';
 import { OperationError, opError } from '../ops/contract.ts';
-import { shellQuote } from '../agent-output.ts';
+import { shellQuote, type Action, type Notice } from '../agent-output.ts';
+import { onPushMode, redactUnpushed, spoolSealer, type RedactOutcome } from './redact-unpushed.ts';
+import { isSyncable } from '../sync.ts';
+import { untrackAdmitted, untrackTargets, type UntrackPageVerdict } from './untrack-admission.ts';
+export { untrackAdmitted, untrackPageCandidates } from './untrack-admission.ts';
+import { relativeEscapesRoot } from '../path-confine.ts';
 
 export const COMMIT_LOCK_NAME = 'brain-commit.lock';
 /** Taken by pre-#6530 helpers and hooks; held too so they still exclude us during the mixed-version window. */
@@ -79,6 +90,15 @@ export interface CommitPushResult {
   no_remote?: true;
   /** Conflicted files where the remote held a version this checkout had already replaced: this checkout's version was published. */
   superseded_remote_paths?: string[];
+  /** A managed canonical worktree: the named paths were committed (or had no change) and nothing was pushed. */
+  managed?: true;
+  /** GST-2988 (`secrets.on_push` redact): values that look like secrets in the unpushed commits were replaced by store markers before the push. */
+  redaction?: Pick<RedactOutcome, 'values' | 'rebuilt' | 'old_head' | 'new_head' | 'push_target' | 'backup_ref' | 'held' | 'held_commit' | 'side_refs' | 'unsigned' | 'spooled' | 'map' | 'rules'>;
+  notices?: Notice[];
+  /** Managed only: commits on the branch its upstream lacks as last fetched; null when no fetched upstream can be read. */
+  unpublished?: number | null;
+  /** Managed only: the branch's configured upstream (`origin/main`); null when it names none. */
+  upstream?: string | null;
 }
 
 export interface PullResult {
@@ -114,10 +134,19 @@ export interface CommitPushOptions {
   branch?: string;
   /** Push-only: never advance the checkout and skip its pre-push hook (a managed canonical worktree; see the header). */
   keepCheckout?: boolean;
+  /** The secret scan's time budget (`--scan-timeout`; default 300 s) and where its progress lines go. */
+  scanTimeoutMs?: number;
+  scanProgress?: (line: string) => void;
   /** Commit the pending write-through files (`--pending`) instead of named paths. */
   pending?: boolean;
+  /** `--untrack` (#7753): remove the named paths from Git and the index, keeping the files on disk. */
+  untrack?: boolean;
+  /** GST-2964: what the brain says about the code-extension files an untrack in a managed canonical worktree names (read by src/commands/git.ts); absent, they refuse. */
+  untrackPages?: UntrackPageVerdict;
   /** Commit and publish files outside the configured source root(s): the user's explicit choice, or gbrain's own scaffolding at the checkout root. */
   allowOutsideSourceRoot?: boolean;
+  /** `--base <path>=<blob>`: the blob (or `absent`) each named path had at HEAD when the writer read it; a moved one refuses `commit_base_moved`. */
+  bases?: Map<string, string>;
 }
 
 export type Resolution = { kind: 'ours' } | { kind: 'theirs' } | { kind: 'file'; path: string };
@@ -129,56 +158,13 @@ interface Ctx {
   mergeRef: string;
   trackingRef: string;
   keepCheckout?: boolean;
-}
-
-interface GitRun { code: number; stdout: string; stderr: string }
-
-function git(root: string, args: string[], opts: { auth?: boolean; timeoutMs?: number; env?: NodeJS.ProcessEnv; input?: string } = {}): GitRun {
-  const base = opts.auth ? { ...GIT_ENV_AUTH } : { ...GIT_ENV };
-  try {
-    const stdout = execFileSync('git', ['-C', root, ...args], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      input: opts.input ?? '',
-      timeout: opts.timeoutMs ?? 60_000,
-      env: gitChildEnv({ ...base, LC_ALL: 'C', LANGUAGE: 'C', ...opts.env }),
-    }).toString();
-    return { code: 0, stdout, stderr: '' };
-  } catch (e) {
-    const err = e as { status?: number | null; stdout?: Buffer | string; stderr?: Buffer | string; message?: string };
-    return {
-      code: typeof err.status === 'number' ? err.status : -1,
-      stdout: String(err.stdout ?? ''),
-      stderr: String(err.stderr ?? err.message ?? ''),
-    };
-  }
-}
-
-function gitOk(root: string, args: string[], what: string, opts: Parameters<typeof git>[2] = {}): string {
-  const r = git(root, args, opts);
-  if (r.code !== 0) {
-    throw opError('git_unavailable', `git ${what} failed in ${root}: ${r.stderr.trim().slice(0, 300) || `exit ${r.code}`}`,
-      `Run git status in ${root}, fix what git reports, then rerun the same gbrain git commit-push command.`);
-  }
-  return r.stdout.trim();
-}
-
-/**
- * Transport flags for this checkout's OWN configured remotes: no redirects, no
- * external helpers, no submodule fetch surface. The file protocol keeps git's
- * default (`user`): a bare repo on the same host is a supported brain topology
- * (the pre-#6530 helper pushed to it with plain git), and the URL is the
- * operator's own config, not remote-supplied input. GBRAIN_GIT_ALLOW_FILE_TRANSPORT
- * still forces `always` for tests.
- */
-function transportFlags(): string[] {
-  return durableSsrfFlags().flatMap((flag, i, all) =>
-    all[i - 1] === '-c' && flag.startsWith('protocol.file.allow=') && process.env.GBRAIN_GIT_ALLOW_FILE_TRANSPORT !== '1'
-      ? ['protocol.file.allow=user'] : [flag]);
+  scanTimeoutMs?: number;
+  scanProgress?: (line: string) => void;
 }
 
 /** Remote operations: transport hardening on every call, credentials allowed, no prompt. */
 function remoteGit(root: string, sub: 'fetch' | 'push', args: string[], timeoutMs = 120_000): GitRun {
-  return git(root, [...transportFlags(), sub, ...GIT_SSRF_SUBCOMMAND_FLAGS, ...args], { auth: true, timeoutMs });
+  return git(root, [...transportFlags(), sub, ...GIT_SSRF_SUBCOMMAND_FLAGS, ...args], { auth: true, timeoutMs, returnStopped: true });
 }
 
 export function gitVersion(root: string): [number, number] {
@@ -200,11 +186,12 @@ export function commitPushCommand(root: string, paths: readonly string[], messag
 
 export function checkoutRoot(dir: string): string {
   const r = git(dir, ['rev-parse', '--show-toplevel']);
-  if (r.code !== 0 || !r.stdout.trim()) {
+  const top = (r.code === 0 && r.stdout.trim()) || checkoutBehindStrayGitfile(dir);
+  if (!top) {
     throw opError('commit_paths_invalid', `${dir} is not inside a git checkout.`,
       'Run the command inside the brain checkout or pass --path <checkout>.');
   }
-  return r.stdout.trim();
+  return worktreeOfGitdir(top);
 }
 
 function resolveCtx(root: string): Ctx {
@@ -318,9 +305,12 @@ export function scopePaths(root: string, paths: string[], cwd: string): string[]
   }
   const out: string[] = [];
   for (const p of paths) {
-    const abs = resolve(cwd, p);
+    // GST-2767: a path reached through a symlinked directory (a source path linked to a subdirectory of the checkout) names
+    // the file at its real location; only the parent is resolved, so a named symlink file stays itself.
+    const named = resolve(cwd, p);
+    const abs = join(canonicalFilesystemPath(dirname(named)), basename(named));
     const rel = relative(root, abs);
-    if (rel === '' || rel === '.' || rel.startsWith('..') || isAbsolute(rel)) {
+    if (rel === '' || rel === '.' || relativeEscapesRoot(rel)) {
       throw opError('commit_paths_invalid', `Path ${p} is ${rel === '' || rel === '.' ? 'the whole checkout' : 'outside the checkout'}.`,
         'Pass the explicit file(s) you wrote inside the checkout; a repo-wide commit would sweep up other writers\' files.', { detail: p });
     }
@@ -338,7 +328,7 @@ export function configuredSourceRoots(root: string): string[] {
   for (const raw of git(root, ['config', '--get-all', SOURCE_ROOT_CONFIG]).stdout.split('\n').map(v => v.trim()).filter(Boolean)) {
     const rel = (isAbsolute(raw) ? relative(root, raw) : raw).split('\\').join('/').replace(/^(\.\/)+/, '').replace(/\/+$/, '');
     if (rel === '' || rel === '.') return [''];
-    if (!rel.startsWith('..')) roots.push(rel);
+    if (!relativeEscapesRoot(rel)) roots.push(rel);
   }
   return roots.length ? [...new Set(roots)] : [''];
 }
@@ -379,8 +369,8 @@ function withIndexRetry(root: string, args: string[], what: string, env?: NodeJS
 }
 
 /** A staged rename (`git mv`) commits both sides: committing only the new name would publish a duplicate and leave the deletion staged for another writer's commit. */
-function withRenamePartners(root: string, rel: string[]): string[] {
-  const fields = git(root, ['diff', '--cached', '-M', '--name-status', '-z']).stdout.split('\0');
+function withRenamePartners(root: string, rel: string[], env?: NodeJS.ProcessEnv): string[] {
+  const fields = git(root, ['diff', '--cached', '-M', '--name-status', '-z'], { env }).stdout.split('\0');
   const out = new Set(rel);
   for (let i = 0; i < fields.length;) {
     const status = fields[i];
@@ -394,9 +384,9 @@ function withRenamePartners(root: string, rel: string[]): string[] {
   return [...out];
 }
 
-/** Index entries that differ from HEAD, whoever staged them, with rename detection off so both sides of a rename are listed. */
-function stagedPaths(root: string): string[] {
-  return git(root, ['diff', '--cached', '--no-renames', '--name-only', '-z']).stdout.split('\0').filter(Boolean);
+/** Index entries under `rel` that differ from HEAD, whoever staged them, with rename detection off so both sides of a rename are listed. */
+function stagedPaths(root: string, rel: string[]): string[] {
+  return git(root, ['diff', '--cached', '--no-renames', '--name-only', '-z', '--', ...literalPathspecs(rel)]).stdout.split('\0').filter(Boolean);
 }
 
 /** The index entries under `rel` as `ls-files -s` records, so a failed commit can put them back exactly. */
@@ -407,60 +397,316 @@ function indexEntries(root: string, rel: string[]): string[] {
 /**
  * Put the index under `rel` back to `before` after a commit that did not land:
  * `git add` already staged the paths, and an entry left staged in the shared
- * index is what the next writer's commit without paths sweeps up.
+ * index is what the next writer's commit without paths sweeps up. `--index-info`
+ * writes fresh entries, so the skip-worktree and assume-unchanged flags in
+ * `flagged` (`ls-files -v` records) are set again: a dropped flag lets the
+ * next commit publish the edit it hid.
  */
-function restoreIndex(root: string, rel: string[], before: string[]): void {
+function restoreIndex(root: string, rel: string[], before: string[], flagged: string[]): void {
   const pathOf = (line: string) => line.slice(line.indexOf('\t') + 1);
   const kept = new Set(before.map(pathOf));
   const zero = '0'.repeat(git(root, ['rev-parse', 'HEAD']).stdout.trim().length || 40);
   const records = [...indexEntries(root, rel).map(pathOf).filter(p => !kept.has(p)).map(p => `0 ${zero}\t${p}`), ...before];
   if (records.length) withIndexRetry(root, ['update-index', '-z', '--index-info'], 'index restore', undefined, records.map(l => `${l}\0`).join(''));
+  for (const [option, pattern] of [['--skip-worktree', /^[sS] /], ['--assume-unchanged', /^[a-z] /]] as const) {
+    const paths = flagged.filter(entry => pattern.test(entry)).map(entry => `${entry.slice(2)}\0`);
+    if (paths.length) withIndexRetry(root, ['update-index', option, '-z', '--stdin'], 'index restore', undefined, paths.join(''));
+  }
 }
 
-interface CommitScope { roots: string[]; lockPath: string; markHeld: boolean }
+/**
+ * `untrack`: commit the removal of the named paths instead (#7753); `db_only` (GST-2519, a managed canonical worktree)
+ * admits only files under a storage.db_only dir HEAD's gbrain.yml declares (untrackAdmitted).
+ */
+interface CommitScope { roots: string[]; lockPath: string; markHeld: boolean; bases?: ReadonlyMap<string, string>; untrack?: 'any' | { dbOnly: ManagedFilesystemRoot; pages?: UntrackPageVerdict } }
+
+/** A named path `git add -A` left out of the index while still exiting 0 (GST-2116). */
 
 /**
- * Stage and commit exactly `rel` (the caller holds the commit lock). Refused
- * before anything is staged: a path outside the source root(s), and a file
- * another writer already staged under a named directory (name it to claim
- * it). A commit git refuses leaves the index as it found it.
+ * GST-2116: a run that left a named path uncommitted fails, after committing (and, on a classic checkout, pushing) the
+ * rest, so a write is never reported as saved when it is not. In a managed canonical worktree a skipped page is the
+ * owner's to save (`writer_coordinator_required`); anything else is `commit_paths_skipped`.
  */
-function commitPaths(root: string, rel: string[], message: string, scope: CommitScope): string | null {
-  const outside = rel.filter(p => !insideSourceRoots(p, scope.roots));
-  if (outside.length) throw outsideRootError(root, scope.roots, outside, 'Refusing to commit');
-  const swept = stagedPaths(root).filter(p => !rel.includes(p) && rel.some(spec => covers(spec, p)));
+function skippedPathsError(root: string, skipped: SkippedPath[], result: CommitPushResult, managed?: ManagedFilesystemRoot, publish?: unknown, dryRun = false): OperationError {
+  const list = `${skipped.slice(0, 20).map(s => `${s.path} (${s.reason}: ${s.why})`).join(', ')}${skipped.length > 20 ? ', ...' : ''}`;
+  const pushed = !!result.committed && (result.outcome === 'pushed' || result.outcome === 'pushed_checkout_lagging');
+  const done = result.committed
+    ? `The other named paths were committed as ${result.committed.slice(0, 7)}${pushed ? ` and pushed to ${result.remote}/${result.branch}` : ', not pushed'}.`
+    : 'Nothing was committed.';
+  const failed = publish as { code?: string; message?: string; detail?: string } | undefined;
+  const rest = `${done}${failed ? ` The push failed too (${failed.code ?? 'error'}): ${failed.message ?? String(publish)}` : ''}`;
+  const detail = JSON.stringify({ ...(dryRun ? { dry_run: true } : {}), skipped, committed: result.committed, ...(pushed ? { pushed: result.sha } : {}), branch: result.branch,
+    ...(failed ? { publish: { code: failed.code ?? null, detail: failed.detail ?? null } } : {}) });
+  const docs = 'docs/guides/shared-checkout-git.md#outcomes';
+  const flagged = skipped.filter(s => s.reason !== 'not_staged');
+  // One update-index call per flag: given both, git clears only the first.
+  const clears = (['assume_unchanged', 'skip_worktree'] as const)
+    .map(reason => ({ flag: reason === 'skip_worktree' ? '--no-skip-worktree' : '--no-assume-unchanged', paths: flagged.filter(s => s.reason === reason).map(s => s.path) }))
+    .filter(c => c.paths.length)
+    .map(c => ['git', '-C', root, 'update-index', c.flag, '--', ...c.paths]);
+  const clearCommand = clears.map(argv => shellQuote(argv)).join(' && ');
+  const flagNote = 'an assume-unchanged or skip-worktree flag; an editor, an indexer or a sparse checkout can leave one, and people also set skip-worktree on purpose to keep local edits out of commits, so clearing it commits those edits';
+  const chain = (steps: string[][], last?: Action): Action | undefined => steps.reduceRight<Action | undefined>((then, argv) =>
+    ({ argv, consent: [], actor: 'agent', requires_exclusive: false, why: 'Clears the flag so git sees the edit on disk; the file keeps its bytes.', ...(then ? { then } : {}) }), last);
+  const removals = skipped.filter(s => s.reason === 'staged_for_removal').map(s => s.path);
+  if (removals.length && removals.length === skipped.length) {
+    const quoted = removals.map(p => shellQuote([p])).join(' ');
+    return opError('commit_paths_skipped', 'git did not commit ' + skipped.length + ' named path(s) in ' + root + ': ' + list + '. They are staged for removal from Git (git rm --cached) while the files stay on disk, and commit-push does not commit that removal. ' + rest,
+      'To stop tracking them and keep the files, run gbrain git commit-push --untrack -m <msg> -- ' + quoted + '; to keep them tracked, git -C ' + shellQuote([root]) + ' restore --staged -- ' + quoted + '.',
+      { docs: 'docs/guides/shared-checkout-git.md#untrack', detail,
+        why: 'Something took these files out of the index while leaving them on disk; committing would either publish that removal or quietly add back what someone removed, and only the user knows which was meant.',
+        fix: { ask_user: true, consent: [], actor: 'user', requires_exclusive: false,
+          argv: ['git', '-C', root, 'restore', '--staged', '--', ...literalPathspecs(removals)],
+          why: 'Puts the files back in the index as HEAD has them, so the next commit-push commits their edits; the bytes on disk are untouched.',
+          user_message: 'Git has ' + removals.slice(0, 10).join(', ') + ' staged for removal while the files are still on disk, so they were not committed. Keep them in Git (git restore --staged), or stop tracking them and keep the files (gbrain git commit-push --untrack)?',
+          verify: { argv: ['git', '-C', root, 'status', '--porcelain', '--', ...literalPathspecs(removals)] } } });
+  }
+  const pages = managed ? skipped.filter(s => isSyncable(s.path)) : [];
+  if (managed && pages.length) {
+    const source = managed.sourceId ? { argv: ['--source-id', managed.sourceId], mcp: { source_id: managed.sourceId } } : { argv: [], mcp: {} };
+    const put: Action = { argv: ['gbrain', 'put', ...source.argv, '<slug>'],
+      mcp: { tool: 'put_page', arguments: { slug: '<slug>', ...source.mcp, content: '<the page file>' } },
+      inputs: [{ name: 'slug', how: `Each listed page path without its .md extension; pass the file's content on stdin: ${pages.slice(0, 5).map(s => s.path).join(', ')}` }],
+      consent: [], actor: 'agent', requires_exclusive: false,
+      why: 'put_page saves the page through the owner, which writes the file, commits only that path and pushes it.',
+      verify: { argv: ['gbrain', 'sources', 'writer', 'status', managed.sourceId ?? '<source>', '--json'] } };
+    return opError('writer_coordinator_required',
+      `${root} is the managed canonical worktree${managed.sourceId ? ` of source ${managed.sourceId}` : ''}, and git did not commit ${skipped.length} named path(s): ${list}. ${rest}`,
+      `${clears.length ? `First, with the user's agreement, clear the flags (${clearCommand}), since the owner's own Git step cannot see a flagged edit either. ` : ''}Then save those pages through gbrain (put_page, edit_page or capture; on the CLI, gbrain put${managed.sourceId ? ` --source-id ${managed.sourceId}` : ''} with the page slug and the page on stdin): the persistence owner commits and pushes them. Never commit page files around it.`,
+      { docs, detail,
+        why: 'The persistence owner is the only Git writer of pages in a managed worktree; a page file written there directly and left uncommitted is neither in Git nor in the database, so reporting success would lose the write silently.',
+        fix: { ...(chain(clears, put) ?? put), ask_user: true,
+          user_message: `These page files were written straight into the managed checkout and git did not commit them: ${pages.slice(0, 10).map(s => s.path).join(', ')}.${clears.length ? ` Git hides their edits (${flagNote}); clear the flags first.` : ''} Save each one through gbrain (put_page), which replaces the stored page with the file's content?` } });
+  }
+  return opError('commit_paths_skipped', `git did not commit ${skipped.length} named path(s) in ${root}: ${list}. ${rest}`,
+    flagged.length
+      ? `Git hides edits to the assume_unchanged and skip_worktree paths from commits. With the user's agreement clear the flags (${clearCommand}), then rerun the same commit-push.`
+      : 'Git did not stage the not_staged paths (a file inside a nested Git repository is the usual cause). Move them into the brain checkout proper, or commit them in their own repository, then rerun.',
+    { docs, detail,
+      why: 'git add stages nothing and still exits 0 for a modified file flagged assume-unchanged or skip-worktree, or a file inside a nested repository; reporting success would leave the write uncommitted with nothing in any log.',
+      fix: flagged.length
+        ? { ...chain(clears)!, ask_user: true,
+          user_message: `Git is set to ignore edits to ${flagged.slice(0, 10).map(s => s.path).join(', ')} (${flagNote}), so they were not committed. Clear those flags and commit the edits?`,
+          verify: { argv: ['git', '-C', root, 'ls-files', '-v', '--', ...flagged.map(s => s.path)] } }
+        : { consent: [], actor: 'user', requires_exclusive: false,
+          why: 'Git cannot commit a file that belongs to another repository, so only moving it or committing it there settles it.',
+          user_message: `Git did not commit ${skipped.slice(0, 10).map(s => s.path).join(', ')} in ${root} (a file inside a nested Git repository is the usual cause). Where should they be committed?` } });
+}
+
+/** `--base` keyed by the repository-relative path it names; each must also be a committed path. */
+function scopeBases(root: string, opts: CommitPushOptions, rel: string[]): Map<string, string> | undefined {
+  if (!opts.bases?.size) return undefined;
+  const scoped = new Map<string, string>();
+  for (const [path, blob] of opts.bases) {
+    const [key] = scopePaths(root, [path], opts.cwd ?? process.cwd());
+    if (!key || !rel.includes(key)) throw opError('commit_paths_invalid', `--base names ${path}, which is not one of the paths to commit.`, 'Name every --base path after -- as well.');
+    scoped.set(key, blob);
+  }
+  return scoped;
+}
+
+/**
+ * What commitPaths refuses before anything is staged (and the dry run with it): a path outside the source root(s), a
+ * `--base` blob HEAD no longer holds, and a file another writer already staged under a named directory (name it to claim it).
+ */
+function admitPaths(root: string, rel: string[], roots: string[], bases?: ReadonlyMap<string, string>, dryRun = false): void {
+  const outside = rel.filter(p => !insideSourceRoots(p, roots));
+  if (outside.length) throw outsideRootError(root, roots, outside, 'Refusing to commit');
+  assertNoUnmergedPaths(root, rel);
+  for (const [path, base] of bases ?? []) {
+    const head = git(root, ['rev-parse', '--verify', '-q', `HEAD:${path}`]).stdout.trim() || 'absent';
+    if (head !== base) throw opError('commit_base_moved', `${path} changed at HEAD since the writer read it (base ${base}, HEAD ${head}).`,
+      `Nothing was staged or committed. Read ${path} at HEAD again (git -C ${root} show HEAD:${path}), redo the change on it, and rerun with --base ${path}=${head}.`,
+      { detail: JSON.stringify({ path, base, head }), docs: 'docs/guides/shared-checkout-git.md#base-check' });
+  }
+  const swept = stagedPaths(root, rel).filter(p => !rel.includes(p) && rel.some(spec => covers(spec, p)));
+  const removed = new Set(stagedRemovals(root, swept));
+  if (swept.length && swept.every(p => removed.has(p))) {
+    const branch = git(root, ['symbolic-ref', '--quiet', '--short', 'HEAD']).stdout.trim();
+    throw skippedPathsError(root, swept.map(path => ({ path, reason: 'staged_for_removal' as const, why: STAGED_FOR_REMOVAL_WHY })),
+      { outcome: 'nothing_to_commit', sha: null, committed: null, branch, remote: '', paths: rel, integrated: 0, checkout: 'unchanged' }, undefined, undefined, dryRun);
+  }
   if (swept.length) {
     const list = `${swept.slice(0, 10).join(', ')}${swept.length > 10 ? ', ...' : ''}`;
     throw opError('commit_prestaged_paths', `${swept.length} file(s) under the named path(s) were already staged by another writer: ${list}.`,
-      'Nothing was staged or committed. If they are yours, name each file explicitly; otherwise leave them to the writer that staged them, or unstage them with the user\'s agreement (git restore --staged -- <file>; the working tree keeps its bytes).',
+      'Nothing was staged or committed. If they are yours, name each file explicitly; otherwise leave them to the writer that staged them, or unstage them with the user\'s agreement (git restore --staged -- <file>; the working tree keeps its bytes). Files a parked gbrain Git effect left staged are gbrain\'s own: gbrain sources writer status lists the parked effects with their source and request id, and gbrain sources writer retry-effects with that source and --request-id commits them.',
       { detail: JSON.stringify({ paths: swept }), fix: { ask_user: true, consent: [], actor: 'user', requires_exclusive: false,
-        argv: ['git', '-C', root, 'restore', '--staged', '--', ...swept],
+        argv: ['git', '-C', root, 'restore', '--staged', '--', ...literalPathspecs(swept)],
         why: 'Another writer staged these files; committing them would publish whatever that writer had in progress, and unstaging them drops its staging.',
         user_message: `Files already staged by another writer sit under the path you asked to commit (${list}). Commit only the files you name, or unstage those (their bytes stay on disk)?`,
         docs: 'docs/guides/shared-checkout-git.md#outcomes' } });
   }
-  const before = indexEntries(root, rel);
-  const add = withIndexRetry(root, ['add', '-A', '--', ...literalPathspecs(rel)], 'git add');
-  if (add.code !== 0) {
-    throw opError('commit_paths_invalid', 'git add refused the given paths.', add.stderr.trim().slice(0, 300) || 'Check the paths exist or are tracked.');
+}
+
+/** The named paths' `ls-files -v` records that carry the assume-unchanged or skip-worktree flag. */
+function flaggedEntries(root: string, rel: string[]): string[] {
+  return gitOk(root, ['ls-files', '-v', '-z', '--', ...literalPathspecs(rel)], 'ls-files -v').split('\0').filter(entry => /^[a-zS] /.test(entry));
+}
+
+/**
+ * Stage `rel` for a commit; returns the named skip-worktree files on disk it left out. GST-2118: git add refuses a named
+ * skip-worktree file that is on disk; it is left to the skipped-path check, so the other paths still commit. #7984: a
+ * tracked path stages with `add -u`, because `add -A` refuses a deletion whose only match left is an ignored path;
+ * visible untracked files stage with `add -A`; a path already staged as deleted is staged. Any other path keeps git's own
+ * refusal (missing, or only an ignored untracked file). `indexCopy` (#7752) stages into the index copy `env` names, with
+ * no index-lock retry, so a dry run sees the rename pairs the real staging makes.
+ */
+function stagePaths(root: string, rel: string[], before: string[], flagged: string[], env?: NodeJS.ProcessEnv, indexCopy = false): Set<string> {
+  const skipWorktree = new Set(flagged.filter(entry => /^[sS] /.test(entry)).map(entry => entry.slice(2)));
+  const sparse = new Set([...skipWorktree].filter(p => rel.includes(p) && existsSync(join(root, p))));
+  const live = rel.filter(p => !sparse.has(p));
+  const listed = (args: string[]) => live.length ? git(root, [...args, '-z', '--', ...literalPathspecs(live)], { env }).stdout.split('\0').filter(Boolean) : [];
+  const tracked = before.map(line => line.slice(line.indexOf('\t') + 1)).filter(p => !skipWorktree.has(p));
+  const untracked = listed(['ls-files', '--others', '--exclude-standard']);
+  const deleted = listed(['diff', '--cached', '--no-renames', '--name-only', '--diff-filter=D']);
+  const matching = (paths: string[]) => live.filter(spec => paths.some(p => covers(spec, p)));
+  const matched = new Set(matching([...tracked, ...untracked, ...deleted]));
+  const unmatched = live.filter(spec => !matched.has(spec));
+  for (const [mode, specs] of [['-u', matching(tracked)], ['-A', matching(untracked)], ['-A', unmatched]] as const) {
+    if (!specs.length) continue;
+    const args = ['add', mode, '--', ...literalPathspecs(specs)];
+    const add = indexCopy ? git(root, args, { env }) : withIndexRetry(root, args, 'git add', env);
+    if (add.code !== 0) throw opError('commit_paths_invalid', 'git add refused the given paths.', add.stderr.trim().slice(0, 300) || 'Check the paths exist or are tracked.');
   }
+  return sparse;
+}
+
+/**
+ * Stage and commit exactly `rel` (the caller holds the commit lock), after admitPaths. A commit git refuses leaves the
+ * index as it found it. `skipped` lists the named paths git left out (GST-2116); the rest are still committed.
+ */
+function commitPaths(root: string, rel: string[], message: string, scope: CommitScope): { sha: string | null; skipped: SkippedPath[] } {
+  admitPaths(root, rel, scope.roots, scope.bases);
+  const dirtyBefore = directoryStatus(root, rel);
+  const before = indexEntries(root, rel);
+  const flagged = flaggedEntries(root, rel);
+  if (scope.untrack) return { sha: untrackPaths(root, rel, message, scope, before, flagged), skipped: [] };
+  let landed: { committed: boolean; paths: string[]; listed: string[] };
   try {
+    const sparse = stagePaths(root, rel, before, flagged);
     const paths = withRenamePartners(root, rel);
     const partners = paths.filter(p => !insideSourceRoots(p, scope.roots));
     if (partners.length) throw outsideRootError(root, scope.roots, partners, 'A staged rename would commit');
-    if (git(root, ['diff', '--cached', '--quiet', '--', ...literalPathspecs(paths)]).code === 0) return null;
-    const env = { [COMMIT_VIA_ENV]: scope.lockPath, ...(scope.markHeld ? { [COMMIT_LOCK_ENV]: scope.lockPath } : {}) };
-    // #7759: literal per path, never git's global --literal-pathspecs: Git exports that to the commit's hooks, where a
-    // guard's glob pathspec ('*.json') then matches nothing and lets the commit through.
-    const commit = withIndexRetry(root, ['commit', '--only', '-m', message, '--', ...literalPathspecs(paths)], 'git commit', env);
+    // A file git did not index would fail `commit --only` for every path; it is left out here and reported as skipped.
+    const listed = gitOk(root, ['ls-files', '-v', '-z', '--', ...literalPathspecs(paths)], 'ls-files -v').split('\0').filter(Boolean);
+    const unindexed = new Set(unindexedFiles(root, paths, listed));
+    const staged = paths.filter(p => !unindexed.has(p) && !sparse.has(p));
+    if (!staged.length || git(root, ['diff', '--cached', '--quiet', '--', ...literalPathspecs(staged)]).code === 0) {
+      landed = { committed: false, paths, listed };
+    } else {
+      const env = { [COMMIT_VIA_ENV]: scope.lockPath, ...(scope.markHeld ? { [COMMIT_LOCK_ENV]: scope.lockPath } : {}) };
+      // #7759: literal per path, never git's global --literal-pathspecs: Git exports that to the commit's hooks, where a
+      // guard's glob pathspec ('*.json') then matches nothing and lets the commit through.
+      recordIntent(root, { writer: 'commit_push', head_before: git(root, ['rev-parse', '--verify', '--quiet', 'HEAD']).stdout.trim() || null, message });
+      const commit = withIndexRetry(root, ['commit', '--only', '-m', message, '--', ...literalPathspecs(staged)], 'git commit', env);
+      if (commit.code !== 0) {
+        throw opError('git_unavailable', `git commit failed in ${root}; the paths were unstaged again and keep their bytes.`,
+          `${commit.stderr.trim().slice(0, 300)} A missing git identity (user.name, user.email) or a refusing pre-commit hook are common causes.`);
+      }
+      landed = { committed: true, paths, listed };
+    }
+  } catch (e) {
+    try { restoreIndex(root, rel, before, flagged); } catch { /* the index lock outlasted the retries; the error below still stands */ }
+    throw e;
+  }
+  // GST-2116: after the try, so a failure from here on never restores the index under a commit that landed.
+  const sha = landed.committed ? gitOk(root, ['rev-parse', 'HEAD'], 'rev-parse HEAD') : null;
+  if (sha) recordCommit(root, { sha, writer: 'commit_push' });
+  return { sha, skipped: unstagedPaths(root, landed.paths, landed.listed, dirtyBefore, sha) };
+}
+
+/** The source roots a dry run checks paths against; a managed canonical worktree refuses --allow-outside-source-root as its real run does. */
+function previewRoots(root: string, allowOutsideSourceRoot?: boolean): { managed: ManagedFilesystemRoot | null; roots: string[] } {
+  const managed = managedFilesystemRootFor(root);
+  if (managed && allowOutsideSourceRoot) {
+    throw opError('commit_paths_invalid', `${root} is the managed canonical worktree${managed.sourceId ? ` of source ${managed.sourceId}` : ''}: commit-push there only commits the paths you name.`,
+      `Run gbrain git commit-push with only -m and the page paths after --; gbrain sources refresh${managed.sourceId ? ` ${managed.sourceId}` : ''} brings remote commits in.`);
+  }
+  return { managed, roots: allowOutsideSourceRoot ? [''] : configuredSourceRoots(root) };
+}
+
+/**
+ * #7752: `--dry-run` of a commit runs the real run's path checks in its order: the source roots, `--base` and files
+ * another writer staged (admitPaths), the real run's staging (stagePaths) and the source roots of a staged rename's other
+ * side. Staging goes into a temporary copy of the index, so the preview takes no lock and leaves the real index and the
+ * worktree as they were (git may add loose objects for the staged files); each refusal carries the real run's code and text.
+ */
+export function previewPaths(root: string, rel: string[], opts: { allowOutsideSourceRoot?: boolean; bases?: Map<string, string>; cwd?: string } = {}): void {
+  const { managed, roots } = previewRoots(root, opts.allowOutsideSourceRoot);
+  admitPaths(root, rel, roots, scopeBases(root, { repo: root, bases: opts.bases, cwd: opts.cwd }, rel), true);
+  const dir = mkdtempSync(join(tmpdir(), 'gbrain-preview-'));
+  try {
+    const index = join(dir, 'index');
+    const live = absGitPath(root, 'index');
+    if (existsSync(live)) copyFileSync(live, index);
+    const env = { GIT_INDEX_FILE: index };
+    stagePaths(root, rel, indexEntries(root, rel), flaggedEntries(root, rel), env, true);
+    const partners = withRenamePartners(root, rel, env).filter(p => !insideSourceRoots(p, roots));
+    if (partners.length) throw outsideRootError(root, roots, partners, 'A staged rename would commit');
+    const listed = gitOk(root, ['ls-files', '-v', '-z', '--', ...literalPathspecs(rel)], 'ls-files -v', { env }).split('\0').filter(Boolean);
+    const skipped = unstagedPaths(root, rel, listed, new Map(), null);
+    const branch = git(root, ['symbolic-ref', '--quiet', '--short', 'HEAD']).stdout.trim();
+    if (skipped.length) throw skippedPathsError(root, skipped, { outcome: 'nothing_to_commit', sha: null, committed: null, branch, remote: '', paths: rel, integrated: 0, checkout: 'unchanged' }, managed ?? undefined, undefined, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * `--dry-run --untrack`: the real run's path checks (source roots, the files HEAD holds, and in a managed canonical
+ * worktree the storage.db_only admission) with no lock taken and nothing written; each refusal is the real run's.
+ */
+export function previewUntrack(root: string, rel: string[], opts: { allowOutsideSourceRoot?: boolean; untrackPages?: UntrackPageVerdict } = {}): string[] {
+  const { managed, roots } = previewRoots(root, opts.allowOutsideSourceRoot);
+  const outside = rel.filter(p => !insideSourceRoots(p, roots));
+  if (outside.length) throw outsideRootError(root, roots, outside, 'Refusing to commit');
+  return managed ? untrackAdmitted(root, rel, managed, opts.untrackPages) : untrackTargets(root, rel);
+}
+
+/**
+ * #7753: commit the removal of `rel` from Git, keeping the files on disk, under the caller's commit lock. The index
+ * loses the entries (`git rm --cached`), and the commit is built from HEAD in a temporary index (`commit --only` would
+ * stage the files again), so nothing else staged rides along. It must change exactly the files HEAD held under `rel`,
+ * each deleted: a commit carrying anything else (a pre-commit hook staging a sibling) is taken back before anything is
+ * published, and the index is restored.
+ */
+function untrackPaths(root: string, rel: string[], message: string, scope: CommitScope, before: string[], flagged: string[]): string {
+  const removed = scope.untrack === 'any' || !scope.untrack ? untrackTargets(root, rel) : untrackAdmitted(root, rel, scope.untrack.dbOnly, scope.untrack.pages);
+  const parent = gitOk(root, ['rev-parse', 'HEAD'], 'rev-parse HEAD');
+  const rm = withIndexRetry(root, ['rm', '--cached', '-r', '-q', '--ignore-unmatch', '--', ...literalPathspecs(rel)], 'git rm --cached');
+  if (rm.code !== 0) {
+    try { restoreIndex(root, rel, before, flagged); } catch { /* the refusal below still stands */ }
+    throw opError('commit_paths_invalid', 'git rm --cached refused the given paths.', rm.stderr.trim().slice(0, 300) || 'Check the paths exist or are tracked.');
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'gbrain-untrack-'));
+  try {
+    const env = { GIT_INDEX_FILE: join(dir, 'index') };
+    gitOk(root, ['read-tree', parent], 'read-tree', { env });
+    gitOk(root, ['update-index', '-z', '--force-remove', '--stdin'], 'update-index', { env, input: removed.map(p => `${p}\0`).join('') });
+    recordIntent(root, { writer: 'commit_push', head_before: parent, message });
+    const commit = git(root, ['commit', '-q', '-m', message], { timeoutMs: 120_000,
+      env: { ...env, [COMMIT_VIA_ENV]: scope.lockPath, ...(scope.markHeld ? { [COMMIT_LOCK_ENV]: scope.lockPath } : {}) } });
     if (commit.code !== 0) {
-      throw opError('git_unavailable', `git commit failed in ${root}; the paths were unstaged again and keep their bytes.`,
+      throw opError('git_unavailable', `git commit failed in ${root}; the paths are tracked again and keep their bytes.`,
         `${commit.stderr.trim().slice(0, 300)} A missing git identity (user.name, user.email) or a refusing pre-commit hook are common causes.`);
     }
-    return gitOk(root, ['rev-parse', 'HEAD'], 'rev-parse HEAD');
+    const head = gitOk(root, ['rev-parse', 'HEAD'], 'rev-parse HEAD');
+    recordCommit(root, { sha: head, writer: 'commit_push' });
+    const fields = git(root, ['diff-tree', '-r', '--no-renames', '--name-status', '-z', parent, head]).stdout.split('\0').filter(Boolean);
+    const landed = new Set(fields.flatMap((status, i) => (i % 2 ? [] : [`${status}\t${fields[i + 1]}`])));
+    const wanted = new Set(removed.map(p => `D\t${p}`));
+    const extra = [...landed].filter(e => !wanted.has(e)).map(e => e.slice(e.indexOf('\t') + 1));
+    const missing = removed.filter(p => !landed.has(`D\t${p}`));
+    const first = git(root, ['rev-parse', '--verify', '--quiet', `${head}^1`]).stdout.trim();
+    if (first === parent && !extra.length && !missing.length) return head;
+    const undo = git(root, ['update-ref', '-m', 'gbrain: take back an untrack commit that changed other paths', 'HEAD', first, head]);
+    throw opError('git_unavailable', `The untrack commit ${first !== parent ? 'was built on a HEAD that moved' : `changed ${[...extra, ...missing].slice(0, 10).join(', ')} beyond deleting the named paths`}, so ${undo.code === 0 ? 'it was taken back and nothing is committed' : `commit ${head.slice(0, 12)} is left unpublished`}.`,
+      'A pre-commit hook or another process changed the commit. Rerun the same gbrain git commit-push --untrack command once it is done.');
   } catch (e) {
-    try { restoreIndex(root, rel, before); } catch { /* the index lock outlasted the retries; the error below still stands */ }
+    try { restoreIndex(root, rel, before, flagged); } catch { /* the index lock outlasted the retries; the error below still stands */ }
     throw e;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
@@ -468,7 +714,7 @@ function commitPaths(root: string, rel: string[], message: string, scope: Commit
 
 export interface PendingWriteThrough { path: string; since: string }
 
-const PENDING_NOTED = new Set(['commit_lock_busy', 'git_index_locked', 'git_index_stale', 'git_unavailable', 'git_operation_in_progress']);
+const PENDING_NOTED = new Set(['commit_lock_busy', 'git_index_locked', 'git_index_stale', 'git_unavailable', 'git_command_stopped', 'git_operation_in_progress', 'commit_paths_unmerged']);
 
 function readPendingFile(file: string, into: Map<string, string>): void {
   let text: string;
@@ -517,7 +763,10 @@ export function notePending(root: string, paths: string[]): void {
 function dirtyPaths(root: string, paths: string[]): Set<string> {
   const out = new Set<string>();
   for (let i = 0; i < paths.length; i += 500) {
-    const entries = git(root, ['status', '--porcelain', '-z', '--untracked-files=all', '--', ...literalPathspecs(paths.slice(i, i + 500))]).stdout.split('\0');
+    const specs = literalPathspecs(paths.slice(i, i + 500));
+    // GST-2118: status is blind to an assume-unchanged or skip-worktree entry, so a flagged edit is read from HEAD.
+    for (const { path } of flaggedChanges(root, git(root, ['ls-files', '-v', '-z', '--', ...specs]).stdout.split('\0').filter(Boolean))) out.add(path);
+    const entries = git(root, ['status', '--porcelain', '-z', '--untracked-files=all', '--', ...specs]).stdout.split('\0');
     for (let j = 0; j < entries.length; j++) {
       if (entries[j].length < 4) continue;
       out.add(entries[j].slice(3));
@@ -528,7 +777,7 @@ function dirtyPaths(root: string, paths: string[]): Set<string> {
 }
 
 /** Drop ledger entries whose file no longer differs from HEAD (the caller holds the commit lock). New lines appended meanwhile go to a fresh ledger file. */
-function settlePending(root: string): void {
+export function settlePending(root: string): void {
   try {
     const file = absGitPath(root, PENDING_NAME);
     const settle = `${file}.settle`;
@@ -537,8 +786,8 @@ function settlePending(root: string): void {
     const entries = new Map<string, string>();
     readPendingFile(settle, entries);
     readPendingFile(moved, entries);
-    const dirty = dirtyPaths(root, [...entries.keys()]);
-    const keep = [...entries].filter(([path]) => dirty.has(path)).map(([path, since]) => `${since}\t${JSON.stringify(path)}\n`);
+    const dirty = (() => { try { return dirtyPaths(root, [...entries.keys()]); } catch { return null; } })();
+    const keep = [...entries].filter(([path]) => !dirty || dirty.has(path)).map(([path, since]) => `${since}\t${JSON.stringify(path)}\n`);
     if (keep.length) { writeFileSync(`${settle}.tmp`, keep.join('')); renameSync(`${settle}.tmp`, settle); }
     else rmSync(settle, { force: true });
     rmSync(moved, { force: true });
@@ -554,7 +803,8 @@ function settlePending(root: string): void {
  * doctor's `dirty_age` reports. It never commits without the lock: that races
  * other writers on the shared index. Paths must sit under `repo` (the source
  * root). No marker is set, so the post-commit hook publishes. Returns the new
- * commit, or null when the paths had no change.
+ * commit, or null when the paths had no change. A named path git left out fails
+ * `commit_paths_skipped` after the rest is committed (GST-2116).
  */
 export function commitPathsLocked(repo: string, rel: string[], message: string, opts: { lockWaitMs: number }): string | null {
   const root = checkoutRoot(repo);
@@ -562,24 +812,31 @@ export function commitPathsLocked(repo: string, rel: string[], message: string, 
   assertNoOperationInProgress(root);
   const paths = scopePaths(root, rel, root);
   const own = relative(realpathSync(root), realpathSync(repo)).split('\\').join('/');
-  const roots = [own.startsWith('..') ? '' : own];
+  const roots = [relativeEscapesRoot(own) ? '' : own];
   let lock: CommitLock;
   try { lock = acquireCommitLock(root, opts.lockWaitMs); } catch (e) {
     if (PENDING_NOTED.has((e as { code?: string }).code ?? '')) notePending(root, paths);
     throw e;
   }
   try {
-    const pending = [...dirtyPaths(root, readPendingWriteThrough(root).map(e => e.path).filter(p => !paths.includes(p) && insideSourceRoots(p, roots)))];
+    const pending = withoutUnmergedPaths(root, [...dirtyPaths(root, readPendingWriteThrough(root).map(e => e.path).filter(p => !paths.includes(p) && insideSourceRoots(p, roots)))]);
     const scope = { roots, lockPath: lock.lockPath, markHeld: false };
-    let sha: string | null;
+    let commit: ReturnType<typeof commitPaths>;
     try {
-      sha = commitPaths(root, [...paths, ...pending], pending.length ? `${message} (+${pending.length} pending write-through file(s))` : message, scope);
+      commit = commitPaths(root, [...paths, ...pending], pending.length ? `${message} (+${pending.length} pending write-through file(s))` : message, scope);
     } catch (e) {
       if (!pending.length) throw e;
-      sha = commitPaths(root, paths, message, scope);
+      commit = commitPaths(root, paths, message, scope);
     }
+    // GST-2118: a file git left out stays in the ledger, so doctor dirty_age reports it and --pending retries it loudly.
+    const ownSkipped = commit.skipped.filter(s => paths.includes(s.path));
+    if (ownSkipped.length) notePending(root, ownSkipped.map(s => s.path));
     settlePending(root);
-    return sha;
+    if (ownSkipped.length) {
+      const branch = git(root, ['symbolic-ref', '--quiet', '--short', 'HEAD']).stdout.trim();
+      throw skippedPathsError(root, ownSkipped, { outcome: commit.sha ? 'committed_local' : 'nothing_to_commit', sha: commit.sha, committed: commit.sha, branch, remote: '', paths, integrated: 0, checkout: 'unchanged' });
+    }
+    return commit.sha;
   } catch (e) {
     if (PENDING_NOTED.has((e as { code?: string }).code ?? '')) notePending(root, paths);
     throw e;
@@ -709,6 +966,7 @@ function integrate(root: string, local: string, remote: string): Integration {
     for (const p of step.conflicts) conflicts.add(p);
     for (const p of step.structural) structural.add(p);
     acc = gitOk(root, ['commit-tree', '--no-gpg-sign', step.tree!, '-p', acc, '-m', 'gbrain: replay'], 'commit-tree');
+    recordCommit(root, { sha: acc, writer: 'replay', ref: null });
   }
   return { tree: treeOf(root, acc), conflicts: [...conflicts], structural: [...structural], skipped };
 }
@@ -799,13 +1057,13 @@ function conflictError(ctx: Ctx, ours: string, theirs: string, merged: MergeTree
   const compare = `Compare the two versions (this machine's: git show ${local}:<path>; the remote's: git show ${remote}:<path>)`;
   const fix = merged.structural.length
     ? `${preface}The local commit ${local} stays local and the checkout is unchanged. ${merged.structural.map(shellWord).join(', ')} ${merged.structural.length === 1 ? 'is' : 'are'} a file/directory or rename conflict that a per-file choice cannot resolve. ${compare}, then move or remove the local path in a new commit (gbrain git commit-push -m "<msg>" -- <paths>) and rerun gbrain git commit-push --push-only. See docs/guides/shared-checkout-git.md#conflicts.`
-    : `${preface}The local commit ${local} stays local and the checkout is unchanged. ${compare}, then run gbrain git commit-push --push-only${ctx.keepCheckout ? ' --keep-checkout' : ''} --expect-remote ${remote} ${paths.map(p => `--resolve ${shellWord(p)}=ours|theirs`).join(' ')} (ours = this machine's version, theirs = the remote's, or =file:<path> with a merged copy). Until then every push from this checkout reports this conflict. See docs/guides/shared-checkout-git.md#conflicts.`;
+    : `${preface}The local commit ${local} stays local and the checkout is unchanged. ${compare}, then run gbrain git commit-push --push-only${ctx.keepCheckout ? ' --keep-checkout' : ''} --scan-secrets --expect-remote ${remote} ${paths.map(p => `--resolve ${shellWord(p)}=ours|theirs`).join(' ')} (ours = this machine's version, theirs = the remote's, or =file:<path> with a merged copy). Until then every push from this checkout reports this conflict. See docs/guides/shared-checkout-git.md#conflicts.`;
   return opError('integrate_conflict', `Local and remote commits both changed ${paths.length} file(s) on ${ctx.branch}; nothing was merged.`, fix,
     { detail: JSON.stringify({ local: ours, remote: theirs, paths, structural: merged.structural, ...(merged.superseded?.length ? { superseded: merged.superseded } : {}) }),
       fix: { ask_user: true, consent: [], actor: 'user', requires_exclusive: false,
         why: 'Choosing which version of a file wins discards the other side; ask the user before resolving.',
         user_message: `Both this machine and the remote changed ${paths.join(', ')}. Which version should win, or should they be merged by hand?`,
-        ...(merged.structural.length ? {} : { argv: ['gbrain', 'git', 'commit-push', '--push-only', ...(ctx.keepCheckout ? ['--keep-checkout'] : []), '--path', ctx.root, '--expect-remote', theirs, ...paths.flatMap(p => ['--resolve', `${p}=<ours|theirs>`])] }),
+        ...(merged.structural.length ? {} : { argv: ['gbrain', 'git', 'commit-push', '--push-only', ...(ctx.keepCheckout ? ['--keep-checkout'] : []), '--scan-secrets', '--path', ctx.root, '--expect-remote', theirs, ...paths.flatMap(p => ['--resolve', `${p}=<ours|theirs>`])] }),
         docs: 'docs/guides/shared-checkout-git.md#conflicts' } });
 }
 
@@ -814,7 +1072,9 @@ function buildMerge(ctx: Ctx, ours: string, theirs: string, tree: string, skippe
   const remote = `${ctx.remote}/${ctx.mergeRef.replace(/^refs\/heads\//, '')}`;
   const note = skipped.length
     ? ['-m', `Left out ${skipped.length} local commit(s) whose patch ${remote} already has: ${skipped.slice(0, 20).map(s => s.slice(0, 12)).join(' ')}${skipped.length > 20 ? ' ...' : ''}`] : [];
-  return gitOk(ctx.root, ['commit-tree', tree, '-p', ours, '-p', theirs, '-m', `gbrain: merge ${remote} into ${ctx.branch}`, ...note, ...extra.flatMap(m => ['-m', m])], 'commit-tree');
+  const sha = gitOk(ctx.root, ['commit-tree', tree, '-p', ours, '-p', theirs, '-m', `gbrain: merge ${remote} into ${ctx.branch}`, ...note, ...extra.flatMap(m => ['-m', m])], 'commit-tree');
+  recordCommit(ctx.root, { sha, writer: 'merge', ref: null });
+  return sha;
 }
 
 function fetchTracking(ctx: Ctx): string | null {
@@ -840,17 +1100,41 @@ function remoteContains(ctx: Ctx, sha: string): boolean {
   if (urls.length === 0) return false;
   for (const url of urls) {
     if (git(ctx.root, ['ls-remote', '--get-url', '--', url]).stdout.trim() !== url) return false;
-    const listed = git(ctx.root, [...transportFlags(), 'ls-remote', '--exit-code', '--', url, branchRef], { auth: true, timeoutMs: 60_000 });
+    const listed = git(ctx.root, [...transportFlags(), 'ls-remote', '--exit-code', '--', url, branchRef], { auth: true, timeoutMs: 60_000, returnStopped: true });
     if (listed.code !== 0) return false;
     const tip = listed.stdout.split(/\s/)[0];
     if (!/^[0-9a-f]{40,64}$/.test(tip)) return false;
     if (git(ctx.root, ['cat-file', '-e', `${tip}^{commit}`]).code !== 0) {
-      const got = git(ctx.root, [...transportFlags(), 'fetch', '--quiet', ...fetchFlags(ctx.root), ...GIT_SSRF_SUBCOMMAND_FLAGS, '--', url, tip], { auth: true, timeoutMs: 120_000 });
+      const got = git(ctx.root, [...transportFlags(), 'fetch', '--quiet', ...fetchFlags(ctx.root), ...GIT_SSRF_SUBCOMMAND_FLAGS, '--', url, tip], { auth: true, timeoutMs: 120_000, returnStopped: true });
       if (got.code !== 0) return false;
     }
     if (!isAncestor(ctx.root, sha, tip)) return false;
   }
   return true;
+}
+
+/** GST-2456: the base a scanned push is scanned from and leased on: the fetched tip, or with pushurls (#5138) the one commit every push URL holds live (or none has the branch); else push_unconfirmed. */
+function pushBase(ctx: Ctx, fetched: string, candidate: string): string {
+  const urls = git(ctx.root, ['remote', 'get-url', '--push', '--all', '--', ctx.remote]).stdout.split('\n').map(u => u.trim()).filter(Boolean);
+  if (urls.length === 1 && urls[0] === git(ctx.root, ['remote', 'get-url', '--', ctx.remote]).stdout.trim()) return fetched;
+  const refuse = (why: string) => opError('push_unconfirmed', `Nothing was pushed: ${why}, so no one scanned range covers what this push would publish to every push URL of ${ctx.remote}.`,
+    `Bring every push URL of ${ctx.remote} to the same commit of ${ctx.mergeRef.replace(/^refs\/heads\//, '')} (git remote get-url --push --all ${ctx.remote} lists them), then rerun gbrain git commit-push --push-only.`,
+    { detail: candidate, retryable: true });
+  const tips = new Set<string>();
+  for (const url of urls) {
+    if (git(ctx.root, ['ls-remote', '--get-url', '--', url]).stdout.trim() !== url) throw refuse(`push URL ${url} names another remote`);
+    const listed = git(ctx.root, [...transportFlags(), 'ls-remote', '--exit-code', '--', url, ctx.mergeRef], { auth: true, timeoutMs: 60_000, returnStopped: true });
+    if (listed.code === 2) { tips.add(''); continue; }
+    const tip = listed.code === 0 ? listed.stdout.split(/\s/)[0] ?? '' : '';
+    if (!/^[0-9a-f]{40,64}$/.test(tip)) throw refuse(`push URL ${url} could not be read`);
+    if (git(ctx.root, ['cat-file', '-e', `${tip}^{commit}`]).code !== 0
+      && git(ctx.root, [...transportFlags(), 'fetch', '--quiet', ...fetchFlags(ctx.root), ...GIT_SSRF_SUBCOMMAND_FLAGS, '--', url, tip], { auth: true, timeoutMs: 120_000, returnStopped: true }).code !== 0) {
+      throw refuse(`the commit push URL ${url} holds could not be fetched`);
+    }
+    tips.add(tip);
+  }
+  if (tips.size !== 1) throw refuse(`the push URLs hold different commits of ${ctx.mergeRef.replace(/^refs\/heads\//, '')}`);
+  return [...tips][0]!;
 }
 
 interface Published { sha: string; integrated: number; confirmed: 'push' | 'remote'; quarantined?: QuarantineEntry; superseded?: string[] }
@@ -896,6 +1180,11 @@ export function readQuarantine(repo: string): QuarantineEntry[] {
  */
 function publish(ctx: Ctx, start: string, resolutions: Map<string, Resolution> | undefined, expectRemote: string | undefined, cwd: string): Published {
   const bound = expectRemote && !resolutions?.size ? gitOk(ctx.root, ['rev-parse', '--verify', `${expectRemote}^{commit}`], 'rev-parse --expect-remote') : undefined;
+  // #8896: every publish (GST-2650: the derived write-through and a handed-off request too) scans <base>..<candidate> before
+  // every push and leases the push on that base, so a remote that moved or was rewound since the tracking ref was fetched (a
+  // stale ref hides commits from the scan) is fetched and scanned again; a missing tracking ref is fetched first, so the scan
+  // covers what the remote lacks, never its whole history.
+  let scannedBase = pushBase(ctx, git(ctx.root, ['rev-parse', '--verify', '--quiet', ctx.trackingRef]).stdout.trim() || (fetchTracking(ctx) ?? ''), start);
   let candidate = start;
   let integrated = 0;
   let lastError = '';
@@ -911,12 +1200,18 @@ function publish(ctx: Ctx, start: string, resolutions: Map<string, Resolution> |
     if (attempt) Atomics.wait(sleeper, 0, 0, Math.min(2000, 50 * 2 ** attempt) + Math.floor(Math.random() * 100));
     let remoteTip = bound && !isAncestor(ctx.root, bound, candidate) ? bound : null;
     if (!remoteTip) {
-      const push = remoteGit(ctx.root, 'push', [...(ctx.keepCheckout ? ['--no-verify'] : []), ...(bound ? [`--force-with-lease=${ctx.mergeRef}:${bound}`] : []), '--', ctx.remote, `${candidate}:${ctx.mergeRef}`]);
-      if (push.code === 0) return { sha: candidate, integrated, confirmed: 'push', ...notes() };
-      lastError = push.stderr.trim();
+      const lease = bound ?? scannedBase;
+      assertNoSecretsInRange({ ...ctx, trackingRef: lease }, candidate);
+      const push = lease && !isAncestor(ctx.root, lease, candidate) ? null
+        : remoteGit(ctx.root, 'push', ['--no-follow-tags', '--recurse-submodules=no', ...(ctx.keepCheckout ? ['--no-verify'] : []), `--force-with-lease=${ctx.mergeRef}:${lease}`, '--', ctx.remote, `${candidate}:${ctx.mergeRef}`]);
+      if (push?.code === 0) return { sha: candidate, integrated, confirmed: 'push', ...notes() };
+      if (push) lastError = push.stderr.trim();
       if (remoteContains(ctx, candidate)) return onRemote();
+      const refused = push ? credentialRefusal(push.stderr) : null;
+      if (refused) throw pushCredentialRefusedError(ctx.root, ctx.remote, ctx.mergeRef.replace(/^refs\/heads\//, ''), refused, candidate);
       remoteTip = fetchTracking(ctx);
       if (!remoteTip) break;
+      scannedBase = pushBase(ctx, remoteTip, candidate);
       if (bound && remoteTip !== bound) {
         throw opError('push_unconfirmed', `The remote moved to ${remoteTip.slice(0, 12)} after --expect-remote ${bound.slice(0, 12)} was checked, so nothing was pushed: publishing now could merge back commits a rewrite removed.`,
           'Check the remote history first (gbrain sources refresh checks it for a force-push), then rerun.', { detail: candidate, retryable: true });
@@ -926,6 +1221,7 @@ function publish(ctx: Ctx, start: string, resolutions: Map<string, Resolution> |
         continue;
       }
     }
+    assertNoSecretsInRange({ ...ctx, trackingRef: remoteTip }, candidate);
     const raw = integrate(ctx.root, candidate, remoteTip);
     const kept = supersededPaths(ctx.root, candidate, remoteTip, raw, resolutions);
     const merged = kept.length
@@ -953,7 +1249,7 @@ function publish(ctx: Ctx, start: string, resolutions: Map<string, Resolution> |
   }
   if (remoteContains(ctx, candidate)) return onRemote();
   throw opError('push_unconfirmed', `The commit is durable locally but no push to ${ctx.remote}/${ctx.mergeRef.replace(/^refs\/heads\//, '')} was confirmed.`,
-    `git push failed (network, credentials, branch protection, or a remote that kept moving): ${lastError.slice(0, 500) || 'no detail'}. Rerun gbrain git commit-push --push-only once the remote is reachable; never git pull --rebase in this checkout.`,
+    `git push failed (network, credentials, branch protection, or a remote that kept moving): ${lastError.slice(0, 500) || 'no detail'}. Rerun gbrain git commit-push --push-only${ctx.keepCheckout ? ' --keep-checkout' : ''} --scan-secrets once the remote is reachable; never git pull --rebase in this checkout.`,
     { detail: candidate, retryable: true });
 }
 
@@ -986,10 +1282,17 @@ function assertLocalCommitsInsideRoots(ctx: Ctx, target: string, roots: string[]
     `A commit made without gbrain git commit-push (for example a cron's git add plus git commit) can carry files other writers had staged. Show the user git show --stat ${offending[0].sha.slice(0, 12)}; if they want it published as is, rerun with --allow-outside-source-root. See docs/guides/shared-checkout-git.md#source-roots.`,
     { detail: JSON.stringify({ roots, commits: offending }),
       fix: { ask_user: true, consent: [], actor: 'user', requires_exclusive: false,
-        argv: ['gbrain', 'git', 'commit-push', '--push-only', '--allow-outside-source-root', '--path', ctx.root],
+        argv: ['gbrain', 'git', 'commit-push', '--push-only', ...(ctx.keepCheckout ? ['--keep-checkout'] : []), '--scan-secrets', '--allow-outside-source-root', '--path', ctx.root],
         why: 'These commits change files that are not the brain\'s; publishing them can overwrite other projects\' or writers\' work on the remote.',
         user_message: `Local commit(s) ${shas} change files outside the brain's folder (${files.slice(0, 5).join(', ')}${files.length > 5 ? ', ...' : ''}). Publish them anyway?`,
         docs: 'docs/guides/shared-checkout-git.md#source-roots' } });
+}
+
+/** The automatic-publish secret gate: scan what the commits in trackingRef..target add (publish passes the base it leases its push on, under its lock). */
+function assertNoSecretsInRange(ctx: Ctx, target: string): void {
+  const refusal = rangeSecretRefusal(ctx.root, ctx.trackingRef, target, scanRange(ctx.root, ctx.trackingRef, target, ctx.scanTimeoutMs, ctx.scanProgress), {
+    timeoutMs: ctx.scanTimeoutMs, retryArgv: ['gbrain', 'git', 'commit-push', '--push-only', ...(ctx.keepCheckout ? ['--keep-checkout'] : []), '--branch', ctx.mergeRef.replace(/^refs\/heads\//, ''), '--path', ctx.root] });
+  if (refusal) throw refusal;
 }
 
 /** Advance the shared checkout (caller holds the commit lock) with a real compare-and-swap: fast-forward only, hooks off, never autostash. */
@@ -1041,6 +1344,24 @@ export function readIntegrateConflict(repo: string): IntegrateConflictState | nu
   }
 }
 
+/** GST-2961: the push refusal for the credential git used, recorded for this checkout until a push lands (by any route: when the remote pushes to the one URL it fetches from, a refused commit already on the remote-tracking ref is past), if any. */
+export function readCredentialRefusal(repo: string): CredentialRefusalState | null {
+  try {
+    const root = checkoutRoot(repo);
+    const state = readCredentialRefusalFile(absGitPath(root, CREDENTIAL_STATE_NAME));
+    const pushesWhereItFetches = () => {
+      const push = git(root, ['remote', 'get-url', '--push', '--all', '--', state!.remote]);
+      const fetch = git(root, ['remote', 'get-url', '--', state!.remote]);
+      const urls = push.stdout.trim().split('\n');
+      return push.code === 0 && fetch.code === 0 && urls.length === 1 && urls[0] === fetch.stdout.trim();
+    };
+    if (state?.commit && state.remote && state.branch && pushesWhereItFetches() && isAncestor(root, state.commit, `refs/remotes/${state.remote}/${state.branch}`)) return null;
+    return state;
+  } catch {
+    return null;
+  }
+}
+
 function recordConflict(root: string, branch: string, e: unknown): void {
   try {
     const d = JSON.parse(String((e as { detail?: string }).detail ?? '{}'));
@@ -1068,7 +1389,12 @@ function commitManagedPaths(root: string, opts: CommitPushOptions, managed: Mana
     throw opError('commit_paths_invalid', `${where}: commit-push there only commits the paths you name.`,
       `Run gbrain git commit-push with only -m and the page paths after --; gbrain sources refresh${managed.sourceId ? ` ${managed.sourceId}` : ''} brings remote commits in.`);
   }
-  return commitPathsOnly(root, opts, where, configuredSourceRoots(root), 'Leave the checkout to its owner; gbrain sources writer status names its state.');
+  const { result: committed, skipped } = commitPathsOnly(root, opts, where, configuredSourceRoots(root), 'Leave the checkout to its owner; gbrain sources writer status names its state.', managed);
+  const counted = git(root, ['rev-list', '--count', '@{upstream}..HEAD']);
+  const upstream = git(root, ['for-each-ref', '--format=%(upstream:short)', `refs/heads/${committed.branch}`]).stdout.trim();
+  const result: CommitPushResult = { ...committed, managed: true, unpublished: counted.code === 0 ? Number(counted.stdout.trim()) : null, upstream: upstream || null };
+  if (skipped.length) throw skippedPathsError(root, skipped, result, managed);
+  return result;
 }
 
 /** A checkout with no Git remote at all: no remote is configured and the branch names none (a named but missing remote is refused by resolveCtx). A git command that fails is not proof of "no remote". */
@@ -1087,11 +1413,14 @@ function commitRemotelessPaths(root: string, opts: CommitPushOptions): CommitPus
     throw opError('commit_paths_invalid', `${where}; commit-push there only commits the paths you name.`,
       'Run gbrain git commit-push -m <msg> -- <paths> to commit them locally, or add a remote (git remote add origin <url>) and set the branch upstream to publish.');
   }
-  return { ...commitPathsOnly(root, opts, where, opts.allowOutsideSourceRoot ? [''] : configuredSourceRoots(root), 'Check out a branch (git switch <branch>), then rerun.'), no_remote: true };
+  const { result: committed, skipped } = commitPathsOnly(root, opts, where, opts.allowOutsideSourceRoot ? [''] : configuredSourceRoots(root), 'Check out a branch (git switch <branch>), then rerun.');
+  const result: CommitPushResult = { ...committed, no_remote: true };
+  if (skipped.length) throw skippedPathsError(root, skipped, result);
+  return result;
 }
 
 /** Commit only the named paths under the commit lock and nothing more: no fetch, merge, push or checkout move. */
-function commitPathsOnly(root: string, opts: CommitPushOptions, where: string, roots: string[], detachedFix: string): CommitPushResult {
+function commitPathsOnly(root: string, opts: CommitPushOptions, where: string, roots: string[], detachedFix: string, managed?: ManagedFilesystemRoot): { result: CommitPushResult; skipped: SkippedPath[] } {
   if (!opts.message?.trim()) throw opError('commit_paths_invalid', 'A commit message is required.', 'Pass the commit message with -m.');
   const rel = scopePaths(root, opts.paths ?? [], opts.cwd ?? process.cwd());
   if (!rel.length) throw opError('commit_paths_invalid', `${where}: name the paths to commit.`, 'Pass -- <paths> after the message.');
@@ -1099,20 +1428,23 @@ function commitPathsOnly(root: string, opts: CommitPushOptions, where: string, r
   if (!branch) throw opError('git_detached_head', `${root} is on a detached HEAD, so there is no branch to commit to.`, detachedFix);
   assertNoOperationInProgress(root);
   const lock = acquireCommitLock(root, opts.lockWaitMs);
-  let committed: string | null;
+  let commit: ReturnType<typeof commitPaths>;
   try {
     assertNoOperationInProgress(root);
-    committed = commitPaths(root, rel, opts.message.trim(), { roots, lockPath: lock.lockPath, markHeld: true });
+    commit = commitPaths(root, rel, opts.message.trim(), { roots, lockPath: lock.lockPath, markHeld: true, bases: scopeBases(root, opts, rel),
+      ...(opts.untrack ? { untrack: managed ? { dbOnly: managed, pages: opts.untrackPages } : 'any' as const } : {}) });
   } finally {
     lock.release();
   }
+  const committed = commit.sha;
   const remote = git(root, ['config', '--get', `branch.${branch}.remote`]).stdout.trim();
-  return { outcome: committed ? 'committed_local' : 'nothing_to_commit', sha: committed, committed, branch, remote, paths: rel, integrated: 0, checkout: 'unchanged' };
+  return { result: { outcome: committed ? 'committed_local' : 'nothing_to_commit', sha: committed, committed, branch, remote, paths: rel, integrated: 0, checkout: 'unchanged' }, skipped: commit.skipped };
 }
 
 export function commitAndPush(opts: CommitPushOptions): CommitPushResult {
   const root = checkoutRoot(opts.repo);
   if (opts.keepCheckout && !opts.pushOnly) throw opError('commit_paths_invalid', 'keepCheckout publishes commits already on the branch; it commits nothing.', 'Use --push-only --keep-checkout.');
+  if (opts.untrack && (opts.pushOnly || opts.pending)) throw opError('commit_paths_invalid', 'untrack removes the paths you name; it does not combine with push-only or pending.', 'Use --untrack -m <msg> -- <paths>.');
   const managed = opts.keepCheckout || opts.pushOnly ? null : managedFilesystemRootFor(root);
   if (managed && !hasFilesystemPublication(root)) return commitManagedPaths(root, opts, managed);
   if (!opts.keepCheckout) assertManagedFilesystemWrite(root);
@@ -1126,16 +1458,19 @@ export function commitAndPush(opts: CommitPushOptions): CommitPushResult {
     throw opError('commit_paths_invalid', 'A commit message is required.', 'Pass -m "<message>".');
   }
   const upstream = resolveCtx(root);
-  const ctx = { ...withBranch(upstream, opts.branch), ...(opts.keepCheckout ? { keepCheckout: true } : {}) };
+  const ctx = { ...withBranch(upstream, opts.branch), ...(opts.keepCheckout ? { keepCheckout: true } : {}),
+    ...(opts.scanTimeoutMs ? { scanTimeoutMs: opts.scanTimeoutMs } : {}), ...(opts.scanProgress ? { scanProgress: opts.scanProgress } : {}) };
   const elsewhere = ctx.mergeRef !== upstream.mergeRef;
   assertNoOperationInProgress(root);
 
   let committed: string | null = null;
+  let skipped: SkippedPath[] = [];
   if (!opts.pushOnly) {
     const lock = acquireCommitLock(root, opts.lockWaitMs);
     try {
       assertNoOperationInProgress(root);
-      committed = rel.length ? commitPaths(root, rel, opts.message!.trim(), { roots: opts.allowOutsideSourceRoot ? [''] : roots, lockPath: lock.lockPath, markHeld: true }) : null;
+      if (rel.length) ({ sha: committed, skipped } = commitPaths(root, rel, opts.message!.trim(), { roots: opts.allowOutsideSourceRoot ? [''] : roots, lockPath: lock.lockPath, markHeld: true, bases: scopeBases(root, opts, rel),
+        ...(opts.untrack ? { untrack: managed ? { dbOnly: managed, pages: opts.untrackPages } : 'any' as const } : {}) }));
       settlePending(root);
     } finally {
       lock.release();
@@ -1151,28 +1486,51 @@ export function commitAndPush(opts: CommitPushOptions): CommitPushResult {
     writeFileSync(requestPath, `${process.pid}\n`);
     pub = acquireNativeLockSync(publishLockPath, { timeoutMs: 0 });
   }
+  const unpublished: CommitPushResult = { outcome: 'committed_local', sha: null, committed, branch: ctx.branch, remote: ctx.remote, paths: rel, integrated: 0, checkout: 'unchanged' };
   if (!pub) {
     if (unattended) {
-      return { outcome: 'push_deferred', sha: null, committed, branch: ctx.branch, remote: ctx.remote, paths: rel, integrated: 0, checkout: 'unchanged' };
+      const deferred: CommitPushResult = { ...unpublished, outcome: 'push_deferred' };
+      if (skipped.length) throw skippedPathsError(root, skipped, deferred);
+      return deferred;
     }
-    throw opError('push_unconfirmed', `${committed ? 'The commit is durable locally, but another' : 'Another'} publish held this checkout's push lock for ${Math.round(waitMs / 1000)}s.`,
-      `The running publish was asked to push HEAD too once it finishes. Rerun gbrain git commit-push --push-only to confirm; never git pull --rebase in this checkout.`,
+    const busy = opError('push_unconfirmed', `${committed ? 'The commit is durable locally, but another' : 'Another'} publish held this checkout's push lock for ${Math.round(waitMs / 1000)}s.`,
+      `The running publish was asked to push HEAD too once it finishes. Rerun gbrain git commit-push --push-only${ctx.keepCheckout ? ' --keep-checkout' : ''} --scan-secrets to confirm; never git pull --rebase in this checkout.`,
       { detail: committed ?? '', retryable: true });
+    if (skipped.length) throw skippedPathsError(root, skipped, unpublished, undefined, busy);
+    throw busy;
   }
 
+  let redaction: RedactOutcome | undefined;
   const cycle = (onlyWhenClean: boolean, start: string | null, resolutions?: Map<string, Resolution>, expectRemote?: string) => {
     const requested = existsSync(requestPath);
     rmSync(requestPath, { force: true });
     try {
-      const head = gitOk(root, ['rev-parse', 'HEAD'], 'rev-parse HEAD');
-      const target = start && !isAncestor(root, start, head) ? start : head;
+      let head = gitOk(root, ['rev-parse', 'HEAD'], 'rev-parse HEAD');
+      const fromHead = !(start && !isAncestor(root, start, head));
+      let target = fromHead ? pushableHead(root, head) : start!;
       if (!opts.allowOutsideSourceRoot) assertLocalCommitsInsideRoots(ctx, target, roots);
-      const published = publish(ctx, target, resolutions, expectRemote, cwd);
+      let published: Published;
+      try {
+        published = publish(ctx, target, resolutions, expectRemote, cwd);
+      } catch (e) {
+        // GST-2988: with secrets.on_push redact (the default), the checked-out branch's unpushed commits are rebuilt with store markers and published.
+        if ((e as { code?: string }).code !== 'publish_secret_found' || !fromHead || elsewhere || onPushMode() !== 'redact') throw e;
+        const base = git(root, ['rev-parse', '--verify', '--quiet', ctx.trackingRef]).stdout.trim();
+        const outcome = redactUnpushed(root, { base, sealer: spoolSealer(root, null), publishLockHeld: true, lockWaitMs: opts.lockWaitMs, ...(opts.scanTimeoutMs ? { budgetMs: opts.scanTimeoutMs } : {}) });
+        if (!outcome || !('redacted' in outcome)) throw e;
+        redaction = outcome;
+        head = outcome.new_head;
+        target = outcome.push_target;
+        if (!opts.allowOutsideSourceRoot) assertLocalCommitsInsideRoots(ctx, target, roots);
+        published = publish(ctx, target, resolutions, expectRemote, cwd);
+      }
       if (!elsewhere) rmSync(absGitPath(root, CONFLICT_STATE_NAME), { force: true });
+      rmSync(absGitPath(root, CREDENTIAL_STATE_NAME), { force: true });
       const moved = published.sha === head || elsewhere || opts.keepCheckout ? { checkout: 'unchanged' as const } : advanceWithLock(root, published.sha, head, onlyWhenClean, opts.lockWaitMs);
       return { published, moved };
     } catch (e) {
       if ((e as { code?: string }).code === 'integrate_conflict' && !elsewhere) recordConflict(root, ctx.branch, e);
+      if ((e as { code?: string }).code === 'push_credential_refused') recordCredentialRefusalFile(absGitPath(root, CREDENTIAL_STATE_NAME), e);
       if (requested) writeFileSync(requestPath, `${process.pid}\n`);
       throw e;
     }
@@ -1181,6 +1539,9 @@ export function commitAndPush(opts: CommitPushOptions): CommitPushResult {
   let first: ReturnType<typeof cycle>;
   try {
     first = cycle(unattended, committed, opts.resolutions, opts.expectRemote);
+  } catch (e) {
+    if (skipped.length) throw skippedPathsError(root, skipped, unpublished, undefined, e);
+    throw e;
   } finally {
     pub.release();
   }
@@ -1192,13 +1553,17 @@ export function commitAndPush(opts: CommitPushOptions): CommitPushResult {
   }
 
   const { published, moved } = first;
-  return {
+  const result: CommitPushResult = {
     outcome: moved.checkout === 'lagging' ? 'pushed_checkout_lagging' : committed || opts.pushOnly ? 'pushed' : 'nothing_to_commit',
     sha: published.sha, committed, branch: ctx.branch, remote: ctx.remote, paths: rel,
     integrated: published.integrated, confirmed: published.confirmed, checkout: moved.checkout, ...(moved.reason ? { lagging_reason: moved.reason } : {}),
     ...(published.quarantined ? { quarantined: published.quarantined } : {}),
     ...(published.superseded ? { superseded_remote_paths: published.superseded } : {}),
+    ...(redaction ? { redaction: { values: redaction.values, rebuilt: redaction.rebuilt, old_head: redaction.old_head, new_head: redaction.new_head, push_target: redaction.push_target, backup_ref: redaction.backup_ref,
+      held: redaction.held, held_commit: redaction.held_commit, side_refs: redaction.side_refs, unsigned: redaction.unsigned, spooled: redaction.spooled, map: redaction.map, rules: redaction.rules }, ...(redaction.notices.length ? { notices: redaction.notices } : {}) } : {}),
   };
+  if (skipped.length) throw skippedPathsError(root, skipped, result);
+  return result;
 }
 
 /**

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Windows hidden-console guard (#4992; docs/TESTING.md#windows-hidden-console-guard).
+ * Windows hidden-console guard (#4992; docs/ci-guards.md#windows-hidden-console-guard).
  *
  * On Windows a detached gbrain child has no console, so every console program
  * it launches without `windowsHide` opens a visible console window that takes
@@ -26,7 +26,7 @@ import { join, relative } from 'node:path';
 import ts from 'typescript';
 
 const ROOT = process.env.GBRAIN_GUARD_ROOT ?? join(import.meta.dir, '..');
-const ANCHOR = 'docs/TESTING.md#windows-hidden-console-guard';
+const ANCHOR = 'docs/ci-guards.md#windows-hidden-console-guard';
 const SEAM = 'src/core/spawn.ts';
 const MODULES = new Set(['child_process', 'node:child_process']);
 
@@ -42,7 +42,6 @@ const ALLOWLIST: Record<string, string> = {
  */
 const NOT_YET_MIGRATED: Record<string, string> = {
   'src/commands/bootstrap.ts': 'not yet migrated: open PR #6283, #6319 edits this file',
-  'src/commands/serve.ts': 'not yet migrated: open PR #6437 edits this file',
   'src/commands/setup.ts': 'not yet migrated: open PR #6406 edits this file',
   'src/commands/takes.ts': 'not yet migrated: open PR #6505 edits this file',
   'src/core/harness/install.ts': 'not yet migrated: open PR #6319, #6406 edits this file',

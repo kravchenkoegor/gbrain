@@ -192,8 +192,11 @@ export const UNKNOWN_PARAM_ALLOWLIST: ReadonlySet<string> = new Set(['_meta', 'd
  */
 const PARAM_ALIAS_HINTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   add_timeline_entry: { content: 'detail', text: 'detail', body: 'detail' },
-  remember: { facts: 'items', text: 'fact' },
+  remember: { facts: 'items', text: 'fact', source: 'provenance' },
 };
+
+/** GBRA-431: source-scope spellings edit distance ties or misses (`sources` is as near `source_id` as `source_ids`). */
+const SOURCE_PARAM_ALIASES: Readonly<Record<string, string>> = { source: 'source_id', sourceid: 'source_id', sources: 'source_ids', sourceids: 'source_ids' };
 
 /**
  * `_meta.warnings` entry shape (amendment 13) — documented in
@@ -226,18 +229,45 @@ export function findUnknownParams(op: Operation, params: Record<string, unknown>
   const warnings: UnknownParamWarning[] = [];
   for (const key of Object.keys(params)) {
     if (declaredSet.has(key) || UNKNOWN_PARAM_ALLOWLIST.has(key)) continue;
-    const alias = aliases?.[key];
+    const alias = aliases?.[key] ?? SOURCE_PARAM_ALIASES[key.toLowerCase().replace(/[^a-z]/g, '')];
     const nearest = alias && declaredSet.has(alias) ? alias : suggestNearest(key, declared);
     warnings.push({ code: 'unknown_param', param: key, ...(nearest ? { suggestion: nearest } : {}) });
   }
   return warnings;
 }
 
+/** The families of parameter names that narrow a read's result: a source scope or a type, tag, entity, date, trust or visibility filter. */
+const NARROWING_FAMILIES: readonly RegExp[] = [
+  /^sources?(id|ids|name|names)?$/, /^(types?|kinds?)$/, /^tags?$/, /^(entity|entities)$/,
+  /^(since|until|after|before)$/, /^(min)?trust$/, /^visibility$/,
+];
+
+function narrowingFamily(name: string): RegExp | undefined {
+  const normalized = name.toLowerCase().replace(/[^a-z]/g, '');
+  return NARROWING_FAMILIES.find(family => family.test(normalized));
+}
+
 /**
- * Render the model-visible warn-mode notice lines (one per unknown key) that
- * dispatch appends as an extra text content block on the RESULT — the same
- * D8 second-block mechanism that carries empty-retrieval loudness, so the
- * grace period actually corrects clients instead of warning into a void.
+ * GBRA-431: the unknown keys a read must refuse whatever `mcp.strict_params` says, because ignoring them answers
+ * unnarrowed: a key whose nearest declared param is a scope or filter (`source` for `source_id`, `type` for `types`),
+ * or whose own name is in a scope or filter family the op declares (`source_name` on an op declaring `source_id`,
+ * `kind` on one declaring `types`). A key whose family the op does not declare cannot narrow it, so it keeps the warn
+ * grace period like any other unknown key (a client adding `source_id` to every call).
+ */
+export function narrowingUnknownParams(warnings: readonly UnknownParamWarning[], declared: readonly string[]): UnknownParamWarning[] {
+  const declaredFamilies = new Set(declared.map(narrowingFamily).filter(family => family !== undefined));
+  return warnings.filter(w => {
+    if (w.suggestion !== undefined && narrowingFamily(w.suggestion)) return true;
+    const family = narrowingFamily(w.param);
+    return family !== undefined && declaredFamilies.has(family);
+  });
+}
+
+/**
+ * The warn-mode notice lines (one per unknown key) hosts before GST-900 appended
+ * as an extra content block. Dispatch no longer sends it (the warning lives in
+ * `_meta.warnings` only, so harnesses never store it in a turn); it stays the
+ * reference for the old-host block `ignoredRemoteParams` still parses.
  */
 export function buildUnknownParamWarnBlock(warnings: UnknownParamWarning[]): string {
   return warnings

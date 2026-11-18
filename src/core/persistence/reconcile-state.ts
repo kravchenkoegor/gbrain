@@ -8,8 +8,9 @@ import { alignWithStored } from './align-stored.ts';
 import { parseDataFrontmatter } from '../data-frontmatter.ts';
 import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
-import type { PageSnapshot } from '../page-state/types.ts';
-import { isWriteTargetContained } from '../path-confine.ts';
+import { REVISION_BACKFILL_PENDING, type PageSnapshot } from '../page-state/types.ts';
+import { revisionBackfillExhausted, REVISION_BACKFILL_RESUME_COMMAND } from '../page-state/revision-backfill-schema.ts';
+import { isWriteTargetContained, relativeEscapesRoot } from '../path-confine.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode, scannerSourcePath } from '../write-through.ts';
 import { absentCanonicalPath, findLiveFileClaimants, recordedReconcilePath, type FileClaimTarget } from './file-claims.ts';
 import { wholeBodySnapshot } from './segmented-apply.ts';
@@ -108,7 +109,7 @@ export function canonicalDeletionState(root: string, path: string): 'in_head' | 
   if (!head.ok) return head.reason === 'exit' && head.status === 1 ? 'gone' : 'unknown';
   let repoPath: string;
   try { repoPath = relative(realpathSync(top.stdout.toString('utf8').trim()), absentCanonicalPath(path)).split(sep).join('/'); } catch { return 'unknown'; }
-  if (!repoPath || repoPath.startsWith('..')) return 'unknown';
+  if (!repoPath || relativeEscapesRoot(repoPath)) return 'unknown';
   const listed = hardenedGitSync(root, ['ls-tree', '-z', '--full-tree', 'HEAD', '--', repoPath], limits);
   if (!listed.ok) return 'unknown';
   return listed.stdout.toString('utf8').split('\0').some(entry => entry.split('\t')[1] === repoPath) ? 'in_head' : 'gone';
@@ -213,6 +214,18 @@ async function assertSoleFileClaim(engine: BrainEngine, target: FileClaimTarget)
       { argv: originTwinsPreviewArgv(target.sourceId) }) });
 }
 /**
+ * #6394: the file at a page's slug path that `adoptSlugPath` reconciles it against, or null when the page records a file
+ * origin, publishes database-only by design (a declared db_only slug, a never-filed derive-phase page), is mirror-only, or
+ * its slug path cannot be derived inside the source. `root` is the realpath of the source root. Throws
+ * `slug_path_ambiguous` when several files import as the slug. liveFileDrift reads an origin twin's drift with it.
+ */
+export async function adoptableSlugOrigin(engine: BrainEngine, sourceId: string, root: string, snapshot: PageSnapshot,
+  mode: 'git-root' | 'source-root'): Promise<{ path: string; sourcePath: string } | null> {
+  if (!recordsNoFileOrigin(snapshot.page) || publishesDatabaseOnly(root, snapshot.page.slug, snapshot) || await isMirrorOnlyPage(engine, sourceId, snapshot.page.slug)) return null;
+  const derived = slugDerivedOrigin(root, snapshot.page.slug, mode);
+  return derived && isWriteTargetContained(derived.path, root) ? derived : null;
+}
+/**
  * #6394: `adoptSlugPath` lets a live page with no recorded origin and no database-only marker reconcile against the file
  * at its slug path (mode-aware, as discovery names it). A page that publishes database-only by design (a declared db_only
  * slug, a never-filed derive-phase page) or a mirror-only page never adopts one.
@@ -238,9 +251,8 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
   const recordedPath = recordedReconcilePath(root, snapshot.page, mode);
   const marked = !recordedPath && (isDatabaseOnlyPage({ ...snapshot.page,
     database_only_reason: await isUnboundSourcePage(engine, sourceId, slug) ? 'unbound_source' : null }) || await staleMirrorPage(engine, sourceId, snapshot.page));
-  const adoptable = !recordedPath && !marked && opts.adoptSlugPath === true && recordsNoFileOrigin(snapshot.page)
-    && !publishesDatabaseOnly(root, slug, snapshot) && !await isMirrorOnlyPage(engine, sourceId, slug);
-  const derived = marked || adoptable ? slugDerivedOrigin(root, slug, mode) : null;
+  const adoptable = !recordedPath && !marked && opts.adoptSlugPath === true;
+  const derived = marked ? slugDerivedOrigin(root, slug, mode) : adoptable ? await adoptableSlugOrigin(engine, sourceId, root, snapshot, mode) : null;
   const origin = derived ? 'slug_derived' : 'recorded';
   const path = recordedPath ?? derived?.path ?? null;
   if (!path || !isWriteTargetContained(path, root)) throw opError('source_changed', 'The page has no unambiguous confined recorded Markdown origin.',
@@ -314,6 +326,24 @@ export function reconcilePreviewAdopts(artifact: Pick<ReconcileArtifact, 'preima
   const stored = (artifact.preimages as { stored_page?: { source_path?: unknown; source_uri?: unknown } | null } | null)?.stored_page;
   return stored != null && stored.source_path == null && recordsNoFileOrigin({ source_uri: typeof stored.source_uri === 'string' ? stored.source_uri : null });
 }
+/**
+ * GST-1555: a reconcile preview binds the page's revision, so a page the revision backfill has not reached refuses before
+ * anything is prepared. Its fix resumes the backfill, or, for a row that used every attempt, previews the torn-body repair.
+ * Read-only classification (drift class, audit) reads such a page normally; only previews call this.
+ */
+export async function assertReconcileRevision(engine: BrainEngine, snapshot: PageSnapshot, sourceId: string, slug: string): Promise<void> {
+  if (snapshot.revision !== REVISION_BACKFILL_PENDING) return;
+  const exhausted = await revisionBackfillExhausted(engine, Number(snapshot.page.id));
+  const verify = { argv: ['gbrain', 'doctor', '--only', 'revision_backfill', '--json'] };
+  throw opError('revision_backfill_pending', 'Reconciliation requires the page revision, and this page has none yet.',
+    `Nothing changed. Page ${slug} in '${sourceId}' was written before page revisions and the revision backfill has not reached it, so no reconcile preview can bind to it. `
+      + (exhausted ? 'The backfill used every attempt on this row (usually a torn page body): preview gbrain repair orphan-children (the command in fix) and recover the page from a backup or a re-sync, then preview it again.'
+        : `Resume the backfill on the brain host with ${REVISION_BACKFILL_RESUME_COMMAND} (the command in fix), then preview the page again.`),
+    { fix: exhausted
+      ? { ...readFix('Previews orphaned child rows and lists torn page bodies (torn_pages) without changing anything.', { argv: ['gbrain', 'repair', 'orphan-children'] }), verify, docs: 'docs/guides/repair.md#orphan-children' }
+      : { argv: REVISION_BACKFILL_RESUME_COMMAND.split(' '), consent: [], actor: 'agent', requires_exclusive: true, verify, docs: 'docs/guides/write-refusals.md#revision-backfill',
+        why: 'Re-runs the schema migration pass on the brain host, which resumes the page revision backfill and prints its progress; it changes no page content.' } });
+}
 export function assertReconcilePins(expected: ReconcilePins, actual: ReconcilePins): void {
   for (const key of Object.keys(expected) as Array<keyof ReconcilePins>) if (expected[key] !== actual[key]) staleReconcile(key);
 }
@@ -339,20 +369,22 @@ export function validateReconcileArtifact(value: unknown): ReconcileArtifact {
     'owner_epoch', 'revision', 'raw_file_hash', 'relative_path', 'policy_digest', 'withdrawals_digest', 'assessment_at']);
   strictReconcileKeys(value.preimages, ['file_base64', 'database', 'stored_page']);
   // globalPurges is optional here so an artifact written before the '*' purge marker validates and then reads stale (assertPreimages).
-  strictReconcileKeys(value.preimages.database, ['page', 'tags', 'revision', 'sourceIncarnation', 'withdrawals', 'globalPurges'],
+  // A page stored in segments (`body_storage`) is reconciled from its materialized body; its snapshot pins the body generation.
+  strictReconcileKeys(value.preimages.database, ['page', 'tags', 'revision', 'sourceIncarnation', 'withdrawals', 'globalPurges', 'bodyGeneration'],
     ['page', 'tags', 'revision', 'sourceIncarnation', 'withdrawals']);
   if (value.preimages.database.globalPurges !== undefined) strictReconcileKeys(value.preimages.database.globalPurges, ['count', 'latest', 'world_only']);
   strictReconcileKeys(value.preimages.database.page, ['id', 'slug', 'source_id', 'type', 'title', 'compiled_truth', 'timeline', 'frontmatter',
     'content_hash', 'source_path', 'knowledge_revision', 'text_projection_revision', 'emotional_weight', 'created_at', 'updated_at', 'updated_at_iso',
     'deleted_at', 'effective_date', 'effective_date_source', 'import_filename', 'salience_touched_at', 'source_kind', 'source_uri', 'ingested_via',
-    'ingested_at', 'contextual_retrieval_mode', 'corpus_generation', 'withheld_source_path'], ['id', 'slug', 'source_id', 'type', 'title', 'compiled_truth', 'timeline', 'frontmatter']);
+    'ingested_at', 'contextual_retrieval_mode', 'corpus_generation', 'withheld_source_path', 'body_storage', 'body_bytes'], ['id', 'slug', 'source_id', 'type', 'title', 'compiled_truth', 'timeline', 'frontmatter']);
   strictReconcileKeys(value.preimages.stored_page, ['id', 'source_id', 'slug', 'type', 'title', 'compiled_truth', 'timeline', 'frontmatter',
     'content_hash', 'source_path', 'source_kind', 'source_uri', 'ingested_via', 'ingested_at', 'knowledge_revision', 'deleted_at']);
   strictReconcileKeys(value.result, ['type', 'title', 'compiled_truth', 'timeline', 'frontmatter', 'tags']);
   const result = value.result;
   if (value.format_version !== 1 && !v2 || typeof value.preview_id !== 'string' || !['ready', 'needs_resolution'].includes(String(value.status)) ||
     !Array.isArray(value.conflicts) || !Array.isArray(value.decisions) || !Array.isArray(value.preimages.database.tags) ||
-    !Array.isArray(value.preimages.database.withdrawals) || !Array.isArray(value.result.tags) || value.result.tags.some(v => typeof v !== 'string') ||
+    !Array.isArray(value.preimages.database.withdrawals) || value.preimages.database.bodyGeneration !== undefined && !Number.isSafeInteger(value.preimages.database.bodyGeneration) ||
+    !Array.isArray(value.result.tags) || value.result.tags.some(v => typeof v !== 'string') ||
     ['type', 'title', 'compiled_truth', 'timeline'].some(key => typeof result[key] !== 'string') ||
     value.result.frontmatter === null || typeof value.result.frontmatter !== 'object' || Array.isArray(value.result.frontmatter) ||
     typeof value.preimages.file_base64 !== 'string' ||

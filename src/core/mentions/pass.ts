@@ -55,12 +55,13 @@ import type { BrainEngine, LinkBatchInput } from '../engine.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { isCrossSourceLinksEnabled } from '../link-extraction.ts';
 import {
-  buildGazetteer, findMentionedEntities, gazetteerEntryKeys, tokenizeTitle,
+  buildGazetteer, entryNameNorm, findMentionedEntities, gazetteerEntryKeys, tokenizeTitle,
   type FindMentionsOpts, type Gazetteer, type GazetteerEntry, type GazetteerEntryKey, type Mention,
 } from '../by-mention.ts';
 import { bodyBlocks, detachedValue } from '../page-body/segment-blocks.ts';
 import { commitRuns, derivationScope, keyDigest, planRuns, readRuns, SegmentDerivationRaced, type DeriveRun } from '../page-body/segment-derive.ts';
 import { canonicalJson } from '../belief/keys.ts';
+import { beliefCoveredSources, unmanagedBeliefPoint } from '../belief/projection-point.ts';
 import { classifyItemFailure } from '../item-failure.ts';
 import { linkableTypesFor, loadSourcePack, parseNameList, readMentionPolicy, type MentionPolicy, type PackTypes } from './policy.ts';
 import { deriveEntityAliases, type DerivedAlias } from './aliases.ts';
@@ -183,6 +184,15 @@ async function writeStatus(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: st
       patch.fingerprint ?? null, patch.fingerprint !== undefined]);
 }
 
+/**
+ * #9548: a disable (exclusive) and each reconcile batch reading the source's generation (shared) take this first, before page
+ * keys or status rows: a journaled disable locks its origin pages, which a cross-source batch holding the status row links to.
+ */
+async function lockMentionSources(tx: Pick<BrainEngine, 'executeRaw'>, sourceIds: string[], shared: boolean): Promise<void> {
+  await tx.executeRaw(`SELECT count(${shared ? 'pg_advisory_xact_lock_shared' : 'pg_advisory_xact_lock'}(hashtext('gbrain:mention-publish:' || s)::bigint))
+    FROM (SELECT DISTINCT s FROM unnest($1::text[]) AS x(s) ORDER BY s) k`, [sourceIds]);
+}
+
 /** Run `fn` in a transaction; on a managed brain, as a coordinated write for `sourceId` (page_aliases is guarded). */
 async function aliasWrite<T>(engine: BrainEngine, managed: boolean, sourceId: string, fn: (tx: BrainEngine) => Promise<T>): Promise<T> {
   if (!managed) return engine.transaction(fn);
@@ -197,7 +207,7 @@ async function aliasWrite<T>(engine: BrainEngine, managed: boolean, sourceId: st
  * write). A page that is not a linkable entity, or linking that is off,
  * leaves no derived rows. Frontmatter rows are untouched.
  */
-export async function writeDerivedAliases(tx: Pick<BrainEngine, 'executeRaw' | 'getConfig'>, sourceId: string,
+export async function writeDerivedAliases(tx: Pick<BrainEngine, 'replaceDerivedAliases' | 'executeRaw' | 'getConfig'>, sourceId: string,
   page: { slug: string; title: string | null; type: string | null; compiled_truth: string | null; timeline?: string | null; frontmatter?: Record<string, unknown> | null },
   opts: { pack?: PackTypes | null; policy?: MentionPolicy | null } = {}): Promise<number> {
   // A config read that fails (null policy) leaves the rows for the next sweep rather than failing the caller's write.
@@ -205,13 +215,7 @@ export async function writeDerivedAliases(tx: Pick<BrainEngine, 'executeRaw' | '
   if (!policy) return 0;
   const types = policy.enabled ? linkableTypesFor(opts.pack !== undefined ? opts.pack : await loadSourcePack(tx, sourceId), policy) : [];
   const aliases = types.includes(page.type ?? '') ? deriveEntityAliases(page, aliasOptsOf(policy)).aliases : [];
-  await tx.executeRaw(`DELETE FROM page_aliases WHERE source_id = $1 AND slug = $2 AND origin IN ('declared','subject')`, [sourceId, page.slug]);
-  if (aliases.length) {
-    await tx.executeRaw(
-      `INSERT INTO page_aliases (source_id, alias_norm, slug, origin, case_sensitive, alias_text)
-       SELECT $1, a, $2, o, c::boolean, t FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS x(a, o, c, t) ON CONFLICT DO NOTHING`,
-      [sourceId, page.slug, aliases.map(a => a.alias_norm), aliases.map(a => a.origin), aliases.map(a => String(a.case_sensitive)), aliases.map(a => a.alias_text)]);
-  }
+  await tx.replaceDerivedAliases(page.slug, sourceId, aliases);
   return aliases.length;
 }
 
@@ -234,18 +238,26 @@ export async function writePageAliases(tx: BrainEngine, slug: string, sourceId: 
 
 /** Turn the index off for one source: plain mention links, derived aliases, entries and page state go; typed_ner rows stay. */
 async function disableSource(engine: BrainEngine, managed: boolean, sourceId: string): Promise<number> {
-  let removed = 0;
-  await aliasWrite(engine, managed, sourceId, async tx => {
-    const rows = await tx.executeRaw<{ id: number }>(
+  let beliefs = null as ReturnType<typeof unmanagedBeliefPoint> | null;
+  const removed = await aliasWrite(engine, managed, sourceId, async tx => {
+    await lockMentionSources(tx, [sourceId], false);
+    // #9548: on a belief-covered source the removed links are journaled like the reconcile's; only origins whose page keys are held are swept.
+    const origins = (await beliefCoveredSources(tx, [sourceId])).has(sourceId) ? (await tx.executeRaw<{ slug: string }>(
+      `SELECT DISTINCT f.slug FROM links l JOIN pages f ON f.id = l.from_page_id
+        WHERE f.source_id = $1 AND l.link_source = 'mentions' AND (l.link_kind IS NULL OR l.link_kind = 'plain')`, [sourceId])).map(r => r.slug) : null;
+    const unlink = async () => (await tx.executeRaw<{ id: number }>(
       `DELETE FROM links l USING pages f
         WHERE f.id = l.from_page_id AND f.source_id = $1 AND l.link_source = 'mentions'
-          AND (l.link_kind IS NULL OR l.link_kind = 'plain') RETURNING l.id`, [sourceId]);
-    removed = rows.length;
+          AND (l.link_kind IS NULL OR l.link_kind = 'plain') AND ($2::text[] IS NULL OR f.slug = ANY($2::text[])) RETURNING l.id`, [sourceId, origins])).length;
+    if (origins?.length) beliefs = unmanagedBeliefPoint(sourceId, origins, 'mention_pass');
+    const unlinked = beliefs ? await beliefs.run(tx, unlink) : await unlink();
     await tx.executeRaw(`DELETE FROM page_aliases WHERE source_id = $1 AND origin IN ('declared','subject')`, [sourceId]);
     await tx.executeRaw('DELETE FROM mention_gazetteer_entries WHERE source_id = $1', [sourceId]);
     await tx.executeRaw('DELETE FROM page_mention_state WHERE source_id = $1', [sourceId]);
     await writeStatus(tx, sourceId, { state: 'disabled', pending: 0, error: null, bumpGeneration: true, fingerprint: null });
+    return unlinked;
   });
+  await beliefs?.commit(engine);
   return removed;
 }
 
@@ -446,7 +458,7 @@ function miniGazetteer(gazetteer: Gazetteer, keys: Set<string>): Gazetteer {
 
 function entryKey(e: GazetteerEntry | GazetteerEntryKey): string {
   if ('target_slug' in e) return `${e.source_id}\0${e.name_norm}\0${e.target_slug}\0${e.case_sensitive}`;
-  return `${e.source_id}\0${(e.caseTokens ?? e.tokens).join(' ')}\0${e.slug}\0${!!e.caseTokens}`;
+  return `${e.source_id}\0${entryNameNorm(e)}\0${e.slug}\0${!!e.caseTokens}`;
 }
 
 /**
@@ -550,7 +562,13 @@ async function reconcileSource(engine: BrainEngine, sourceId: string, gazetteer:
     }
     if (!readable.length) continue;
     await opts.beforePublish?.(readable.map(p => Number(p.id)));
+    // #7031: on a belief-covered source the link changes are an unmanaged projection point, like derived links; the
+    // page keys are locked first, as every publisher locks them before the page rows.
+    let beliefs = null as ReturnType<typeof unmanagedBeliefPoint> | null;
     const outcome = await engine.transaction(async tx => {
+      await lockMentionSources(tx, genSources, true);
+      const journaled = (await beliefCoveredSources(tx, [sourceId])).has(sourceId);
+      if (journaled) await tx.lockPageKeys(readable.map(p => ({ sourceId: p.source_id, slug: p.slug })));
       if (!sameGenerations(generations, await readGenerations(tx, genSources, true))) return null;
       const current = new Map((await tx.executeRaw<{ id: number; revision: string }>(
         `SELECT id, knowledge_revision::text AS revision FROM pages WHERE id = ANY($1::int[]) AND deleted_at IS NULL FOR SHARE`,
@@ -572,12 +590,18 @@ async function reconcileSource(engine: BrainEngine, sourceId: string, gazetteer:
         .map(m => `${p.id}\0${m.source_id}\0${m.slug}`)));
       const have = new Set(existing.map(r => `${r.from_page_id}\0${r.to_source_id}\0${r.to_slug}`));
       const drop = existing.filter(r => !want.has(`${r.from_page_id}\0${r.to_source_id}\0${r.to_slug}`)).map(r => Number(r.id));
-      if (drop.length) await tx.executeRaw('DELETE FROM links WHERE id = ANY($1::int[])', [drop]);
       const add: LinkBatchInput[] = fresh.flatMap(p => (found.get(Number(p.id)) ?? [])
         .filter(m => want.has(`${p.id}\0${m.source_id}\0${m.slug}`) && !have.has(`${p.id}\0${m.source_id}\0${m.slug}`))
         .map(m => ({ from_slug: p.slug, to_slug: m.slug, link_type: 'mentions', link_source: 'mentions', context: m.name,
           from_source_id: p.source_id, to_source_id: m.source_id })));
-      const created = add.length ? await tx.addLinksBatch(add, { auditSite: 'extract.mentions' }) : 0; // gbrain-allow-direct-insert: mention pass — reconciling write of the scan's own plain mention rows
+      const write = async () => {
+        if (drop.length) await tx.executeRaw('DELETE FROM links WHERE id = ANY($1::int[])', [drop]);
+        return add.length ? await tx.addLinksBatch(add, { auditSite: 'extract.mentions' }) : 0; // gbrain-allow-direct-insert: mention pass — reconciling write of the scan's own plain mention rows
+      };
+      const dropped = new Set(existing.filter(r => drop.includes(Number(r.id))).map(r => Number(r.from_page_id)));
+      const changed = fresh.filter(p => dropped.has(Number(p.id))).map(p => p.slug).concat(add.map(link => link.from_slug));
+      if (journaled && changed.length) beliefs = unmanagedBeliefPoint(sourceId, changed, 'mention_pass');
+      const created = beliefs ? await beliefs.run(tx, write) : await write();
       await tx.executeRaw(
         `INSERT INTO page_mention_state (page_id, source_id, mention_revision, mention_version, mention_generation, mentions_scanned_at)
          SELECT id, $1, rev::uuid, $4, $5::bigint, now() FROM unnest($2::int[], $3::text[]) AS x(id, rev)
@@ -586,6 +610,7 @@ async function reconcileSource(engine: BrainEngine, sourceId: string, gazetteer:
         [sourceId, fresh.map(p => p.id), fresh.map(p => p.revision), MENTION_EXTRACTOR_VERSION, generations.get(sourceId) ?? '0']);
       return { fresh: fresh.length, created, removed: drop.length };
     });
+    await beliefs?.commit(engine);
     if (!outcome) { result.skipped += readable.length; return; }
     result.pages += outcome.fresh;
     result.skipped += readable.length - outcome.fresh;

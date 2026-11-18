@@ -73,7 +73,7 @@ describe('nightly-watch incidents', () => {
     expect(plan.action).toBe('create');
     const create = calls.find(c => c.method === 'POST' && c.path === 'repos/{repo}/issues')!;
     expect(create.body!.title).toBe('Nightly red: Heavy Tests');
-    expect(create.body!.labels).toEqual(['nightly-red']);
+    expect(create.body!.labels).toEqual(['nightly-red', 'agent-filed']);
     const body = String(create.body!.body);
     expect(body).toContain('| `Heavy tests` | `Bootstrap offline Docker e2e (placeholder)` | failure | no |');
     expect(body).toContain('### Next step for the agent');
@@ -397,7 +397,7 @@ describe('master-red: push-to-master runs', () => {
     expect(r.track).toBe('push');
     expect(r.masterRed!.action).toBe('create');
     const issue = masterIssue(w)!;
-    expect(labelNames(issue)).toEqual(['master-red']);
+    expect(labelNames(issue)).toEqual(['master-red', 'agent-filed']);
     const state = mrState(issue);
     expect(state.status).toBe('red');
     expect(state.first_red).toMatchObject({ run_id: T.r8320.id, sha: T.r8320.head_sha });
@@ -440,6 +440,7 @@ describe('master-red: push-to-master runs', () => {
     expect(issue.comments.at(-1)).toContain('No merged repair PR is linked');
     const flakes = w.labeled('flake');
     expect(flakes.map(f => f.title).sort()).toEqual(['Flake: test/managed-lint.test.ts', 'Flake: test/pack-relation-direction-engine.test.ts', 'Flake: test/persistence-history-fixture.test.ts']);
+    for (const f of flakes) expect(labelNames(f)).toEqual(['flake', 'agent-filed']);
     const rec = readJsonBlock<FlakeRecord>(flakes[0]!.body, FLAKE_MARKER)!;
     expect(rec).toMatchObject({ schema: 'flake/v1', master_red_issue: issue.number, owner: 'agent on release duty', platform: 'linux' });
     expect(rec.reproduce).toMatch(/^bun run test:stress test\/[\w./-]+\.test\.ts --iterations 10 --postgres$/);
@@ -630,6 +631,16 @@ describe('master-red: push-to-master runs', () => {
       expect([name, state.evidence!.complete]).toEqual([name, false]);
       expect([name, state.evidence!.problems.join(' | ')]).toEqual([name, expect.stringContaining(problem)]);
     }
+  });
+
+  test('a reused run whose source passed files only on a re-run of failed jobs keeps the incident open', async () => {
+    const src = mr<CiManifest>('ci-manifest-39170735990.json');
+    const rerun = { ...src, attempts: [1, 2], files: src.files.map((f, i) => (i === 0 ? { ...f, rerun: true as const } : f)) };
+    const { incident } = await reuseWatch(w => { w.manifests.set(`${RU.dispatch10224.id}/1`, rerun); });
+    expect(incident.state).toBe('open');
+    const state = mrState(incident);
+    expect(state.evidence!.complete).toBe(false);
+    expect(state.evidence!.problems.join(' | ')).toContain(`re-ran only failed jobs (attempts 1, 2); 1 file(s) passed only on that re-run (${src.files[0]!.file})`);
   });
 
   test('a green run where a previously failing job did not run keeps the issue open and names the manual-close step', async () => {
@@ -928,7 +939,10 @@ describe('master-red: push-to-master runs', () => {
     const open = both.issues.filter(i => i.title === 'Master red: Test' && i.state === 'open');
     expect(open).toHaveLength(1);
     expect(both.labeled('master-red')).toHaveLength(1);
-    for (const twin of both.issues.filter(i => i.title === 'Master red: Test' && i.state === 'closed')) expect(twin.body).toContain(`Duplicate of #${open[0]!.number}`);
+    for (const twin of both.issues.filter(i => i.title === 'Master red: Test' && i.state === 'closed')) {
+      expect(twin.body).toContain(`Duplicate of #${open[0]!.number}`);
+      expect(labelNames(twin)).toEqual(['agent-filed']);
+    }
   });
 
   test('E2E Tests closes only when every previously failing test file was among the files a run executed and passed', async () => {

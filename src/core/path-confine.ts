@@ -21,7 +21,7 @@
 
 import { realpathSync, existsSync, type Stats } from 'fs';
 import { realpath as realpathAsync } from 'fs/promises';
-import { resolve as resolvePath, relative, isAbsolute, dirname, basename, join, sep } from 'path';
+import { resolve as resolvePath, relative, isAbsolute, dirname, basename, join, sep, posix } from 'path';
 
 /**
  * Symlink-safe path confinement: realpath BOTH sides, then a separator-aware
@@ -63,6 +63,25 @@ export function resolvedPrefixContained(
   // suffix would make the prefix test fail for every real subdirectory.
   const parentWithSep = resolvedParent.endsWith(sepChar) ? resolvedParent : resolvedParent + sepChar;
   return resolvedChild === resolvedParent || resolvedChild.startsWith(parentWithSep);
+}
+
+/**
+ * True when a `path.relative(root, x)` result leaves `root`: it is exactly
+ * `..`, starts with a `..` path component (`../` or `..` + the platform
+ * separator), or is absolute (another drive on Windows). A bare
+ * `startsWith('..')` is wrong: it also matches a legal first folder such as
+ * `..drafts`, `..x` or `...`, which sits inside the root.
+ *
+ * Accepts both native and `/`-joined relative paths, because several callers
+ * normalize to `/` before checking. `pathOps` lets tests pass `path.win32` to
+ * check backslash and drive-letter shapes on POSIX CI. The empty string (the
+ * root itself) is NOT an escape; callers keep their own policy for it.
+ */
+export function relativeEscapesRoot(
+  rel: string,
+  pathOps: { sep: string; isAbsolute(p: string): boolean } = { sep, isAbsolute },
+): boolean {
+  return rel === '..' || rel.startsWith('../') || rel.startsWith('..' + pathOps.sep) || pathOps.isAbsolute(rel);
 }
 
 /**
@@ -140,6 +159,27 @@ export function msysToNativePath(
   return `${drive}:${rest || '\\'}`;
 }
 
+/** The platform the loaded `path` module resolves for: the stored-root verdict follows the module that resolves the root. */
+const PATH_PLATFORM: NodeJS.Platform = sep === '\\' ? 'win32' : 'linux';
+
+/**
+ * #7646: is a stored root (`sources.local_path`, `sync.repo_path`) absolute on THIS host? The one predicate sync,
+ * `config set`, write-through, `sources set-path --clear` and doctor share. On win32 only a drive path (`C:\\x`, or a
+ * Git Bash `/c/x`, healed by `msysToNativePath`) or a UNC share counts: `path.win32.isAbsolute` also accepts the
+ * root-relative `\\brain` and `/brain`, which resolve against whatever drive gbrain runs from. On POSIX it is
+ * `path.posix.isAbsolute`, so a Windows drive path another host stored is not absolute here.
+ */
+export function isHostAbsolutePath(p: string, platform: NodeJS.Platform = PATH_PLATFORM): boolean {
+  if (platform !== 'win32') return posix.isAbsolute(p);
+  return /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/])/.test(msysToNativePath(p, platform));
+}
+
+/** #7646: a stored root absolute only on another operating system (a Windows drive or UNC path on POSIX, a POSIX path on win32). */
+export function isForeignAbsolutePath(p: string, platform: NodeJS.Platform = PATH_PLATFORM): boolean {
+  if (isHostAbsolutePath(p, platform)) return false;
+  return platform === 'win32' ? posix.isAbsolute(p) && !/^[\\/]{2}/.test(p) : isHostAbsolutePath(p, 'win32');
+}
+
 /**
  * Async twin of `realpathOrResolve` — same fallback contract, but backed by
  * `fs.promises.realpath` instead of `realpathSync`. Exists so a caller
@@ -193,5 +233,5 @@ export function isWriteTargetContained(target: string, root: string): boolean {
   const base = realpathOrResolve(existing);
   const finalPath = tail.length ? join(base, ...tail) : base;
   const rel = relative(resolvedRoot, finalPath);
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  return !relativeEscapesRoot(rel);
 }

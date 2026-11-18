@@ -154,6 +154,8 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   { name: 'protocol', phase: 'pre-connect', thinClient: 'none', selfHelp: true, load: () => import('./commands/protocol.ts') },
   { name: 'errors', phase: 'pre-connect', thinClient: 'none', selfHelp: true, json: 'document', read_only: true, load: () => import('./commands/errors.ts') },
   { name: 'bundled-skill', phase: 'pre-connect', thinClient: 'none', selfHelp: true, json: 'document', read_only: true, skipStartupHooks: true, load: () => import('./commands/bundled-skill.ts') },
+  // GBRA-377: `skills index|resolve` (routed by cli/command-route.ts); engine-free on every install shape.
+  { name: 'skill-resolver', phase: 'pre-connect', thinClient: 'none', selfHelp: true, skipStartupHooks: true, load: () => import('./commands/skill-resolver.ts') },
   { name: 'notices', phase: 'pre-connect', thinClient: 'none', selfHelp: true, load: () => import('./commands/notices.ts') },
   // selfHelp: `gbrain init --help` prints its own usage from runInit; route around the generic
   // one-line short-circuit (matches `connect`). Without this, `init` is in CLI_ONLY but not
@@ -215,7 +217,7 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   // selfHelp: backup ships its own HELP (runBackupCli guard, engine-free — the command dispatches in
   // the pre-engine lane, so help never touches the PGLite lock).
   { name: 'backup', phase: 'pre-connect-own-engine', thinClient: 'none', selfHelp: true, load: () => import('./commands/backup.ts') },
-  { name: 'upgrade', phase: 'pre-connect', thinClient: 'none', selfHelp: true, skipStartupHooks: true, load: () => import('./commands/upgrade.ts') },
+  { name: 'upgrade', phase: 'pre-connect-own-engine', thinClient: 'none', selfHelp: true, skipStartupHooks: true, load: () => import('./commands/upgrade.ts') },
   { name: 'post-upgrade', phase: 'pre-connect', thinClient: 'none', selfHelp: true, skipStartupHooks: true, json: 'document', load: () => import('./commands/post-upgrade.ts') },
   { name: 'check-update', phase: 'pre-connect', thinClient: 'none', selfHelp: true, skipStartupHooks: true, load: () => import('./commands/check-update.ts') },
   // selfHelp: v0.42 self-upgrade ships its own usage (flags + the agent-skill story).
@@ -339,6 +341,8 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   // selfHelp: gbrain repair prints REPAIR_HELP (kinds + dry-run/apply contract).
   // thin client: Wave 2 repair core: repairs publish coordinated writes on the brain host.
   { name: 'repair', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, load: () => import('./commands/repair.ts') },
+  // GST-2988: the secret store (reveal, restore, keys); trusted local CLI on the brain host.
+  { name: 'secrets', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, load: () => import('./commands/secrets.ts') },
   { name: 'diag', phase: 'post-connect', thinClient: 'refuse', json: 'document', read_only: true, slowRead: () => 'the diagnostic bundle', help: () => import('./help/diag.ts'), load: () => import('./commands/diag.ts') },
   { name: 'orphans', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, slowRead: () => 'orphan pages', load: () => import('./commands/orphans.ts') },
   // selfHelp: maintain (#3015) prints its own usage block (modes + not-auto-applied list).
@@ -346,6 +350,7 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   { name: 'reindex', phase: 'post-connect', thinClient: 'none', selfHelp: true, load: () => import('./commands/reindex.ts') },
   { name: 'salience', phase: 'post-connect', thinClient: 'none', selfHelp: true, load: () => import('./commands/salience.ts') },
   { name: 'anomalies', phase: 'post-connect', thinClient: 'none', selfHelp: true, slowRead: () => 'anomalous cohorts', load: () => import('./commands/anomalies.ts') },
+  { name: 'dedupe', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, slowRead: () => 'duplicate person and company pages', load: () => import('./commands/dedupe.ts') },
   { name: 'feedback', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, load: () => import('./commands/feedback.ts') },
   { name: 'status', phase: 'post-connect', thinClient: 'none', slowRead: args => args.includes('--funnel') ? null : 'the brain status snapshot', help: () => import('./help/status.ts'), load: () => import('./commands/status.ts') },
   { name: 'advisor', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, load: () => import('./commands/advisor.ts') },
@@ -399,11 +404,16 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   { name: 'questions', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, routes_source: true, load: () => import('./commands/questions.ts') },
   // CLI_ONLY: relationship-contradiction proposals (temporal typed edges); host-local, writes canonical timeline lines.
   { name: 'edge-proposals', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, load: () => import('./commands/edge-proposals.ts') },
+  // CLI_ONLY: the owner's review of QM's proposed timeline entries and links (GST-1158); host-local, never an MCP op.
+  { name: 'memory-proposals', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, load: () => import('./commands/memory-proposals.ts') },
   // selfHelp: core prints its own usage (commands/core.ts). Always-loaded core memory, docs/guides/core-memory.md.
   { name: 'core', phase: 'post-connect', thinClient: 'none', selfHelp: true, load: () => import('./commands/core.ts') },
   // selfHelp: connectors ships its own printHelp (commands/connectors/index.ts) with the
   // per-subcommand usage; keep the generic short-circuit from hiding it.
   { name: 'connectors', phase: 'post-connect', thinClient: 'none', selfHelp: true, load: () => import('./commands/connectors.ts') },
+  // selfHelp: Wakeshift report-back switch (commands/wakeshift.ts HELP), docs/guides/wakeshift.md. Thin client: only
+  // `watch` routes (watch_job / watch_write_request / watch_cron over MCP); the rest writes the host file plane and key.
+  { name: 'wakeshift', phase: 'post-connect', thinClient: 'route-then-refuse', selfHelp: true, load: () => import('./commands/wakeshift.ts') },
   // selfHelp: #3502 sweep: pages + bench print their own usage (pages.ts printHelp, bench-publish.ts
   // printHelp). Both were documented but undispatchable — `pages` had a live handleCliOnly case but
   // was missing from CLI_ONLY (the #2035 calibration bug class); `bench` was never wired at all.
@@ -418,6 +428,9 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   // #5575: memory trust. Observational startup: `trust backfill --dry-run` runs with no migrations and no writes.
   // W1 belief ledger coverage: enable, disable, status, reconcile, backfill (docs/designs/BELIEF_LEDGER.md section 7).
   { name: 'beliefs', phase: 'post-connect', thinClient: 'route-then-refuse', selfHelp: true, json: 'document', routes_source: true, load: () => import('./commands/beliefs.ts') },
+  // CLI_ONLY: guest notes (GBRA-504): sets up a database-only guest source; trusted local CLI only. selfHelp: a router
+  // (init, promote, grant-owner-clients); its usage prints before any engine is opened.
+  { name: 'guests', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, load: () => import('./commands/guests.ts') },
   { name: 'trust', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, json: 'document', skipStartupHooks: true, startup: 'observational', load: () => import('./commands/trust.ts') },
   // selfHelp: v0.43 (#2095): watch ships WATCH_HELP (flags + the stdin-turn protocol).
   // thin client: v0.43 (#2095): watch streams against a LOCAL engine; thin clients get the

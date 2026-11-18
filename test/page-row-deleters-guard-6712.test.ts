@@ -20,8 +20,7 @@ const SEGMENTS = /(?<!function )\bdeletePageWithSegments\(/g;
  * `writeOriginDeletedMarker(` within three lines.
  */
 const MARKED: Record<string, number> = {
-  'src/core/persistence/page-purge.ts': 1, // delete_page --purge, manual and retention (the coordinator's purge transaction)
-  'src/core/belief/purge-mirror.ts': 1, // the restore-time purge replay
+  'src/core/persistence/page-purge.ts': 1, // deletePurgedPage: delete_page --purge, manual and retention, and the restore-time purge replay (#9469)
 };
 
 /** Reviewed callers a managed Git source never reaches, with the number of matches each file may hold. */
@@ -34,11 +33,13 @@ const REVIEWED: Record<string, { count: number; why: string }> = {
   'src/core/engine-constants.ts': { count: 1, why: 'doc comment of the batch bound' },
   'src/core/bootstrap/verify.ts': { count: 1, why: 'unmanaged brains only; a managed brain removes its probe pages through delete_page --purge' },
   'src/core/transcripts/ingest.ts': { count: 1, why: 'unmanaged brains only; a managed brain deletes stale parts through the coordinator' },
+  'src/core/transcripts/archive.ts': { count: 1, why: 'repo-less database mode only; a managed brain deletes stale day parts through the coordinator and a repo brain removes the files and syncs' },
   'src/core/persistence/purge-deleted.ts': { count: 1, why: 'unmanaged retention (expireRecordedTombstones); a managed brain purges through delete_page --purge' },
   'src/commands/migrate-engine.ts': { count: 1, why: 'engine migration copy, outside any source write' },
   'src/core/github-source.ts': { count: 2, why: 'GitHub connector source, not a managed Git checkout' },
   'src/core/google/google-source.ts': { count: 1, why: 'Google connector source' },
   'src/core/google/sweep-shared.ts': { count: 1, why: 'Google connector sweep' },
+  'src/core/persistence/source-lifecycle.ts': { count: 1, why: 'managed remove/purge retire batches (#7702/#8905): the whole source is being removed under its topology locks, and the final transaction deletes its row and bindings, ending the incarnation every deletion marker (op_checkpoints, keyed on source, incarnation and origin, with no cascade) is scoped to; the single-transaction cascade these batches split wrote no markers either, and a page an interrupted run left behind is re-imported at worst until the rerun finishes the removal' },
   'src/core/connectors/api-source.ts': { count: 1, why: 'Fireflies/Slack connector source, unmanaged only; a managed source deletes through ManagedConnectorSync' },
 };
 

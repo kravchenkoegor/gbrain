@@ -70,7 +70,7 @@ beforeAll(async () => {
     timeline: `- ${TODAY}: ${planted('timeline')}`, frontmatter: { summary: planted('summary') },
   }, { sourceId: SRC });
   await engine.putPage('notes/n1', {
-    type: 'note', title: planted('note'), compiled_truth: `${planted('note body')}\nGITHUB_TOKEN=${rand(31)}7`,
+    type: 'note', title: planted('note'), compiled_truth: `${planted('note body')}\n${planted('link')}\nGITHUB_TOKEN=${rand(31)}7`,
     timeline: `- ${TODAY}: ${planted('note timeline')}`, frontmatter: {},
   }, { sourceId: SRC });
   await engine.putPage('misc/orphan', { type: 'note', title: planted('orphan'), compiled_truth: planted('orphan body'), frontmatter: {} }, { sourceId: SRC });
@@ -136,6 +136,9 @@ const SWEEP: Record<string, Row> = {
   synthesize: { skip: 'LLM-backed; keyless test env returns no composition. Wrapper coverage is the registration test below.' },
   list_pages: { args: { limit: 100 } },
   find_pages: { args: { pattern: '*', limit: 100 } },
+  storage_find: { skip: 'Cards refuse secret-shaped values when written (storage_record_secret) and the shelf is not federated, so this fixture has no card a remote caller can read; test/storage-manifest.test.ts covers both.' },
+  storage_get: { skip: 'Cards refuse secret-shaped values when written (storage_record_secret) and the shelf is not federated, so this fixture has no card a remote caller can read; test/storage-manifest.test.ts covers both.' },
+  storage_list: { skip: 'Cards refuse secret-shaped values when written (storage_record_secret) and the shelf is not federated, so this fixture has no card a remote caller can read; test/storage-manifest.test.ts covers both.' },
   search: { args: { query: 'PLANTMARK note body', limit: 20 } },
   query: { args: { query: 'PLANTMARK note body', limit: 20 } },
   search_exact: { args: { phrase: 'PLANTMARK' } },

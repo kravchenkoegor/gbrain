@@ -9,12 +9,14 @@
 > gbrainio workspace new         # pick a plan in the browser
 > curl -fsSL https://bun.sh/install | bash   # skip if Bun 1.4.4+ is installed
 > export PATH="$HOME/.bun/bin:$PATH"
-> bun install -g github:garrytan/gbrain#latest-stable   # the gbrain CLI only; no local brain
+> bun install -g github:garrytan/gbrain#stable   # the gbrain CLI only; no local brain
 > # Claude Code (an existing gbrain entry is kept):
 > (claude mcp get gbrain >/dev/null 2>&1 || claude mcp add --transport http --scope user gbrain https://gbrain.io/mcp) && gbrain setup claude-code --instructions-only
 > # Codex (an existing gbrain entry is kept):
 > (codex mcp get gbrain >/dev/null 2>&1 || codex mcp add gbrain --url https://gbrain.io/mcp) && gbrain setup codex --instructions-only
 > ```
+>
+> Bun's installer needs `unzip` and stops with `error: unzip is required to install bun` without it. Check with `command -v unzip`; if it prints nothing, install it first: `apt-get update && apt-get install -y unzip` (Debian, Ubuntu), `dnf install -y unzip` (Fedora, RHEL) or `apk add unzip` (Alpine), with `sudo` in front unless you are root. No way to install packages? Use the [no-unzip route](../INSTALL_FOR_AGENTS.md#no-unzip), not an improvised one.
 >
 > `gbrain setup <harness> --instructions-only` tells the agent the brain is there; agents seldom call an MCP server nobody told them about. It writes the [brain-first block](guides/setup.md#brain-first-instructions) into `~/.claude/CLAUDE.md` or Codex's `AGENTS.md` (a non-empty `AGENTS.override.md` instead when Codex has one) with a per-turn rule hook, and leaves the MCP entry alone; the same command with `--no-instructions` added takes them out.
 >
@@ -31,7 +33,7 @@ The paths below are the manual equivalents. Pick one; mix later if needed.
 Already running [OpenClaw](https://github.com/garrytan/openclaw) or [Hermes](https://github.com/garrytan/hermes)?
 
 ```bash
-bun install -g github:garrytan/gbrain#latest-stable
+bun install -g github:garrytan/gbrain#stable
 gbrain init --pglite --no-embedding   # keyless; no server
 gbrain skillpack scaffold --harness openclaw --workspace <ws>   # OpenClaw: the five-skill brain-first core
 gbrain skillpack scaffold --all       # Hermes or any other workspace: every bundled skill (skills/manifest.json)
@@ -43,7 +45,7 @@ Connect and verify the intended harness before calling it activated. Entity
 capture, recurring jobs and paid enrichment require separate opt-in; none of
 the commands above schedules a daily enrichment job.
 
-Scaffolded skills are first-class files in your agent repo — edit freely. To pull upstream gbrain improvements later, `gbrain skillpack reference <name>` diffs your local copy vs the bundle. If your `RESOLVER.md` / `AGENTS.md` still carries the managed `skillpack install` fence, `gbrain skillpack migrate-fence` strips it once and keeps the routing rows inside it.
+Scaffolded skills are first-class files in your agent repo — edit freely. To pull upstream gbrain improvements later, `gbrain skillpack reference <name>` diffs your local copy vs the bundle, and `gbrain skillpack reference --all --update-untouched` replaces the skills you never edited (`--dry-run` previews). If your `RESOLVER.md` / `AGENTS.md` still carries the managed `skillpack install` fence, `gbrain skillpack migrate-fence` strips it once and keeps the routing rows inside it.
 
 To upgrade later, use the [memory-only upgrade path](#memory-only-upgrades)
 unless services and provider work were deliberately configured. Upgrade runs
@@ -56,7 +58,7 @@ skips interactive prompts, not all side effects.
 GBRAIN_NO_AUTOPILOT_INSTALL=1 GBRAIN_NO_REEMBED=1 gbrain upgrade --no-autopilot-install
 ```
 
-The autopilot opt-out reaches package postinstall hooks and migration
+The autopilot opt-out reaches the migration
 orchestrators, and skips existing service-unit rewrites. Other migrations still
 run. `GBRAIN_NO_REEMBED=1` independently skips potentially paid reindexing.
 The same command upgrades a clone linked with Bun: it fetches, checks the new
@@ -73,11 +75,11 @@ See the [agent upgrade steps](../INSTALL_FOR_AGENTS.md#upgrade).
 No agent platform, just shell + MCP-aware editor.
 
 ```bash
-bun install -g github:garrytan/gbrain#latest-stable
+bun install -g github:garrytan/gbrain#stable
 gbrain init --pglite --no-embedding
 ```
 
-> **If `bun install -g` hits a postinstall error** (Bun blocks postinstall hooks in some environments), the CLI prints a recovery hint pointing at [#218](https://github.com/garrytan/gbrain/issues/218). Run `gbrain doctor` to diagnose, then `gbrain apply-migrations --yes --no-autopilot-install` manually. The deterministic fallback is `git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && GBRAIN_NO_AUTOPILOT_INSTALL=1 bun install && bun link`.
+> **Reinstalled over an existing brain?** The install runs no scripts. The first gbrain command applies schema migrations, and when upgrade migrations are still pending it says so with the command that runs them ([#218](https://github.com/garrytan/gbrain/issues/218)): `gbrain apply-migrations --yes --no-autopilot-install`. Run `gbrain doctor` if that exits 1. The deterministic fallback is `git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && GBRAIN_NO_AUTOPILOT_INSTALL=1 bun install && bun link`.
 
 The init flow detects your repo size and suggests Supabase for brains > 1000 markdown files. Agent-harness installs that want Postgres first can run the ladder instead:
 

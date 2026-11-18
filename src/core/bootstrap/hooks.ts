@@ -32,6 +32,7 @@ import { normalizeSeatLabel } from '../context/seat.ts';
 import { detectExecutionEnvironment } from '../execution-env.ts';
 import { stdioServeArgv } from '../mcp-registration.ts';
 import { isHookLauncherPath } from '../setup/hook-launcher.ts';
+import { SKILL_RESOLVER_MARKER } from '../setup/skill-resolver-lane.ts';
 import type { McpSurface } from '../../mcp/surface.ts';
 import type { HarnessReceipt, HarnessTarget } from './format.ts';
 import {
@@ -468,11 +469,11 @@ function isOurs(entry: unknown, marker: string = GBRAIN_HOOK_MARKER_VALUE): bool
   );
 }
 
-/** True when the entry carries the gbrain marker KEY with any OTHER value. */
+/** True when the entry carries the gbrain marker KEY with any OTHER value (the skill-resolver lane's never double-fires a context hook, so it never counts). */
 function isForeignGbrainMarked(entry: unknown, marker: string): boolean {
   if (typeof entry !== 'object' || entry === null) return false;
   const v = (entry as Record<string, unknown>)[GBRAIN_HOOK_MARKER_KEY];
-  return typeof v === 'string' && v !== marker;
+  return typeof v === 'string' && v !== marker && v !== SKILL_RESOLVER_MARKER;
 }
 
 /**
@@ -1141,7 +1142,7 @@ export type CodexMcpRegistration = Omit<ClaudeMcpRegistration, 'scope'>;
  * (binary first) — the dispatcher execs them; nothing here touches the
  * filesystem or the network. Shape per TARGETS['claude-code-2026-08'].
  *
- * The serve argv comes from `stdioServeArgv`: `--surface full` by default
+ * The serve argv comes from `stdioServeArgv`: `--surface starter` by default
  * (REGISTRATION_SURFACE; bootstrap's contract — put_page, get_page,
  * add_timeline_entry, search, query — stays callable, and a pre-existing `mcp_surface: verbs` config row cannot
  * narrow a pinned registration), listing the memory verbs and request_tools

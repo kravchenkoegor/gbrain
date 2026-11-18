@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * Engine-sql dynamic-SQL guard (refactor wave 1, A2b / CQ3 / EO8 / EO17;
- * docs/TESTING.md#engine-sql-dynamic-sql).
+ * docs/ci-guards.md#engine-sql-dynamic-sql).
  *
  * In src/core/engine-sql/** every value reaches SQL as a bound parameter
  * (`sqlFragment`), and only constant text is spliced. This guard parses each
@@ -35,7 +35,7 @@ import ts from 'typescript';
 
 const ROOT = process.env.GBRAIN_GUARD_ROOT ?? join(import.meta.dir, '..');
 const SCAN_DIR = 'src/core/engine-sql';
-const ANCHOR = 'docs/TESTING.md#engine-sql-dynamic-sql';
+const ANCHOR = 'docs/ci-guards.md#engine-sql-dynamic-sql';
 
 const EXEMPT_FILES: Record<string, string> = {
   'fragment.ts': 'the renderer itself: it writes the $n placeholders and splices trustedSql text by design',
@@ -63,9 +63,11 @@ const VETTED_BUILDERS: Record<string, string> = {
   replacedBecauseSql: 'src/core/engine-sql/pages.ts: constant GBRA-217 reason projection over a caller alias, with callerReadersAllowedSql on the successor (identities checked by validIdentity before they are quoted in); the boolean picks one of two constant texts',
   validDateSql: 'src/core/valid-time.ts: constant GBRA-217 date normaliser over a caller column expression; engine-sql passes only constant pv.frontmatter keys',
   quarantineFilterFragment: 'src/core/quarantine.ts: constant quarantine predicate over a caller alias',
+  guestSourceExclusionSql: 'src/core/guests/derived.ts: GBRA-504 constant guest-source NOT EXISTS predicate (guests/note.ts guestSourceSql) over a caller alias, or TRUE for a producer that takes guest input; the producer key is a typed union member; no values',
   currentCodeEdgeFilter: 'src/core/code-intel/read-scope.ts: constant current-edge predicate over a caller alias',
   buildCJKKeywordSql: 'src/core/search/cjk-keyword-sql.ts: binds the query as params; shared by both engines',
   currentTextProjectionFilter: 'src/core/search/safe-chunks.ts: constant projection predicate over a caller alias',
+  servedTextProjectionFilter: 'src/core/search/safe-chunks.ts: constant projection predicate over a caller alias, ORed with the constant v153 served-index marker (#9192)',
   chunkVisibleFilter: 'src/core/search/safe-chunks.ts: constant projection + live body generation predicate over caller page/chunk aliases (Wave B)',
   chunkGenerationFilter: 'src/core/search/safe-chunks.ts: constant live body generation predicate over caller page/chunk aliases (Wave B)',
   chunkManifestJoin: 'src/core/search/safe-chunks.ts: constant LEFT JOIN onto the live page_body_manifest row over caller aliases (Wave B)',
@@ -80,19 +82,24 @@ const VETTED_BUILDERS: Record<string, string> = {
   privateTimelineEventFilterFragment: 'src/core/search/private-visibility.ts: constant timeline-event visibility predicate over a caller alias',
   privateSnapshotFilterFragment: 'src/core/search/private-visibility.ts: constant snapshot visibility predicate over a caller alias',
   rederiveHiddenSql: 'src/core/eligibility/sql.ts: constant needs_rederive NOT EXISTS predicate over a literal table name and caller alias; no values',
+  deletedPageProjectionHiddenSql: 'src/core/eligibility/sql.ts: constant soft-deleted-page NOT EXISTS predicate over a literal table name and caller alias; no values',
+  privateFactFilterForCaller: 'src/core/search/private-visibility.ts: privateProvenanceFilterFragment ANDed with privateEntityFilterForCaller (the caller page policy over a constant entity-page alias); no values',
   privateProvenanceFilterFragment: 'src/core/search/private-visibility.ts: constant fact-provenance visibility predicate over a caller alias',
   readersAllowedSql: 'src/core/search/private-visibility.ts: GBRA-218 readers predicate over a caller alias; splices only identities that pass validIdentity (member:/group: plus [a-z0-9._-]), else none',
   callerReadersAllowedSql: 'src/core/search/private-visibility.ts: GBRA-231 readersAllowedSql for the current caller, one conjunct per audience identity; each identity passes validIdentity',
   privacyForCaller: 'src/core/search/private-visibility.ts: the caller privacy arm (TRUE, or the given predicate ORed with private-readable source ids checked by isValidSourceId); callers pass a constant alias and a vetted predicate builder',
   factVisibilitySql: 'src/core/access/member-facts.ts: visibility values filtered to the constant set world/private; widened only by memberFactAdmitSql, whose member id passed ACCESS_ID_RE (no quote) and whose page test is privatePagesFilterForCaller; no values',
-  onMemberPageSql: 'src/core/access/member-facts.ts: constant memory/members/ prefix test over a code-provided facts alias; no values',
+  onOwnedMemoryPageSql: 'src/core/access/member-facts.ts: constant memory/members/ prefix and memory/scope slug test over a code-provided facts alias; no values',
   privateProvenanceFilterUnderPolicy: 'src/core/search/private-visibility.ts: constant fact-provenance predicate (readers part with no identity, or the caller identity on its own member page whose id passed ACCESS_ID_RE; privacy part dropped only under an operator relaxation); no values',
   liveTilingSql: 'src/core/page-body/schema.ts: constant LATERAL aggregate of the live manifest rows of a caller page alias (count, covered bytes, gapless); no values (GST-1209)',
   untiledSql: 'src/core/page-body/schema.ts: constant predicate over caller page and tiling aliases; no values (GST-1209)',
   stagingNeedsTextSql: 'src/core/page-body/schema.ts: constant live-staging text-reference EXISTS predicate over a caller text alias; no values (Wave B purge)',
   atomRetirementPurgeHold: 'src/core/persistence/atom-retirement-hold.ts: constant #7013 restorable-atom purge-hold predicate over a caller pages alias; no values',
   derivedRetirementPurgeHold: 'src/core/persistence/derived-retirement-hold.ts: constant GBRA-161 derived-retirement purge-hold predicate over a caller pages alias; no values',
+  derivedOriginPurgeHold: 'src/core/persistence/derived-origin-hold.ts: constant GST-2689 parked-origin purge-hold predicate over a caller pages alias; no values',
+  pageSearchVectorSql: 'src/core/fts-language.ts: constant page search_vector expression (setweight/to_tsvector) over caller SQL expressions; the language passes VALID_CONFIG_NAME ([a-z][a-z0-9_]*) or falls back to the default, and PAGE_TIMELINE_FTS_MAX_CHARS is a code constant',
   rankingLinkSql: 'src/core/link-ranking-policy.ts: constant non-ranking link-type predicate (code-constant type names) over a caller alias',
+  boundedBodyPrefixSql: 'src/core/page-window/bounded-lead.ts: constant bounded body-prefix expression (BOUNDED_PREFIX_BYTES literal) over a caller page alias; no values',
   retiredPageSql: 'src/core/entities/resolve.ts: constant retired-page frontmatter predicate over a caller alias; no values',
   vectorLiteralSql: 'src/core/engine-sql/facts.ts: master\'s inlined vector literal; toPgVectorLiteral output (numbers joined by commas) + a ::vector/::halfvec constant',
   temporalLinkJoinSql: 'src/core/link-validity.ts: constant LEFT JOIN onto link_relationships over a caller alias; scope is one of two literals',

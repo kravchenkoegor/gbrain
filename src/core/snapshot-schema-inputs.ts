@@ -41,12 +41,15 @@ export const SNAPSHOT_SCHEMA_LEAVES: readonly string[] = [
 /** Dynamic imports inside the closure that never run during schema init or migrations. */
 export const SNAPSHOT_DYNAMIC_IMPORTS_NOT_HASHED: Readonly<Record<string, string>> = {
   'operations.ts': 'verbs.ts request-time verb handlers',
+  'access/attest-sources.ts': 'grants/service.ts, grants/legacy-token.ts and token-mint.ts check grant writes against QM scope sources at request time (GST-1113)',
   'ops/context.ts': 'verbs.ts request-time verb handlers (synthesize source scope, #7147)',
+  'grants/shared-exposure.ts': 'grants/legacy-token.ts reads a rescoped token\'s resolved read set before and after at request time (GST-2898)',
   'ops/facts.ts': 'verbs.ts request-time verb handlers (remember TTL parsing, #7147)',
   'ai/gateway.ts': 'search/projection-statistics.ts embed-drain refresh reads the configured embedding model at request time (#7083)',
   'persistence/memory-mutations.ts': 'verbs.ts request-time verb handlers',
   'persistence/verb-errors.ts': 'verbs.ts request-time verb handlers',
   'search/transcript-quote.ts': 'verbs.ts request-time verb handlers (remember unquotes a copied fact, #8377)',
+  'access/member-facts.ts': 'verbs.ts request-time verb handlers (remember refuses a member world write without share, GST-2243)',
   'feedback/record.ts': 'verbs.ts request-time answer recording',
   'verbs/entity-card.ts': 'verbs.ts request-time verb handlers',
   'verbs/entity-card-identity.ts': 'verbs.ts request-time verb handlers (identity siblings notice)',

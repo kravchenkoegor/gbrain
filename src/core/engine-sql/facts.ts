@@ -27,12 +27,13 @@ import type { SqlExecutor } from './executor.ts';
 import type { LegacyUnscopedRead } from './brands.ts';
 import { sqlFragment, trustedSql } from './fragment.ts';
 import { compileRowNormalizer } from './normalize.ts';
-import { projectionEligibleSql } from '../eligibility/sql.ts';
+import { deletedPageProjectionHiddenSql, projectionEligibleSql } from '../eligibility/sql.ts';
 import { FACT_WITHDRAWAL_STAMP_DEFERRED_SETTING } from '../facts/insert-guard-schema.ts';
 import { privateProvenanceFilterUnderPolicy } from '../search/private-visibility.ts';
-import { factVisibilitySql, onMemberPageSql } from '../access/member-facts.ts';
+import { factVisibilitySql, onOwnedMemoryPageSql } from '../access/member-facts.ts';
 import { storedTrustTier } from '../trust/tier.ts';
 import { ensureWellFormed } from '../text-safe.ts';
+import { valueHash } from '../chronicle/ontology.ts';
 
 export type EmbeddingCast = '::vector' | '::halfvec';
 
@@ -53,9 +54,9 @@ async function embeddingCast(exec: SqlExecutor, probe: ResolveEmbeddingCast | un
  * silently misses matches outside the newest-N window on high-cardinality
  * entities. Parity with the pglite engine's `_listFacts`.
  */
-/** #5575: the read-eligibility predicate for list reads that pass a policy (eligibility/sql.ts). */
-function eligibilityClause(opts: FactListOpts | undefined) {
-  return opts?.eligibility ? sqlFragment` AND ${trustedSql(projectionEligibleSql('facts', 'facts', opts.eligibility))}` : sqlFragment``;
+/** #5575: the read-eligibility predicate for list reads that pass a policy (eligibility/sql.ts); every read hides a deleted page's facts. */
+function eligibilityClause(opts: Pick<FactListOpts, 'eligibility'> | undefined) {
+  return sqlFragment` AND ${trustedSql(opts?.eligibility ? projectionEligibleSql('facts', 'facts', opts.eligibility) : deletedPageProjectionHiddenSql('facts', 'facts'))}`;
 }
 
 /** GST-359 C2: a visibility list, widened only to the caller's own member-page private facts (access/member-facts.ts). */
@@ -136,7 +137,7 @@ export async function insertFact(
         `)).rows;
         const id = Number(ins[0].id);
         (await tx.run(sqlFragment`UPDATE facts SET expired_at = now(), superseded_by = ${id},
-                   valid_until = CASE WHEN valid_from < ${validFrom}::timestamptz AND (valid_until IS NULL OR valid_until > ${validFrom}::timestamptz) THEN ${validFrom}::timestamptz ELSE valid_until END
+                   valid_until = CASE WHEN valid_from < ${validFrom}::timestamptz AND ${validFrom}::timestamptz < COALESCE(valid_until, now()) THEN ${validFrom}::timestamptz ELSE GREATEST(valid_from, LEAST(COALESCE(valid_until, now()), now())) END
                  WHERE id = ${supersedeId} AND expired_at IS NULL`)).rows;
         return id;
       });
@@ -171,11 +172,16 @@ export async function insertFact(
     return { id, status: 'inserted' };
   }
 
-export async function expireFact(exec: SqlExecutor, id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean> {
+/** With `successorFrom` (a supersession) the row's validity ends by supersede-interval.ts's rule; a plain expiry leaves valid_until as stored. */
+export async function expireFact(exec: SqlExecutor, id: number, opts?: { supersededBy?: number; at?: Date; successorFrom?: Date }): Promise<boolean> {
     const at = opts?.at ?? new Date();
     const supersededBy = opts?.supersededBy ?? null;
+    const successor = opts?.successorFrom ?? null;
     const result = await exec.run(sqlFragment`
-      UPDATE facts SET expired_at = ${at}, superseded_by = COALESCE(${supersededBy}, superseded_by)
+      UPDATE facts SET expired_at = ${at}, superseded_by = COALESCE(${supersededBy}, superseded_by),
+        valid_until = CASE WHEN ${successor}::timestamptz IS NULL THEN valid_until
+          WHEN valid_from < ${successor}::timestamptz AND ${successor}::timestamptz < COALESCE(valid_until, now()) THEN ${successor}::timestamptz
+          ELSE GREATEST(valid_from, LEAST(COALESCE(valid_until, now()), now())) END
       WHERE id = ${id} AND expired_at IS NULL
     `);
     return result.affectedRows > 0;
@@ -215,7 +221,11 @@ async function insertFactRows(tx: SqlExecutor, castSuffix: EmbeddingCast,
         hash_text: embedding && input.embedding_model ? wellFormed(input.fact) : null,
         row_num: input.row_num, source_markdown_slug: wellFormed(input.source_markdown_slug),
         claim_metric: wellFormed(input.claim_metric ?? null), claim_value: input.claim_value ?? null, claim_unit: wellFormed(input.claim_unit ?? null),
-        claim_period: wellFormed(input.claim_period ?? null), event_type: wellFormed(input.event_type ?? null), attributed_to: input.attributed_to ?? null, ord,
+        claim_period: wellFormed(input.claim_period ?? null), event_type: wellFormed(input.event_type ?? null), attributed_to: input.attributed_to ?? null,
+        ...(input.dimension && input.value != null
+          ? { dimension: wellFormed(input.dimension), value: wellFormed(input.value), value_hash: valueHash(input.value), dim_status: 'active' }
+          : { dimension: null, value: null, value_hash: null, dim_status: null }),
+        ord,
       };
     });
     const inserted = (await tx.run<{ id: number; source_markdown_slug: string; row_num: number | null }>(sqlFragment`
@@ -225,21 +235,24 @@ async function insertFactRows(tx: SqlExecutor, castSuffix: EmbeddingCast,
         embedding, embedded_at, embedding_model, embedded_text_hash,
         row_num, source_markdown_slug,
         claim_metric, claim_value, claim_unit, claim_period,
-        event_type, attributed_to
+        event_type, attributed_to,
+        dimension, value, value_hash, dim_status
       )
       SELECT ${sourceId}, r.entity_slug, r.fact, r.kind, r.visibility, r.notability, r.context,
         r.valid_from::timestamptz, r.valid_until::timestamptz, r.expired_at::timestamptz, r.source, r.source_session, r.confidence,
         ${castSuffix === '::halfvec' ? trustedSql('r.embedding::halfvec') : trustedSql('r.embedding::vector')}, r.embedded_at::timestamptz, r.embedding_model, md5(r.hash_text),
         r.row_num, r.source_markdown_slug,
         r.claim_metric, r.claim_value, r.claim_unit, r.claim_period,
-        r.event_type, r.attributed_to
+        r.event_type, r.attributed_to,
+        r.dimension, r.value, r.value_hash, r.dim_status
       FROM jsonb_to_recordset(${JSON.stringify(chunk)}::text::jsonb) AS r(
         entity_slug text, fact text, kind text, visibility text, notability text, context text,
         valid_from text, valid_until text, expired_at text, source text, source_session text, confidence real,
         embedding text, embedded_at text, embedding_model text, hash_text text,
         row_num integer, source_markdown_slug text,
         claim_metric text, claim_value double precision, claim_unit text, claim_period text,
-        event_type text, attributed_to text, ord integer)
+        event_type text, attributed_to text,
+        dimension text, value text, value_hash text, dim_status text, ord integer)
       ORDER BY r.ord
       ON CONFLICT (source_id, source_markdown_slug, row_num)
       WHERE row_num IS NOT NULL
@@ -551,7 +564,7 @@ export async function listSupersessions(
       WHERE source_id = ${source_id}
         AND superseded_by IS NOT NULL
         ${since ? sqlFragment`AND COALESCE(expired_at, valid_until) >= ${since}` : sqlFragment``}
-        ${visibilityClause(visibility)}${privacyClause(opts)}${opts?.eligibility ? sqlFragment` AND ${trustedSql(projectionEligibleSql('facts', 'facts', opts.eligibility))}` : sqlFragment``}
+        ${visibilityClause(visibility)}${privacyClause(opts)}${eligibilityClause(opts)}
       ORDER BY COALESCE(expired_at, valid_until) DESC, id DESC
       LIMIT ${limit}
     `)).rows;
@@ -589,7 +602,7 @@ export async function findCandidateDuplicates(
       ? sqlFragment`AND (attributed_to IS NULL OR attributed_to = ${opts.attributedTo})`
       : sqlFragment``;
     const members = opts?.onlyPage ? sqlFragment` AND source_markdown_slug = ${opts.onlyPage}`
-      : opts?.excludeMemberPages ? sqlFragment` AND NOT ${trustedSql(onMemberPageSql('facts'))}` : sqlFragment``;
+      : opts?.excludeMemberPages ? sqlFragment` AND NOT ${trustedSql(onOwnedMemoryPageSql('facts'))}` : sqlFragment``;
     // Validity-lapsed rows are not dedup candidates: a re-stated fact after
     // its valid_until lapses re-inserts fresh (WP5 read-time TTL honesty).
     if (opts?.arm === 'keyword') return findKeywordCandidates(exec, source_id, entitySlug, factText, k, opts);
@@ -657,7 +670,7 @@ async function findKeywordCandidates(
         AND (f.valid_until IS NULL OR f.valid_until > now())
         AND f.source != ALL(${AUDIT_ROW_SOURCES}::text[])
         ${comparable}
-        ${speaker}${opts.onlyPage ? sqlFragment` AND f.source_markdown_slug = ${opts.onlyPage}` : opts.excludeMemberPages ? sqlFragment` AND NOT ${trustedSql(onMemberPageSql('f'))}` : sqlFragment``}
+        ${speaker}${opts.onlyPage ? sqlFragment` AND f.source_markdown_slug = ${opts.onlyPage}` : opts.excludeMemberPages ? sqlFragment` AND NOT ${trustedSql(onOwnedMemoryPageSql('f'))}` : sqlFragment``}
         AND q.q IS NOT NULL AND to_tsvector(${lang}::regconfig, f.fact) @@ q.q
       ORDER BY ts_rank_cd(to_tsvector(${lang}::regconfig, f.fact), q.q) DESC, f.created_at DESC, f.id DESC
       LIMIT ${k}
@@ -678,9 +691,10 @@ export async function findTrajectory(exec: LegacyUnscopedRead, opts: import('../
     const useArray = Array.isArray(opts.sourceIds) && opts.sourceIds.length > 0;
     const sourceIds = useArray ? opts.sourceIds! : null;
     const sourceId = opts.sourceId ?? 'default';
-    // Fail-closed (CV6 / v0.26.9 F7b posture): anything not strictly local
-    // is remote. An omitted flag (cast-bypassed context, caller that forgot
-    // to thread it) degrades to world-only reads, never to a private-fact leak.
+    // Fail-closed (CV6 / v0.26.9 F7b posture): `remote` means world-only facts here
+    // (callers pass worldOnlyFacts(ctx.remote), so the brain owner's remote read passes
+    // false); it gates only the visibility clause. An omitted flag degrades to
+    // world-only reads, never to a private-fact leak.
     const remoteFilter = opts.remote !== false;
 
     // Source-scope predicate: array path (federated) wins over scalar.
@@ -691,6 +705,7 @@ export async function findTrajectory(exec: LegacyUnscopedRead, opts: import('../
     const rows = (await exec.run<{
       id: number;
       valid_from: Date;
+      valid_until: Date | null;
       claim_metric: string | null;
       claim_value: number | null;
       claim_unit: string | null;
@@ -701,7 +716,7 @@ export async function findTrajectory(exec: LegacyUnscopedRead, opts: import('../
       source_markdown_slug: string | null;
       embedding: string | null;
     }>(sqlFragment`
-      SELECT id, valid_from,
+      SELECT id, valid_from, valid_until,
              claim_metric, claim_value, claim_unit, claim_period,
              event_type,
              fact, source_session, source_markdown_slug,
@@ -725,6 +740,7 @@ export async function findTrajectory(exec: LegacyUnscopedRead, opts: import('../
     return [...rows].reverse().map(r => ({
       fact_id: Number(r.id),
       valid_from: r.valid_from instanceof Date ? r.valid_from : new Date(r.valid_from as unknown as string),
+      valid_until: r.valid_until === null ? null : r.valid_until instanceof Date ? r.valid_until : new Date(r.valid_until as unknown as string),
       metric: r.claim_metric,
       value: r.claim_value === null ? null : Number(r.claim_value),
       unit: r.claim_unit,

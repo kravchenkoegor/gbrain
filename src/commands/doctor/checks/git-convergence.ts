@@ -19,11 +19,17 @@
  * toplevel included): no effect will commit them, so the fix asks the user to
  * commit them, then pushes.
  *
+ * GST-2634: a read-only mirror (every source at the root has sync off, which autopilot's git-reconcile skips, and the
+ * upstream remote has no publishable push URL, such as a disabled sentinel, or every source is `mirror_read_only`) whose
+ * commits ahead of upstream touch only the access policy files (`.gbrain/access.yml`, `.gbrain/access.approved`) can never
+ * publish them: the root is reported as info (`policy_only_mirror`), not warn or fail. On a `mirror_read_only` root
+ * the fix text never suggests a push or `git-durability --enable`: its remote is authoritative.
+ *
  * The same entry emits `tracked_ownership_marker` (#5186) for the same roots.
  */
 import { execFileSync } from '../../../core/spawn.ts';
-import { realpathSync, statSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { existsSync, realpathSync, statSync } from 'node:fs';
+import { join, relative, resolve, sep } from 'node:path';
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 import type { Action } from '../../../core/agent-output.ts';
@@ -37,6 +43,11 @@ import { connectedEngine, type DoctorContext, type DoctorEntry } from '../contex
 import { doctorVerify } from '../check-fix.ts';
 import { readPorcelain, readUnpushedCommits, type CheckoutCommit, type CheckoutPorcelain } from '../../../core/persistence/checkout-state.ts';
 import { boundUnknownDetails } from '../bounded-unknown.ts';
+import { isSyncDisabledConfig } from '../../../core/sync-policy.ts';
+import { sourceMirrorReadOnly } from '../../../core/persistence/mirror-read-only.ts';
+import { APPROVED_FILE, POLICY_FILE } from '../../../core/access/policy-git.ts';
+import { readCredentialRefusal } from '../../../core/git/commit-push.ts';
+import { CREDENTIAL_HELPER_KEYS_WHY, credentialHelperKeysArgv, describeHelpers, type CredentialRefusalState } from '../../../core/git/push-credential.ts';
 
 export const GIT_CONVERGENCE_WARN_MS = 6 * 3_600_000;
 export const GIT_CONVERGENCE_FAIL_MS = 24 * 3_600_000;
@@ -46,7 +57,9 @@ const MAX_DIRTY_PATHS = 200;
 
 interface RootReport { root: string; source_ids: string[]; branch: string | null; ahead: number; behind: number; dirty: number;
   oldest_unpushed_at: string | null; oldest_dirty_at: string | null; status: 'ok' | 'warn' | 'fail'; stranded?: true; uncommitted_pages?: string[];
-  managed?: true; diverged?: true; unpushed_commits?: CheckoutCommit[]; porcelain?: CheckoutPorcelain }
+  managed?: true; diverged?: true; unpushed_commits?: CheckoutCommit[]; porcelain?: CheckoutPorcelain; mirror_read_only?: true; policy_only_mirror?: true;
+  /** GST-2961: the last push was refused for the credential git used, and no push has landed since. */
+  credential_refused?: CredentialRefusalState }
 
 const canonicalPath = (path: string) => { try { return realpathSync(path); } catch { return path; } };
 
@@ -75,6 +88,40 @@ async function unwatchedDurableRoots(engine: BrainEngine): Promise<Map<string, s
     roots.set(canonicalPath(top), [...roots.get(canonicalPath(top)) ?? [], ...prefixes]);
   }
   return roots;
+}
+
+/** GST-2634: whether the upstream remote of `branch` has a push URL a push could reach (a URL, an scp-style host path or an existing local path). */
+function publishableRemote(top: string, branch: string | null): boolean {
+  const remote = branch ? git(top, ['config', '--get', `branch.${branch}.remote`])?.trim() : null;
+  const url = remote ? git(top, ['remote', 'get-url', '--push', remote])?.trim() : null;
+  if (!url) return false;
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(url) || /^[^\s/]+:/.test(url) || existsSync(resolve(top, url));
+}
+
+/**
+ * GST-2634: marks each root whose sources are all read-only mirrors (mirror_read_only), and exempts the unpushed commits of
+ * a root that can never publish them: every source has sync off, there is no publishable remote or every source is
+ * mirror_read_only, and what HEAD adds over its fork point with upstream (merge commits included) is only a source's
+ * access policy files.
+ */
+async function markReadOnlyMirrors(engine: BrainEngine, reports: RootReport[], now: number): Promise<void> {
+  const sources = new Map((await engine.executeRaw<{ id: string; local_path: string | null; config: unknown }>('SELECT id, local_path, config FROM sources')
+    .catch(() => [])).map(row => [row.id, row]));
+  for (const report of reports) {
+    const rows = report.source_ids.map(id => sources.get(id));
+    if (!rows.length || rows.some(row => !row)) continue;
+    const readOnly = (await Promise.all(report.source_ids.map(id => sourceMirrorReadOnly(engine, id).catch(() => false)))).every(Boolean);
+    if (readOnly) report.mirror_read_only = true;
+    if (!report.ahead || !rows.every(row => isSyncDisabledConfig(row!.config)) || (!readOnly && publishableRemote(report.root, report.branch))) continue;
+    const policyPaths = new Set(rows.flatMap(row => {
+      const prefix = relative(canonicalPath(report.root), canonicalPath(row!.local_path ?? report.root)).split(sep).join('/');
+      return [POLICY_FILE, APPROVED_FILE].map(file => prefix ? `${prefix}/${file}` : file);
+    }));
+    const paths = git(report.root, ['diff', '--name-only', '--no-renames', '@{u}...HEAD']);
+    if (paths === null || !paths.split('\n').filter(Boolean).every(path => policyPaths.has(path))) continue;
+    report.policy_only_mirror = true;
+    report.status = report.oldest_dirty_at && now - Date.parse(report.oldest_dirty_at) > GIT_CONVERGENCE_WARN_MS ? 'warn' : 'ok';
+  }
 }
 
 /** `timedOut` collects the roots where a git call ran past GIT_TIMEOUT_MS (#7145: a timeout is not an empty answer). */
@@ -148,6 +195,7 @@ export async function gitConvergenceCheck(engine: BrainEngine, now = Date.now())
     byTop.set(report.root, prior ? { ...prior, source_ids: [...prior.source_ids, ...ids] } : report);
   }
   const reports = [...byTop.values()].filter((r): r is RootReport => !('skipped' in r));
+  await markReadOnlyMirrors(engine, reports, now);
   const unwatched = reports.some(r => r.ahead > 0 || tracked.has(r.root)) ? await unwatchedDurableRoots(engine) : new Map<string, string[]>();
   // Q1 (shape A): on a managed canonical checkout, name each commit the upstream lacks and break the porcelain down; a
   // diverged one blocks gbrain sources refresh (refresh_diverged), so it warns at once.
@@ -167,6 +215,13 @@ export async function gitConvergenceCheck(engine: BrainEngine, now = Date.now())
     if (pages.length) report.uncommitted_pages = pages;
     if (report.status === 'ok') report.status = 'warn';
   }
+  // GST-2961: a push the host refused for the credential git used is reported at once; no retry will land it.
+  for (const report of reports) {
+    const refused = readCredentialRefusal(report.root);
+    if (!refused) continue;
+    report.credential_refused = refused;
+    if (report.status === 'ok') report.status = 'warn';
+  }
   const skipped = [...byTop.values()].filter((r): r is { root: string; source_ids: string[]; skipped: string } => 'skipped' in r);
   const details = { roots: reports, skipped, ...(roots.size > MAX_ROOTS ? { not_probed: roots.size - MAX_ROOTS } : {}),
     warn_after_hours: GIT_CONVERGENCE_WARN_MS / 3_600_000, fail_after_hours: GIT_CONVERGENCE_FAIL_MS / 3_600_000, fetched: false };
@@ -177,6 +232,13 @@ export async function gitConvergenceCheck(engine: BrainEngine, now = Date.now())
     return { name: 'git_convergence', status: 'warn', details: { ...details, ...bound.details },
       message: `Git convergence unknown: ${bound.note}; ${reports.filter(r => !timedOut.has(r.root)).length} other checkout(s) have no unpushed commits or stale uncommitted changes. `
         + 'Run git status and git log @{u}..HEAD in each checkout named here to read what it holds.' };
+  }
+  const policyOnly = reports.filter(r => r.policy_only_mirror && r.status === 'ok');
+  if (!bad.length && policyOnly.length) {
+    return { name: 'git_convergence', status: 'ok', severity: 'info', details,
+      message: `${policyOnly.map(r => `${r.root}${r.source_ids.length ? ` (${r.source_ids.join(', ')})` : ''}`).join(', ')}: a read-only mirror whose only local commits are its access policy (${POLICY_FILE}, ${APPROVED_FILE}); `
+        + 'its sync is off and it has no publishable remote, so they stay local by design and nothing needs to be done. '
+        + `${reports.length - policyOnly.length} other Git checkout(s) have no unpushed commits or stale uncommitted changes (compared with the last fetched upstream).` };
   }
   if (!bad.length) {
     return { name: 'git_convergence', status: 'ok', details,
@@ -190,19 +252,36 @@ export async function gitConvergenceCheck(engine: BrainEngine, now = Date.now())
       r.dirty && r.oldest_dirty_at ? `${r.dirty} uncommitted change(s), oldest from ${r.oldest_dirty_at}` : '']
       .filter(Boolean).join('; '));
   // #5808 (#5606 residue): a managed canonical worktree has no bulk push; its owner pushes page writes and the operator pushes the rest.
-  const remedy = bad.some(r => isManagedFilesystemPath(r.root))
-    ? 'Commit and push them: on a managed canonical worktree the persistence owner commits and pushes page writes (gbrain sources writer status <source> --json shows parked pushes; gbrain sources writer git-durability <source> --enable turns them on), and files that are not pages are committed and pushed with plain git in the checkout, never pulled or rebased; elsewhere gbrain sources push --path <root> for a bootstrap workspace, or git push in the checkout'
-    : 'Commit and push them (gbrain sources push --path <root> for a bootstrap workspace, or git push in the checkout)';
-  const stranded = bad.filter(r => r.stranded);
+  const publishable = bad.filter(r => !r.mirror_read_only);
+  const mirrors = bad.filter(r => r.mirror_read_only);
+  const mirrorNote = mirrors.length ? `${mirrors.map(r => r.root).join(', ')} ${mirrors.length === 1 ? 'is a read-only mirror' : 'are read-only mirrors'} (gbrain sources mirror-readonly): gbrain never publishes ${mirrors.length === 1 ? 'it' : 'them'} and the remote is authoritative, so make these changes in the upstream repository instead, or run gbrain sources mirror-writable <source> if this checkout should publish` : '';
+  const remedy = [!publishable.length ? '' : publishable.some(r => isManagedFilesystemPath(r.root))
+    ? 'Commit and push them: on a managed canonical worktree the persistence owner commits and pushes page writes (gbrain sources writer status <source> --json shows parked pushes; gbrain sources writer git-durability <source> --enable turns them on), and files that are not pages are committed with gbrain git commit-push -m <msg> -- <paths> in the checkout, never pulled or rebased; elsewhere gbrain sources push --path <root> for a bootstrap workspace, or git push in the checkout'
+    : 'Commit and push them (gbrain sources push --path <root> for a bootstrap workspace, or git push in the checkout)', mirrorNote].filter(Boolean).join('. ');
   const status = bad.some(r => r.status === 'fail') ? 'fail' : 'warn';
+  const refused = bad.find(r => r.credential_refused);
+  if (refused) {
+    const c = refused.credential_refused!;
+    const answered = c.helpers.find(h => h.answered);
+    const who = answered ? `the credential from ${answered.helper}${answered.scope ? ` (${answered.scope} config)` : ''}${c.username ? ` for ${c.username}` : ''}` : 'the credential git used';
+    const others = bad.filter(r => r.credential_refused && r !== refused).length;
+    return { name: 'git_convergence', status, details,
+      message: `Git checkouts have not converged with their upstream: ${lines.join(' | ')}. ${refused.root}: ${c.url} has refused every push since ${c.since} (${c.attempts} attempt(s), push_credential_refused: ${c.kind === 'not_found' ? '"Repository not found", HTTP 404' : 'HTTP 403'}) for ${who}, so its commits stay on this machine until git uses a credential for an account that can push there. ${describeHelpers(c)}${others ? ` ${others} other checkout(s) are refused the same way, see details.roots (credential_refused).` : ''} This compares with the last fetched upstream and does not fetch.${boundNote}`,
+      fix: { actor: 'user', consent: [], requires_exclusive: false,
+        argv: credentialHelperKeysArgv(refused.root),
+        why: CREDENTIAL_HELPER_KEYS_WHY,
+        user_message: `Pushes from ${refused.root} to ${c.url} have been refused since ${c.since} for ${who}, so ${refused.ahead} commit(s) are only on this machine (nothing is lost). ${describeHelpers(c)} Please make git use a credential for an account that can push to this repository: the read-only command in this fix lists each credential helper key (such as credential.helper) with the file that sets it, so change the key in the file whose helper answered, then run gbrain git commit-push --push-only --path ${refused.root}.`,
+        verify: doctorVerify('git_convergence') } };
+  }
+  const stranded = publishable.filter(r => r.stranded);
   const uncommitted = stranded.find(r => r.uncommitted_pages);
   if (uncommitted) {
     const pages = uncommitted.uncommitted_pages!;
-    const push: Action = { argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', uncommitted.root], consent: [], actor: 'agent', requires_exclusive: false,
-      why: 'Publishes the commit just made without moving the checkout.', verify: doctorVerify('git_convergence') };
+    const push: Action = { argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--scan-secrets', '--path', uncommitted.root], consent: [], actor: 'agent', requires_exclusive: false,
+      why: 'Publishes the commit just made without moving the checkout, after scanning what the unpublished commits add for secrets.', verify: doctorVerify('git_convergence') };
     return { name: 'git_convergence', status, details,
-      message: `Git checkouts have not converged with their upstream: ${lines.join(' | ')}. ${uncommitted.root} is a managed checkout with Git durability on, ${pages.length} tracked file(s) modified under its source root (${pages.slice(0, 5).join(', ')}${pages.length > 5 ? ', ...' : ''}) and no Git effect queued, running or parked, so no effect will commit them (#7091: earlier releases committed no edits to tracked pages when the source root sits below the repository top). Review and commit them with plain git, then push with the keep-checkout publish. ${remedy}; this compares with the last fetched upstream and does not fetch.${boundNote}`,
-      fix: { ask_user: true, argv: ['git', '-C', uncommitted.root, 'commit', '-m', 'gbrain: persist canonical memory update', '--', ...pages], consent: [], actor: 'user', requires_exclusive: false,
+      message: `Git checkouts have not converged with their upstream: ${lines.join(' | ')}. ${uncommitted.root} is a managed checkout with Git durability on, ${pages.length} tracked file(s) modified under its source root (${pages.slice(0, 5).join(', ')}${pages.length > 5 ? ', ...' : ''}) and no Git effect queued, running or parked, so no effect will commit them (#7091: earlier releases committed no edits to tracked pages when the source root sits below the repository top). Review them and commit them with gbrain git commit-push, then push with the keep-checkout publish. ${remedy}; this compares with the last fetched upstream and does not fetch.${boundNote}`,
+      fix: { ask_user: true, argv: ['gbrain', 'git', 'commit-push', '--path', uncommitted.root, '-m', 'gbrain: persist canonical memory update', '--', ...pages], consent: [], actor: 'user', requires_exclusive: false,
         why: `These tracked files under a durable managed source root differ from the last commit and no Git effect will commit them; committing writes them to the checkout's history, so the user reviews them first.${stranded.length > 1 ? ` ${stranded.length - 1} other checkout(s) are stranded too, see details.roots (stranded).` : ''}`,
         user_message: `${pages.length} page file(s) in ${uncommitted.root} were edited but never committed (${pages.slice(0, 5).join(', ')}${pages.length > 5 ? ', ...' : ''}), so they are not on the remote. Commit them and push?`,
         verify: doctorVerify('git_convergence'), then: push } };
@@ -211,15 +290,15 @@ export async function gitConvergenceCheck(engine: BrainEngine, now = Date.now())
     const first = stranded[0]!;
     return { name: 'git_convergence', status, details,
       message: `Git checkouts have not converged with their upstream: ${lines.join(' | ')}. ${stranded.map(r => r.root).join(', ')} ${stranded.length === 1 ? 'is a managed checkout' : 'are managed checkouts'} with Git durability on and no Git effect queued, running or parked, so no effect will push ${stranded.length === 1 ? 'its' : 'their'} commits; push them with the keep-checkout publish, which merges a moved remote in memory and never moves the checkout. ${remedy}; this compares with the last fetched upstream and does not fetch.${boundNote}`,
-      fix: { argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', first.root], consent: [], actor: 'agent', requires_exclusive: false,
-        why: `${first.root} has ${first.ahead} commit(s) not on its upstream and no Git effect left to push them (#7089); this publishes the commits already on the branch and commits nothing. A conflict with the remote is reported with the user's choice as its fix.${stranded.length > 1 ? ` ${stranded.length - 1} other checkout(s) need the same, see details.roots (stranded).` : ''}`,
+      fix: { argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--scan-secrets', '--path', first.root], consent: [], actor: 'agent', requires_exclusive: false,
+        why: `${first.root} has ${first.ahead} commit(s) not on its upstream and no Git effect left to push them (#7089); this publishes the commits already on the branch and commits nothing, refusing with publish_secret_found when what they add looks like a secret. A conflict with the remote is reported with the user's choice as its fix.${stranded.length > 1 ? ` ${stranded.length - 1} other checkout(s) need the same, see details.roots (stranded).` : ''}`,
         verify: doctorVerify('git_convergence') } };
   }
-  const diverged = bad.find(r => r.diverged);
+  const diverged = publishable.find(r => r.diverged);
   if (diverged) {
     return { name: 'git_convergence', status, details,
       message: `Git checkouts have not converged with their upstream: ${lines.join(' | ')}. ${diverged.root} is a managed checkout that diverged from its upstream, so gbrain sources refresh refuses (refresh_diverged) until its local commits are published merged with the upstream; details.roots lists each one (sha, author, date, paths). ${remedy}; this compares with the last fetched upstream and does not fetch.${boundNote}`,
-      fix: { ask_user: true, argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', diverged.root, '--json'], consent: [], actor: 'user', requires_exclusive: false,
+      fix: { ask_user: true, argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--scan-secrets', '--path', diverged.root, '--json'], consent: [], actor: 'user', requires_exclusive: false,
         why: `${diverged.root} holds ${diverged.ahead} commit(s) its upstream lacks while the upstream moved on; this merges the upstream into HEAD in memory, refuses on a conflict, pushes the merge and never moves the checkout, after which gbrain sources refresh fast-forwards. It publishes those commits, so the user reviews them first.`,
         user_message: `${diverged.root} has ${diverged.ahead} local commit(s) that were never pushed (newest ${diverged.unpushed_commits?.[0]?.sha.slice(0, 7) ?? 'unknown'} by ${diverged.unpushed_commits?.[0]?.author ?? 'unknown'}) while its remote moved on. Push them, merged with the remote, so gbrain can bring the checkout up to date?`,
         verify: doctorVerify('git_convergence') } };

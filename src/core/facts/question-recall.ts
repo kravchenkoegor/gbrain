@@ -14,6 +14,8 @@ import type { BrainEngine, FactRow } from '../engine.ts';
 import type { Action, Notice } from '../agent-output.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { opError } from '../ops/contract.ts';
+import { sqlQueryForEngine } from '../sql-query.ts';
+import { sharedReadSources } from '../grants/read-shared.ts';
 import { MEMORY_VERBS_VERSION } from '../verbs.ts';
 import { getEmbeddingDimensions, getEmbeddingModel, isAvailable } from '../ai/gateway.ts';
 import { calibrationKey } from './supersession-threshold.ts';
@@ -73,6 +75,21 @@ export async function unlinkedNamesakes(engine: BrainEngine, lists: Array<Array<
   return groups.size === 1 && !groups.has(null) ? null : candidates;
 }
 
+/**
+ * GST-2898 (D3-B): the one split the read-shared switch creates. A switched key whose write source is outside the
+ * shared set gets both sets of facts, each labelled by its source_id, when the namesakes are exactly its write source
+ * and one shared source; `mergedSources` names the pair. Every other split keeps today's refusal: unscoped keys, keys
+ * writing into a shared source, guest namesakes, two shared namesakes, or a shared set that cannot be read.
+ */
+export async function namesakesOrMerge(ctx: OperationContext, candidates: EntityCandidate[] | null): Promise<{ ambiguousEntity: EntityCandidate[] | null; mergedSources: [string, string] | null }> {
+  const write = ctx.auth?.sourceId;
+  const other = candidates?.length === 2 && candidates.some(c => c.source_id === write) ? candidates.find(c => c.source_id !== write) : undefined;
+  if (!other || !write || ctx.auth?.readShared !== true) return { ambiguousEntity: candidates, mergedSources: null };
+  const shared = await sharedReadSources(sqlQueryForEngine(ctx.engine), ctx.auth.member?.id ?? null).catch(() => null);
+  return shared && !shared.includes(write) && shared.includes(other.source_id)
+    ? { ambiguousEntity: null, mergedSources: [write, other.source_id] } : { ambiguousEntity: candidates, mergedSources: null };
+}
+
 /** The call's arguments without transport metadata, for retry fixes. */
 function callArgs(p: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(p).filter(([k, v]) => !k.startsWith('_') && v !== undefined));
@@ -93,8 +110,8 @@ export function recallArgv(args: Record<string, unknown>): string[] {
 }
 
 /** An `invalid_params` refusal whose fix is the same recall with `retry` arguments. */
-function invalidQuestionCall(message: string, suggestion: string, retry: Record<string, unknown>, why: string) {
-  const e = opError('invalid_params', message, suggestion, {
+function invalidQuestionCall(message: string, suggestion: string, retry: Record<string, unknown>, why: string, cause: { reason?: string; detail?: string } = {}) {
+  const e = opError('invalid_params', message, suggestion, { ...cause,
     fix: { argv: recallArgv(retry), mcp: { tool: 'recall', arguments: retry }, consent: [], actor: 'agent', requires_exclusive: false, why },
   });
   e.protocolVersion = MEMORY_VERBS_VERSION;
@@ -122,7 +139,8 @@ export function parseQuestionParam(p: Record<string, unknown>): string | null {
   }
   if (question.length > QUESTION_MAX_CHARS) {
     throw invalidQuestionCall(`question is ${question.length} characters; the limit is ${QUESTION_MAX_CHARS}.`,
-      `Shorten question to at most ${QUESTION_MAX_CHARS} characters.`, { ...args, question: question.slice(0, QUESTION_MAX_CHARS) }, `The same recall with question cut to ${QUESTION_MAX_CHARS} characters.`);
+      `Shorten question to at most ${QUESTION_MAX_CHARS} characters.`, { ...args, question: question.slice(0, QUESTION_MAX_CHARS) }, `The same recall with question cut to ${QUESTION_MAX_CHARS} characters.`,
+      { reason: 'question_too_long', detail: `max_chars=${QUESTION_MAX_CHARS} received_chars=${question.length}` });
   }
   return question;
 }
@@ -186,9 +204,13 @@ export interface QuestionRecall {
   degraded?: FactsDegraded;
   /** Present when the cosine arm ran on a model with no measured admission floor. */
   calibration?: FactsCalibration;
+  /** Candidates found when none cleared the admission rule (an empty answer that is not an empty match). */
+  belowFloor?: number;
   /** The source holding the most uncomparable facts, for the `embed --stale --facts` fix. */
   unembeddedSource?: string;
   ambiguousEntity: EntityCandidate[] | null;
+  /** GST-2898: the write source and the shared source whose namesake facts were merged (namesakesOrMerge). */
+  mergedSources?: [string, string];
 }
 
 /** Active facts (all facts with `includeExpired`) ranked by relevance to `question` under recall's read policy and filters. */
@@ -200,13 +222,15 @@ export async function rankFactsByQuestion(ctx: OperationContext, input: Question
     ...(input.grep ? { grep: input.grep } : {}),
     ...(input.includeExpired ? { includeExpired: true } : {}),
   };
+  let mergedSources: [string, string] | undefined;
   const empty = (degraded?: FactsDegraded, ambiguousEntity: EntityCandidate[] | null = null): QuestionRecall => ({ rows: [], relevance: new Map(), ambiguousEntity, ...(degraded ? { degraded } : {}) });
   try {
     if (input.entity) {
       const { resolveEntitySlug } = await import('../entities/resolve.ts');
       filters.entities = await Promise.all(input.factSources.map(async src => ({ sourceId: src, slug: (await resolveEntitySlug(ctx.engine, src, input.entity!)) ?? input.entity! })));
-      const ambiguous = await unlinkedNamesakes(ctx.engine, [await poolEntityPairs(ctx.engine, scope, filters)]);
-      if (ambiguous) return empty(undefined, ambiguous);
+      const split = await namesakesOrMerge(ctx, await unlinkedNamesakes(ctx.engine, [await poolEntityPairs(ctx.engine, scope, filters)]));
+      if (split.ambiguousEntity) return empty(undefined, split.ambiguousEntity);
+      if (split.mergedSources) mergedSources = split.mergedSources;
     }
   } catch (error) {
     throw rankingUnavailable(input.params, error);
@@ -217,7 +241,7 @@ export async function rankFactsByQuestion(ctx: OperationContext, input: Question
     const [pool, uncomparable, rule, switches] = await Promise.all([
       collectFactCandidates(ctx.engine, question, scope, embedding, {
         depth: { keyword: QUESTION_POOL_DEPTH, cosine: QUESTION_POOL_DEPTH, entity: QUESTION_POOL_DEPTH }, filters, cosineForAll: true,
-        hnswIterativeScan: resolveHnswIterativeScan(ctx.engine, ctx.config),
+        hnswIterativeScan: resolveHnswIterativeScan(ctx.engine, ctx.config), distinctiveTerms: true,
       }),
       embedding ? countUncomparableFacts(ctx.engine, scope, filters, embedding.length) : [],
       admissionRule(ctx.engine),
@@ -225,7 +249,8 @@ export async function rankFactsByQuestion(ctx: OperationContext, input: Question
     ]);
     const weighted = switches.weighting;
     const grouped = switches.grouping && !input.entity;
-    const ranked = scoreFactCandidates(question, pool.candidates).filter(s => admitted(s, rule));
+    const scored = scoreFactCandidates(question, pool.candidates, pool.terms, pool.stems);
+    const ranked = scored.filter(s => admitted(s, rule));
     const unembedded = uncomparable.reduce((n, r) => n + r.n, 0);
     const why = reason ?? (embedding && !pool.column ? 'facts_embedding_column_missing' : undefined);
     const degraded: FactsDegraded | undefined = why || unembedded ? { ...(why ? { reason: why } : {}), ...(unembedded ? { unembedded } : {}) } : undefined;
@@ -244,7 +269,8 @@ export async function rankFactsByQuestion(ctx: OperationContext, input: Question
       relevance: new Map(ranked.map(s => [s.candidate.id, Math.round(s.score * 1e4) / 1e4])),
       ...(weighting ? { weighting: { rank: weighting.rank, factor: weighting.factor } } : {}),
       ...(grouped ? { groupByEntity: true } : {}),
-      ambiguousEntity: null,
+      ambiguousEntity: null, ...(mergedSources ? { mergedSources } : {}),
+      ...(scored.length && !ranked.length ? { belowFloor: scored.length } : {}),
       ...(degraded ? { degraded } : {}),
       ...(modelKey && FACT_ADMISSION_FLOOR_EVIDENCE[modelKey] === undefined ? { calibration: { status: 'unmeasured' as const, model_key: modelKey } } : {}),
       ...(uncomparable[0] ? { unembeddedSource: uncomparable[0].source_id } : {}),

@@ -5,7 +5,7 @@ import { DEFAULT_PARALLEL_SOURCES } from '../core/sync-concurrency.ts';
 import { withHumanLogsToStderr, withSourcePrefix } from '../core/console-prefix.ts';
 import { msysToNativePath } from '../core/path-confine.ts';
 import { performSync } from './sync/perform.ts';
-import { runSyncInner } from './sync/run.ts';
+import { clearTerminationFallback, runSyncInner } from './sync/run.ts';
 
 // Refactor wave 1 (W4 sync): the implementation lives in src/commands/sync/.
 // This file keeps the SyncResult / SyncOpts types and every export, so
@@ -58,7 +58,7 @@ export interface SyncResult {
    * QUOTA — retry after fixing the provider) from genuine file poison
    * (--skip-failed territory).
    */
-  failureCodes?: Array<{ code: string; count: number }>;
+  failureCodes?: Array<{ code: string; count: number }>; /** GST-2492 PR 2: advice for a cause in the source's mode, not the files (`strict_requires_managed`). */ failureAdvice?: string;
   /**
    * Files skipped because their FILENAME contains bracket/control characters
    * (SyncableReason 'malformed-path'). Informational — these never gate
@@ -76,6 +76,8 @@ export interface SyncResult {
   tail?: Omit<import('../core/persistence/sync-tail.ts').SyncTailReport, 'links'>;
   /** GBRA-217: the pass's change-reason notices (a failed or capped trailer scan, a secret in a pushed trailer) and its count of skipped malformed trailers. */
   reason_notices?: import('../core/agent-output.ts').Notice[];
+  /** GST-2462: the run's one `privacy_label_ignored` notice, counting by value the pages it wrote whose privacy label gbrain ignores. */
+  privacy_label_notice?: import('../core/agent-output.ts').Notice;
   reason_trailers_malformed?: number;
   /** #5459 (P4.5): live pages a `--full` tree walk kept because their file is in the working tree and their import provenance is the working tree or unknown. */
   working_tree_kept?: number;
@@ -145,8 +147,8 @@ export interface SyncResult {
    * `holds_fix` (a host-operator relay) only.
    */
   held?: import('../core/persistence/sync-holds.ts').GitHoldItem[];
-  held_count?: number; held_needs_human?: number;
-  holds_outstanding?: number;
+  held_count?: number; held_needs_human?: number; carried?: import('../core/persistence/sync-holds.ts').CarriedHolds[]; skipped?: { symlink_dangling: { count: number; sample: string[] } };
+  holds_outstanding?: number; holds_released?: number;
   holds_escalated?: boolean;
   holds_truncated?: boolean;
   /** A sliced run (`writer_yield`) has not screened every entry yet. */
@@ -216,6 +218,8 @@ export interface SyncOpts {
   canonicalOverride?: 'git';
   /** #7866, internal (the conversion's strict passes): a full round without a `--full` episode, so a page equal to its blob is not re-imported. */
   fullRound?: boolean;
+  /** PR A, internal (the conversion's strict passes): the Git verdicts over database versions the plan approved; any other is held (sync-pass.ts ConversionBinding). */
+  conversionBinding?: import('../core/persistence/sync-pass.ts').ConversionBinding;
   /**
    * v0.18.0 Step 5 — sync a specific named source. When set, sync reads
    * local_path + last_commit from the sources table (not the global
@@ -437,7 +441,7 @@ export {
   composeAbortSignals,
 } from '../core/sync-reconcile.ts';
 
-export async function runSync(engine: BrainEngine, args: string[]) {
+export async function runSync(engine: BrainEngine, args: string[], opts: { ownSignals?: boolean } = {}) {
   // #4888: under --json, stdout is reserved for the ONE JSON envelope (#4684:
   // the cost-gate status object rides inside it as `cost_gate`); every slog()
   // human line from performSync and its callees routes to stderr instead.
@@ -445,7 +449,7 @@ export async function runSync(engine: BrainEngine, args: string[]) {
   // `sync status|unblock --json` (sync/operator.ts) write through
   // writeJsonDocument, the guard's only stdout path.
   const stopTrace = startMemoryTrace('sync');
-  try { return await (args.includes('--json') ? withHumanLogsToStderr(() => runSyncInner(engine, args)) : runSyncInner(engine, args)); } finally { stopTrace(); }
+  try { const out = await (args.includes('--json') ? withHumanLogsToStderr(() => runSyncInner(engine, args, opts)) : runSyncInner(engine, args, opts)); await (await import('./sources-add-next.ts')).noteSyncOutOfSearch(engine, args); return out; } finally { stopTrace(); clearTerminationFallback(); }
 }
 
 /**

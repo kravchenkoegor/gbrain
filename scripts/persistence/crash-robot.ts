@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import type { GBrainConfig } from '../../src/core/config.ts';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { sqlEngineKind } from '../../src/core/sql-engine-kind.ts';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { disposePersistenceConsumer, startPersistenceConsumer } from '../../src/core/persistence/service.ts';
 import { installFaultHook, type FaultDetail, type FaultPoint } from '../../src/core/persistence/fault-points.ts';
@@ -94,7 +95,7 @@ export async function settlePending(world: World, model: ReferenceModel): Promis
 }
 
 /** Finish a schedule: drain, check drained invariants, prove a fresh write still admits, and drain that write's effects. */
-export async function finish(world: World, model: ReferenceModel, label: string, drainMs: number = DRAIN_BOUND_MS[world.engine.kind]): Promise<void> {
+export async function finish(world: World, model: ReferenceModel, label: string, drainMs: number = DRAIN_BOUND_MS[sqlEngineKind(world.engine.kind, 'crash robot')]): Promise<void> {
   const drained = await drain(world.engine, world, drainMs);
   if (!drained) model.violate({ class: 'wedge', detail: `${label}: requests or effects did not drain within ${drainMs / 1000} s` });
   await settlePending(world, model);
@@ -157,6 +158,8 @@ interface RobotState {
 }
 export interface RobotOutcome extends Omit<ScheduleResult, 'observations'> {
   crashed: boolean; fault?: RobotConfig['fault']; process?: ProcessFault; counts?: Record<string, number>; inFlight?: string[];
+  /** A run that finished without reaching its fault: how many slots of the fault's seam it made (#8078). */
+  reached?: number;
   /** What each caller observed, kept only for a run with violations. */
   trace?: string[];
   /** Known findings outside the safety classes, filed in TODOS.md: reported, never failing the gate. */
@@ -283,17 +286,17 @@ export function fixedChunks(runner: typeof hardenedGitStream = hardenedGitStream
  * `fault_hook_error` event and the process freezes anyway; the driver counts
  * such a run as a gate failure.
  */
-export function robotFaultHook(fault: NonNullable<RobotConfig['fault']>): (point: FaultPoint, detail: FaultDetail) => void {
+export function robotFaultHook(fault: NonNullable<RobotConfig['fault']>): ((point: FaultPoint, detail: FaultDetail) => void) & { reached(): number } {
   let seen = 0;
   const counts = seamCounter();
-  return (point, detail) => {
+  return Object.assign((point: FaultPoint, detail: FaultDetail) => {
     const advanced = counts(point, detail);
     if (point !== fault.point || (fault.operation && detail.operation !== fault.operation) || !advanced) return;
     seen += advanced;
     if (seen < fault.nth) return;
     try { freeze({ event: 'fault', point, nth: seen, detail }); }
     catch (error) { freeze({ event: 'fault_hook_error', point, nth: seen, message: error instanceof Error ? error.message : String(error) }); }
-  };
+  }, { reached: () => seen });
 }
 
 function finalize(config: RobotConfig, model: ReferenceModel, extra: Partial<RobotOutcome>): RobotOutcome {
@@ -311,7 +314,7 @@ function finalize(config: RobotConfig, model: ReferenceModel, extra: Partial<Rob
 }
 
 /**
- * A git shim whose `git commit` hangs while the marker file exists, holding the
+ * A git shim whose `git commit` (or `commit-tree`, the Git effect's commit) hangs while the marker file exists, holding the
  * checkout's index.lock the way a real stuck git does: SIGTERM lets it remove
  * its lock and exit, SIGKILL leaves the lock behind.
  */
@@ -320,7 +323,7 @@ function installHungGit(root: string): { marker: string; release(): void } {
   const real = Bun.which('git')!; const marker = join(root, 'hung-git.marker');
   writeFileSync(join(dir, 'git'), `#!/bin/sh
 repo=.; prev=; commit=
-for a in "$@"; do [ "$prev" = -C ] && repo="$a"; [ "$a" = commit ] && commit=1; prev="$a"; done
+for a in "$@"; do [ "$prev" = -C ] && repo="$a"; case "$a" in commit|commit-tree) commit=1;; esac; prev="$a"; done
 if [ -n "$commit" ] && [ -e '${marker}' ]; then
   lock="$repo/.git/index.lock"; : > "$lock"; echo $$ >> '${marker}.pids'
   trap 'kill $! 2>/dev/null; rm -f "$lock"; exit 143' TERM
@@ -462,8 +465,9 @@ export async function robotWorker(role: 'count' | 'run' | 'recover', config: Rob
     __setSyncGitStreamForTests(fixedChunks());
     const counts: Record<string, number> = {};
     const counted = seamCounter();
+    const faultHook = role === 'run' && config.fault ? robotFaultHook(config.fault) : undefined;
     const hook = role === 'count' ? (point: FaultPoint, detail: FaultDetail) => { const advanced = counted(point, detail); if (advanced) counts[point] = (counts[point] ?? 0) + advanced; }
-      : role === 'run' && config.fault ? robotFaultHook(config.fault) : undefined;
+      : faultHook;
     if (hook) {
       world.claimPasses = 0;
       installFaultHook((point, detail) => { if (point === 'consumer:claiming') world.claimPasses!++; hook(point, detail); });
@@ -475,7 +479,7 @@ export async function robotWorker(role: 'count' | 'run' | 'recover', config: Rob
       if (config.process) { await processFault(config, world, model, checkouts); return finalize(config, model, { process: config.process }); }
       await runSteps(world, model, config.schedule, 0, (i, batch) => { next = i; inFlight = batch.map(d => d.id); writeState(config, world, model, checkouts, next, inFlight); });
       await finish(world, model, config.schedule.label);
-      return finalize(config, model, { fault: config.fault });
+      return finalize(config, model, { fault: config.fault, ...(faultHook ? { reached: faultHook.reached() } : {}) });
     }
     if (role === 'count') {
       await runSteps(world, model, config.schedule);
@@ -487,7 +491,7 @@ export async function robotWorker(role: 'count' | 'run' | 'recover', config: Rob
     model.beginStep(inFlight.length > 1);
     model.allowInFlight(inFlight); model.relaxInFlight(inFlight);
     await model.checkGlobal('after SIGKILL, before recovery');
-    const bound = DRAIN_BOUND_MS[engine.kind];
+    const bound = DRAIN_BOUND_MS[sqlEngineKind(engine.kind, 'crash robot')];
     const drained = await drain(engine, world, bound);
     if (!drained) model.violate({ class: 'wedge', detail: `recovery: requests or effects did not drain within ${bound / 1000} s after restart` });
     await model.checkDrained('recovered');

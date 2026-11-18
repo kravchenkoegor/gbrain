@@ -8,12 +8,14 @@
 > gbrainio workspace new         # a person picks the plan in the browser
 > curl -fsSL https://bun.sh/install | bash   # skip if Bun 1.4.4+ is installed
 > export PATH="$HOME/.bun/bin:$PATH"
-> bun install -g github:garrytan/gbrain#latest-stable   # the gbrain CLI only; no local brain
+> bun install -g github:garrytan/gbrain#stable   # the gbrain CLI only; no local brain
 > # Claude Code (an existing gbrain entry is kept):
 > (claude mcp get gbrain >/dev/null 2>&1 || claude mcp add --transport http --scope user gbrain https://gbrain.io/mcp) && gbrain setup claude-code --instructions-only
 > # Codex (an existing gbrain entry is kept):
 > (codex mcp get gbrain >/dev/null 2>&1 || codex mcp add gbrain --url https://gbrain.io/mcp) && gbrain setup codex --instructions-only
 > ```
+>
+> Bun's installer needs `unzip` and stops with `error: unzip is required to install bun` without it. Check with `command -v unzip`; if it prints nothing, install it first: `apt-get update && apt-get install -y unzip` (Debian, Ubuntu), `dnf install -y unzip` (Fedora, RHEL) or `apk add unzip` (Alpine), with `sudo` in front unless you are root. No way to install packages? Use the [no-unzip route](#no-unzip), not an improvised one.
 >
 > `gbrain setup <harness> --instructions-only` tells the agent the brain is there; agents seldom call an MCP server nobody told them about. It writes the [brain-first block](docs/guides/setup.md#brain-first-instructions) into `~/.claude/CLAUDE.md` or Codex's `AGENTS.md` (a non-empty `AGENTS.override.md` instead when Codex has one) with a per-turn rule hook, and leaves the MCP entry alone; the same command with `--no-instructions` added takes them out.
 >
@@ -21,11 +23,11 @@
 
 ## Self-host GBrain
 
-GBrain is MIT-licensed and free to self-host; the rest of this guide installs it on the user's machine. Default to adding keyless memory to their existing agent, preserving identity and unrelated configuration. API keys, enrichment, automatic capture, and a new personal-agent identity are separate choices.
+GBrain is MIT-licensed and free to self-host; the rest of this guide installs it on the user's machine. Default to adding keyless memory to their existing agent, preserving identity and unrelated configuration. API keys, enrichment, automatic capture, and a new personal-agent identity are separate choices. The [conversation archive](docs/guides/conversation-archive.md) is on by default on a personal brain (nothing leaves a keyless machine); relay it with the first-run settings, and `gbrain transcripts archive off` turns it off.
 
 > **Choose the installation path first.** Inside **[Grok Bot](docs/guides/grok-bot.md)** or **[Muse](docs/guides/muse.md)**, use their dedicated guide: the recommended shape keeps the brain on the user's own computer, published with `gbrain mcp expose --funnel` ([remote MCP](docs/guides/remote-mcp.md)), and installs the thin CLI inside the agent; `scripts/setup-in-agent.sh` is the in-agent alternative, and its receipt tracks repair and native enablement. To make a brain on this computer reachable from the user's other devices, apps, or cloud agents over MCP, follow the **[remote MCP guide](docs/guides/remote-mcp.md)** (`gbrain mcp expose`; confirm the plan before installing Tailscale or a service; `--funnel` only for cloud agents). For an **[existing hosted brain](docs/guides/hosted-harness-access.md)**, choose the harness's native OAuth/PKCE flow or a private machine handoff. Owner login, client management, permissions, and revocation use the separate [MCP administration](docs/mcp/ADMIN.md) path. This guide covers a local brain for other existing agents.
 >
-> **Memory-only path:** install → initialize → relay and confirm the Step 3.5 search-mode choice → connect the harness → verify memory (with `gbrain setup <harness>`, initialize and connect are one command and the search-mode choice is relayed in the reply that reports the install). Skip identity replacement, private-repo bootstrap, automatic capture, cron installation, and paid enrichment unless requested. A keyword-only brain needs no API key. The required search-mode choice still applies; published API cost examples are not prices for the user’s harness subscription.
+> **Memory-only path:** install → initialize → connect the harness → verify memory → report the install with the Step 3.5 search mode and settings in effect (with `gbrain setup <harness>`, initialize and connect are one command). Never end the install on a question. Skip identity replacement, private-repo bootstrap, automatic capture, cron installation, and paid enrichment unless requested. A keyword-only brain needs no API key. The user still sees the search-mode matrix; published API cost examples are not prices for the user’s harness subscription.
 >
 > Only if the user asks for a **new persistent personal agent** with identity and a private repo, follow `BOOTSTRAP_FOR_AGENTS.md`.
 
@@ -51,8 +53,9 @@ If you fetched this file by URL without cloning yet, the companion files live at
 <!-- npm-trap + #218 recovery: canonical copy lives in README.md ("Install" warning) — sync edits. -->
 > **NEVER install from the npm registry.** The npm package named `gbrain` is unrelated and
 > can shadow the real binary. Never run `npm install -g gbrain` or `bun add -g gbrain` (the
-> missing `github:` prefix is the trap). Install only `github:garrytan/gbrain#latest-stable`
-> (plain `github:garrytan/gbrain` installs master) or a git clone, as below. Already installed
+> missing `github:` prefix is the trap). Install only `github:garrytan/gbrain#stable`
+> (the soaked stable channel; `#latest-stable` is the alpha line with every release, and plain
+> `github:garrytan/gbrain` installs master) or a git clone, as below. Already installed
 > from npm? Remove it (`npm uninstall -g gbrain` / `bun remove -g gbrain`); `gbrain doctor` detects it.
 
 > **On Codex or Claude Code?** After the install, the plugin wires MCP plus curated skills:
@@ -64,11 +67,29 @@ Default path (Bun 1.4.4 or newer is required — gbrain is a Bun + TypeScript ru
 ```bash
 curl -fsSL https://bun.sh/install | bash
 export PATH="$HOME/.bun/bin:$PATH"
-bun install -g github:garrytan/gbrain#latest-stable
+bun install -g github:garrytan/gbrain#stable
 ```
 
 Verify: `gbrain --version` should print a version number. If `gbrain` is not found,
 restart the shell or add the PATH export to the shell profile.
+
+Bun's installer needs `unzip` and stops with `error: unzip is required to install bun` without it. Check with `command -v unzip`; if it prints nothing, install it first: `apt-get update && apt-get install -y unzip` (Debian, Ubuntu), `dnf install -y unzip` (Fedora, RHEL) or `apk add unzip` (Alpine), with `sudo` in front unless you are root. No way to install packages? Use the [no-unzip route](#no-unzip), not an improvised one.
+
+<a id="no-unzip"></a>
+
+**No `unzip` and no way to install packages (Linux).** This route puts the same Bun build the official installer would fetch, taken from Bun's own npm package `@oven/bun-linux-<arch>`, into `~/.bun/bin`, the directory the official installer uses, and adds that directory to the PATH of every new login shell. It needs only `curl` and `tar`:
+
+```bash
+arch=$(uname -m); [ "$arch" = x86_64 ] && arch=x64; [ "$arch" = arm64 ] && arch=aarch64
+mkdir -p ~/.bun/bin
+curl -fsSL "https://registry.npmjs.org/@oven/bun-linux-$arch/-/bun-linux-$arch-1.4.4.tgz" | tar -xzO package/bin/bun > ~/.bun/bin/bun.new && chmod +x ~/.bun/bin/bun.new && ~/.bun/bin/bun.new --version && mv ~/.bun/bin/bun.new ~/.bun/bin/bun
+echo 'export PATH="$HOME/.bun/bin:$PATH"' >> ~/.profile
+export PATH="$HOME/.bun/bin:$PATH"
+bun install -g github:garrytan/gbrain#stable
+bash -lc 'gbrain --version'
+```
+
+The PATH line goes in `~/.profile`, which new login shells read. Bash skips `~/.profile` when `~/.bash_profile` or `~/.bash_login` exists, so append the line to that file instead; zsh reads `~/.zprofile`. On Alpine or another musl system, run `arch=$arch-musl` after the first line; on an x64 CPU without AVX2, run `arch=x64-baseline`. The last command must print a version from a fresh shell. Don't install Bun with `npm install -g bun` or run gbrain from a git clone instead: gbrain starts with `#!/usr/bin/env bun`, so it fails in any new shell that can't find `bun` on its PATH.
 
 Next, on Claude Code or Codex: `gbrain setup claude-code` (or `gbrain setup codex`), which needs no API
 key ([Step 3](#step-3-create-the-brain)). On any other harness, `gbrain init --pglite --no-embedding` (Step 3).
@@ -82,11 +103,9 @@ key ([Step 3](#step-3-create-the-brain)). On any other harness, `gbrain init --p
 > (reinstalling does not help).
 >
 > ```bash
-> git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain
+> git clone --branch stable https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain
 > bun install && bun link
 > ```
-
-Bun blocks gbrain's postinstall on `bun install -g` (`Blocked 1 postinstall`); a new install can skip it: the script only repeats the refusal every gbrain command prints on a Bun below the floor and runs `gbrain apply-migrations --yes --non-interactive`, which has nothing to migrate before a brain exists, and `gbrain setup` creates the brain and applies its setup migrations.
 
 ## Step 2: API Keys
 
@@ -146,6 +165,13 @@ whenever the user gives one. Capture
 (`--capture`) and providers (`--providers`) stay off unless the user accepts
 them. A coded refusal (`setup_owner_conflict`, `setup_hosted_connection`) means
 another owner or a hosted brain holds the target; follow its `fix`.
+When the brain will answer several people (a team bot, a shared channel), ask the
+user who they are and add `--serves several --members <id,...>`: each gets a member,
+a folder `people/<member>/` only they read and a bound key
+(`~/.gbrain/member-keys/<member>.key`; relay paths, never keys). On
+`setup_serves_several`, rerun with its fix. Add `--stdio-member <member>`
+(claude-code, codex) only for a harness one person uses. Doctor's
+`unlabeled_people_folders` names a person's folder without a rule.
 `--remove` undoes only what setup wrote. Guide:
 [docs/guides/setup.md](docs/guides/setup.md). Otherwise:
 
@@ -154,21 +180,23 @@ gbrain init --pglite --no-embedding     # keyless memory, no server needed
 gbrain doctor --json                   # inspect diagnostics and any warnings
 ```
 
-**The first-run decision bundle.** Init asks every first-run question once, in
-one bundle, and does not wait for the answers: it applies defaults and exits 0.
-Human output prints it as an `[AGENT]` block; `gbrain init --json` carries it
-as a notice of kind `ask` with `decisions[]`:
+**The first-run settings.** Init applies its defaults and exits 0; nothing waits
+for an answer. When no agent is connected yet it prints a `harness_wiring`
+notice: connecting gbrain to the agent you run in is part of the install, so do
+it now (Step 5), not after the user replies. It also prints the settings in
+effect once, as an `[AGENT]` block (`gbrain init --json`: a notice of kind
+`ask` with `decisions[]`):
 
-| Decision | What the user picks | Default |
+| Setting | What the user can change | In effect |
 |---|---|---|
 | `search_mode` | `conservative`, `balanced` or `tokenmax`, with the cost matrix (Step 3.5) | the mode init applied, with its reason |
-| `writeback` | whether you save salient facts from conversations without being asked | recommended `salient`; off until the user agrees |
-| `harness_wiring` | registering gbrain in the harness you run in (Step 5) | the exact registration command for the detected harness |
+| `writeback` | whether you save salient facts from conversations without being asked | off; gbrain recommends `salient`, which the user opts into |
 | `skills_scaffold` | optional bundled skills in the agent workspace | skip |
+| `upkeep` | free upkeep while the agent's session is open | on |
 
-Relay the bundle's one `user_message` to the user ("Reply 'defaults' to accept
-…") and apply each answer with the command its option names. One round-trip
-covers Step 3.5 and the wiring question. Details:
+Connect first, then report the install and relay the bundle's `user_message`
+in that reply, as the settings in effect and how to change them. Apply an
+answer with the command its option names whenever the user gives one. Details:
 [first run](docs/protocol/AGENT_OPERATOR_v1.md#first-run).
 
 The user's markdown files and canonical skills are SEPARATE from this tool repo.
@@ -270,20 +298,18 @@ The bundled skills `skills/db-repair/` (triggers on the marker) and
 `skills/postgres-adopt/` (detect / prefer / install / migrate-wrap) drive this
 loop; full reference in `docs/ENGINES.md` ("Engine detection and access repair").
 
-## Step 3.5: Confirm search mode with the user (DO NOT SKIP)
+## Step 3.5: Tell the user which search mode is in effect (DO NOT SKIP)
 
-This is the `search_mode` decision from the first-run bundle.
+This is the `search_mode` setting from the first-run settings.
 `gbrain init` auto-applied a default search mode: `tokenmax` with a chat key
 (Anthropic, OpenAI or Google), `balanced` with a ready reranker but no chat key,
 and `conservative` when your subagent tier is Haiku-class or neither exists. The init output
-included the cost matrix below preceded by `[AGENT]` markers. You must NOT
-silently accept the default. Stop and ask the operator.
-
-After `gbrain setup <harness>` the harness is already wired when the matrix
-appears, so there is nothing to stop before: show the matrix and the applied
-mode in the reply that reports the install, as a choice the user can make at
-any time, and run `gbrain config set search.mode <mode>` when they pick one.
-Don't hold the install open for the answer.
+included the cost matrix below preceded by `[AGENT]` markers. Don't accept it
+silently, and don't stop the install to ask either: on every harness, connect
+gbrain first (with `gbrain setup <harness>` or the `harness_wiring` step), then
+show the matrix and the applied mode in the reply that reports the install, as
+a choice the user can make at any time, and run
+`gbrain config set search.mode <mode>` when they pick one.
 
 If you already know the operator's choice, record it at install time instead:
 `gbrain init --search-mode <conservative|balanced|tokenmax>` stores it as the
@@ -310,9 +336,9 @@ Estimated downstream input cost of the retrieved payload @ 10K queries/mo:
 
 **Ask the operator (paraphrase if needed):**
 
-> Your gbrain just installed with search mode `<auto-applied default>`. This is
-> a one-time setup decision that controls retrieval payload size. Which mode
-> do you want?
+> Your gbrain is installed and connected, with search mode
+> `<auto-applied default>`. It controls retrieval payload size, and you can
+> change it any time. The modes:
 >
 >   1) conservative — tight 4K budget, 10 chunks max, no reranker.
 >      Best for Haiku subagents, cost-sensitive setups, high-volume loops.
@@ -392,6 +418,8 @@ instead of the CLI (one connection, no per-call startup).
 | Links, dated events, every page of a type | `gbrain backlinks <slug>`, `gbrain timeline <slug>`, `gbrain list --type T` | `get_backlinks`, `get_timeline`, `list_pages` |
 | Save a fact the user stated | `gbrain remember "<fact>" --entity <slug> --content-origin user_said --provenance "<where>"` | `remember` |
 | Why a page didn't rank | `gbrain query "<q>" --explain-target <slug>` | `query` |
+| Which installed skill fits a request | `gbrain skills resolve --text "<request>" --json` (after `gbrain skills index build`) | none (CLI only) |
+| Find something archived to B2, Supabase or S3 | `gbrain storage-find "<phrase>"` | `storage_find` |
 
 Parse `--json` output instead of matching the text; notices go to stderr. Never
 send stderr to `/dev/null`: a refusal there (`no_brain`, `GBRAIN_DB_ACCESS`)
@@ -419,7 +447,8 @@ and HTTP MCP) saves references as text without inline graph extraction; a
 post-commit `links` effect then adds plain mention edges to existing pages the
 writer can see (`gbrain config set mcp.remote_auto_links off` disables it). Stdio
 `gbrain serve` runs bounded startup/idle sweeps for typed edges; `gbrain serve --http` does not
-self-sweep. For HTTP, arrange explicit host-side `gbrain sweep --once` or
+self-sweep, and its daily idle upkeep (link extraction included) is the only
+graph work it does on its own. For HTTP, arrange explicit host-side `gbrain sweep --once` or
 extraction; use authorized `add_link` calls for edges needed immediately.
 
 After this step:
@@ -491,7 +520,11 @@ brain rather than making another bundled copy. Follow the
 and preserve edited files.
 
 If you're running an agent platform (OpenClaw, Hermes, or any repo with a workspace),
-scaffold the bundled skills into it. On OpenClaw, install the brain-first core:
+scaffold the bundled skills into it. On OpenClaw the primary route is the
+per-turn rule that `gbrain setup openclaw` installs
+([OpenClaw guide](docs/mcp/OPENCLAW.md#brain-first-instructions)): in
+harness-evals a rule beside each turn was followed on 97-100% of turns and a
+listed skill on 1-3%. Skills are the fallback. Install the brain-first core:
 
 ```bash
 gbrain skillpack scaffold --harness openclaw --workspace /path/to/agent/workspace
@@ -617,13 +650,30 @@ only in the due-job list, which runs only when a session starts.
 
 If skipped, minimal defaults are installed automatically.
 
+## Opt-ins
+
+The default install (keyless PGLite, no repo) adds nothing: no daemon, service
+unit, cron entry, connector or dream schedule, and self-upgrade stays `notify`
+(it reports releases and installs none). An upgrade never installs autopilot on
+a brain without one. Turn each on only when the user asks:
+
+- **Keys and embeddings:** the key (Step 2), then
+  `gbrain init --force --embedding-model voyage:voyage-4 --embedding-dimensions 1024`.
+- **Autopilot** (Postgres): `gbrain autopilot --install --repo <path>`; PGLite uses `gbrain serve`.
+- **Dream schedule:** cron `0 2 * * * <wrapper> dream` ([wrapper](docs/guides/cron-schedule.md#calling-gbrain-unattended)).
+- **Connectors:** `gbrain connectors auth <provider>` ([guide](docs/guides/chat-connectors.md)).
+- **Auto-upgrade:** `gbrain config set self_upgrade.mode auto`.
+- **Release channel:** `gbrain config set self_upgrade.channel alpha` (every release) or `stable`.
+
 ## Step 7: Recurring Jobs
 
 Optional: skip this entire step for memory-only installs. Ask before scheduling
 capture, enrichment, maintenance or a service; do not infer consent from a
 successful install or from a health recommendation.
 
-Set up using your platform's scheduler (OpenClaw cron, Railway cron, crontab), or skip the
+An open `gbrain serve` already runs the free upkeep while its agent is idle
+(`gbrain maintain --status` shows the last run). For the jobs below, set up
+using your platform's scheduler (OpenClaw cron, Railway cron, crontab), or skip the
 platform glue entirely with `gbrain autopilot --install` (built-in self-maintaining daemon).
 
 Every cron job, workspace script and hook calls gbrain through **one wrapper**
@@ -660,11 +710,8 @@ timeout of at least 10 s. The wrapper and its rules:
   paused), 2 the daemon took itself out of rotation. Filesystem-only, so it
   works during DB outages.
 - **Auto-update** (daily): `gbrain check-update --json` (tell user, never auto-install).
-- **Dream cycle** (nightly): `gbrain dream` runs the 8-phase overnight maintenance cycle.
-  Entity sweep, citation fixes, memory consolidation, plus overnight conversation
-  synthesis and cross-session pattern detection. One cron-friendly command. This is what
-  is an opt-in maintenance capability. See `docs/guides/cron-schedule.md` for the
-  full protocol.
+- **Dream cycle** (nightly): `gbrain dream`, the opt-in maintenance cycle
+  ([Opt-ins](#opt-ins), [protocol](docs/guides/cron-schedule.md)).
 - **Weekly**: `gbrain doctor --json && gbrain embed --stale`
 
 ## Step 8: Integrations
@@ -777,8 +824,8 @@ autopilot (`gbrain autopilot pause`), wait until no job is active, run
 `gbrain upgrade` on every install (it restarts every gbrain process onto the
 new build and verifies one build runs, or refuses `restart_refused` naming the
 process it cannot restart), check that each process reports the new version,
-then `gbrain autopilot resume`. A production brain follows the stable channel
-(`gbrain config set self_upgrade.channel stable`)
+then `gbrain autopilot resume`. Installs follow the stable channel by default;
+`gbrain config set self_upgrade.channel alpha` follows every release
 ([the order](skills/gbrain-upgrade/SKILL.md#always-on-hosts-pause-drain-upgrade-verify-resume),
 [stable channel](docs/guides/upgrades-auto-update.md#stable-channel)).
 
@@ -798,9 +845,8 @@ again. Pass `--no-bun-floor-check` only after checking the target yourself
 when the floor cannot be read (offline). See
 [Bun floor](docs/guides/upgrades-auto-update.md#bun-floor).
 
-The autopilot opt-out skips installation and service rewrites, including package
-postinstall hooks; it does not skip other migrations. Keep the environment form
-on the package-manager command because hooks run before `post-upgrade`.
+The autopilot opt-out skips installation and service rewrites; it does not skip
+other migrations.
 `GBRAIN_NO_REEMBED=1` separately skips the potentially paid reindex step.
 For an existing service deployment, review its migration guide instead of
 assuming memory-only options are the desired maintenance policy. Verify a known
@@ -878,6 +924,8 @@ grants.
   writing/originals page content to your configured chat model (default
   Anthropic Haiku). Refuses to run unless `takes.bootstrap_enabled=true`
   is set in config AND `--yes` is passed. Two-gate opt-in by design.
+  `--dry-run` without `--yes` only lists the candidate pages and sends
+  nothing to the model.
 - Autopilot's auto-apply tier for takes-bootstrap is `manual_only`
   (do not bypass).
 

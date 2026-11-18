@@ -244,6 +244,9 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // Authority remains nullable: bootstrap must never authorize historical work.
   { kind: 'column', table: 'minion_jobs', column: 'submission_authority' },
   { kind: 'column', table: 'minion_jobs', column: 'claim_generation' },
+  // v302 (GST-2228): the blob's unique link_transitions_identity_idx includes
+  // link_source, which only v302 adds to a brain at v204-v301.
+  { kind: 'column', table: 'link_transitions', column: 'link_source' },
 ];
 
 test('applyForwardReferenceBootstrap covers every forward reference declared in REQUIRED_BOOTSTRAP_COVERAGE', async () => {
@@ -372,6 +375,12 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
       ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_lease_until;
       ALTER TABLE minion_jobs DROP COLUMN IF EXISTS submission_authority;
       ALTER TABLE minion_jobs DROP COLUMN IF EXISTS claim_generation;
+
+      -- v302 strip: a v204-v301 link_transitions has no link_source and the
+      -- narrower identity index under the same name.
+      ALTER TABLE link_transitions DROP COLUMN IF EXISTS link_source;
+      CREATE UNIQUE INDEX IF NOT EXISTS link_transitions_identity_idx
+        ON link_transitions (origin_page_id, from_page_id, to_page_id, link_type, kind, occurred_on, producer) NULLS NOT DISTINCT;
     `);
 
     // Note: we don't strip sources.archived* here because they're inline in the
@@ -485,6 +494,12 @@ test('after bootstrap, PGLITE_SCHEMA_SQL replays without crashing on missing for
       ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_lease_until;
       ALTER TABLE minion_jobs DROP COLUMN IF EXISTS submission_authority;
       ALTER TABLE minion_jobs DROP COLUMN IF EXISTS claim_generation;
+
+      -- v302 strip: a v204-v301 link_transitions has no link_source and the
+      -- narrower identity index under the same name.
+      ALTER TABLE link_transitions DROP COLUMN IF EXISTS link_source;
+      CREATE UNIQUE INDEX IF NOT EXISTS link_transitions_identity_idx
+        ON link_transitions (origin_page_id, from_page_id, to_page_id, link_type, kind, occurred_on, producer) NULLS NOT DISTINCT;
 
       -- WP4 (v127) strip: surface columns + the wedge-signal index; replay
       -- must succeed from the pre-v127 shape.
@@ -988,6 +1003,10 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // reads them, and grant reads treat a missing column as 'none'.
   'access_tokens.private_pages',
   'oauth_clients.private_pages',
+  // GBRA-575 access_tokens/oauth_clients.private_facts (migration
+  // principal_private_facts): the same shape and rationale as private_pages.
+  'access_tokens.private_facts',
+  'oauth_clients.private_facts',
   // T7 — search_telemetry rank-1 drift columns (migration v111). search_telemetry
   // is created entirely by migration v57 (not in the schema blob), so the v57+v111
   // chain handles fresh + upgrade; no CREATE INDEX references these columns, so
@@ -1223,6 +1242,37 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'oauth_clients.attest_actor',
   'oauth_clients.attest_ops',
   'oauth_tokens.grant_type',
+  // GST-1113 (migration v293) - attest_sources, the scope sources an attested memory_write may name. Same posture as
+  // v286: absent from both schema blobs; readers go through to_jsonb(row), so a schema without it reads as none.
+  'access_tokens.attest_sources',
+  'oauth_clients.attest_sources',
+  // GST-1158 F3 (migration v298) - how an attested call that names sources reads them. Same posture as v286: absent
+  // from both schema blobs; readers read it through to_jsonb(row), so a schema before it reads as NULL (the scope).
+  'access_tokens.attest_read',
+  'oauth_clients.attest_read',
+  // GST-1158 (migration v301) - a member's operator-declared email. Same posture as v286: access_members exists only
+  // through migrations, so no index or function in either blob references it, and only the operator's access commands
+  // and owner-session routes read or write it.
+  'access_members.email',
+  // Migration v305 - raw-only folder rules and audience members. Same posture as v301: access_rules and access_members
+  // exist only through migrations, so no index or function in either blob references covers_derived or kind.
+  'access_rules.covers_derived',
+  'access_members.kind',
+  // The labelled-only migration (GBRA-108 design 1). Same posture: access_members exists only through migrations, so no
+  // index or function in either blob references labelled_only.
+  'access_members.labelled_only',
+  // GST-363 (migration v309) - a credential the operator marked to read unscoped on a brain that serves several people.
+  // Absent from both schema blobs, so no index or function there references it; only the requester-scope gate, access
+  // check and bindCredential read it, all after migrations have run.
+  'access_tokens.reads_unscoped',
+  'oauth_clients.reads_unscoped',
+  // GST-2898 (migration token_read_shared) - the read-shared switch stamp. Same posture as reads_unscoped: absent from
+  // both schema blobs, so no index or function references it; the verifiers read it through to_jsonb after migrations.
+  'access_tokens.read_shared_revision',
+  'oauth_clients.read_shared_revision',
+  // Wakeshift PR 2 (migration v313) - the persistence_requests row a write.settled watch points at. Same posture as
+  // v301: wake_subscriptions exists only through migrations (v290), so no index or function in either blob references it.
+  'wake_subscriptions.target_ref',
   // GBRA-218 A2 (migration v283) - folder rules. Same posture as v282: absent from both schema blobs; the migration
   // creates the folder_rule_ids trigger and functions itself, and no index or function in either blob references it.
   'pages.folder_rule_ids',
@@ -1254,6 +1304,15 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'page_versions.body_generation',
   'page_versions.body_bytes',
   'page_versions.content_hash',
+  // PR B refresh write barrier (v292): migration-only columns. The schema blob creates these tables without them
+  // and no blob index, view or trigger reads them, so there is no forward reference; fresh installs and upgrades
+  // both get them (and the deferred index and triggers) from the migration chain, keeping one column order.
+  'persistence_worktree_refreshes.barrier_sequence',
+  'persistence_worktree_refreshes.released_at',
+  'persistence_requests.deferred_refresh_id',
+  'persistence_consumers.capabilities',
+  // GST-1582 (v291): migration-only like the PR B columns above, for the same reason.
+  'persistence_requests.deferred_import_from',
 ]);
 
 test('every ALTER TABLE ADD COLUMN in MIGRATIONS is covered by applyForwardReferenceBootstrap (column-only class)', async () => {

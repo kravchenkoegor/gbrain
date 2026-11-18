@@ -20,6 +20,7 @@ import type { RegistryCode } from '../error-registry.ts';
 import type { WriteAuthority } from '../persistence/model.ts';
 import type { TrustTier } from '../trust/tier.ts';
 import type { StdioSurfaceState } from '../../mcp/surface.ts';
+import type { GuestChannels } from '../guests/admission.ts';
 
 /** Agent contract v1: the wire renderer for `fix`/`notices` in toJSON(), registered by agent-output.ts on load. */
 interface OperationErrorWireRenderer { fix(a: Action): unknown; notice(n: Notice): unknown }
@@ -305,11 +306,18 @@ export interface AuthInfo {
   /** GBRA-218: the stored `may_act_for` audience list (shared agents, PR B); stored and reported only. */
   mayActFor?: string[] | null;
   /**
+   * GST-363: the brain operator let this credential read unscoped on purpose (`reads_unscoped` is set, gbrain auth
+   * rescope --reads-unscoped --yes). Undefined when no verifier read it; access/requester-scope.ts then looks it up.
+   */
+  readsUnscoped?: boolean;
+  /** GST-363: when the credential was created, epoch seconds (access_tokens.created_at, oauth_clients.client_id_issued_at); null = unknown, which counts as old. */
+  createdAt?: number | null;
+  /**
    * GST-359 C1: the live right to name the person a call serves (x-qm-actor), joined by the verifier: the system and
-   * the operations an attested call may run. Null when the credential holds none, is bound to a member, or (an OAuth
+   * the operations an attested call may run, and (GST-1158 F3) how it reads named sources. Null when the credential holds none, is bound to a member, or (an OAuth
    * client) its token did not come from the client-credentials grant. Undefined when no verifier joined it.
    */
-  attest?: { system: string; ops: string[] } | null;
+  attest?: { system: string; ops: string[]; sources: string[] | null; read?: 'person' | 'scope' } | null;
   /**
    * Human-readable agent name resolved at token-verification time.
    * For OAuth clients this is `oauth_clients.client_name`; for legacy
@@ -445,6 +453,20 @@ export interface AuthInfo {
    * private-readable set of each non-mutating call. Undefined = `none`.
    */
   privatePages?: { mode: 'granted_sources'; sources: string[] };
+  /**
+   * GST-2898: the credential's read-shared switch is on, so `allowedSources` already holds its stored list plus every
+   * shared source (grants/read-shared.ts). `readSharedUnresolved`: the shared set could not be read, so it reads its
+   * stored list only and read results carry the `read_shared_unresolved` degraded notice.
+   */
+  readShared?: boolean;
+  readSharedUnresolved?: boolean;
+  /**
+   * GBRA-575: the grant's `private_facts: granted_sources` axis, set at token
+   * verification from the live row, with the same explicitly named sources.
+   * MCP dispatch makes them the private-fact sources of each non-mutating call
+   * (CallerAccess.privateFactSources). Undefined = `none`.
+   */
+  privateFacts?: { mode: 'granted_sources'; sources: string[] };
   /** Current transport ceiling applied to this authenticated request. */
   effectiveSurface?: 'verbs' | 'starter' | 'full';
   /**
@@ -534,6 +556,14 @@ export interface OperationContext {
    */
   emitNotice?: (n: Notice) => void;
   /**
+   * Wakeshift (docs/guides/wakeshift.md): the MCP caller as the transport saw it, which Wakeshift uses to tell agent
+   * programs apart: `clientInfo.name` (stdio) or the OAuth `client_name` (HTTP), the HTTP User-Agent and the request's
+   * `_meta`. Set by the MCP transports only, never from tool arguments; shape only, never authority.
+   */
+  mcpCaller?: { client?: string; userAgent?: string; meta?: Record<string, unknown> };
+  /** Wakeshift: a handler's addition, rendered as the result's last text block plus `_meta` keys. A credential: never log it. */
+  emitToolTail?: (tail: { text?: string; meta?: Record<string, unknown> }) => void;
+  /**
    * WP4 (D2): the SERVER surface ceiling for this transport (force-clamped),
    * threaded by the MCP dispatch layer. Consumed by `request_tools`: the
    * catalog never names ops above the ceiling, and the persist branch
@@ -542,6 +572,8 @@ export interface OperationContext {
    * treated as 'full'.
    */
   surfaceCeiling?: 'verbs' | 'starter' | 'full';
+  /** #9669: the tool surface MCP dispatch served this call on; a remote agent job records it. Unset for the local CLI. */
+  surface?: 'verbs' | 'starter' | 'full';
   /**
    * GBRA-218 local `--as <member>`: the member identity a trusted local read previews. Set only by the
    * CLI with `applyRemoteReadPolicy`; `remote` stays false, so upload confinement and write trust are unchanged.
@@ -551,6 +583,18 @@ export interface OperationContext {
   applyRemoteReadPolicy?: boolean;
   /** The stdio session's surface (stdio MCP only): `request_tools` widens it for this session, `whoami` reports it. */
   stdioSurface?: StdioSurfaceState;
+  /**
+   * GST-363: the member this stdio server was started with (`gbrain serve --stdio-member <id>`, written into one
+   * harness's own MCP entry). Set only by the stdio server from its process argv, never from a request; it wins over
+   * config mcp.stdio_member, and a named member that is not enabled reads as nobody.
+   */
+  stdioMember?: string;
+  /**
+   * GBRA-504: the guest attribution channels a remote call carried (the X-Gbrain-Guest header, request-level
+   * _meta.guest), set by dispatch from the transport; never from tool arguments. Read only for a write to a guest
+   * source (guests/admission.ts), and stored nowhere for any other write.
+   */
+  guestChannels?: GuestChannels;
   /**
    * Set by transports that can widen a session's listed tools (stdio): when
    * `request_tools` returns schemas, the named tools join this session's
@@ -603,6 +647,11 @@ export interface OperationContext {
    */
   attestedOp?: string;
   /**
+   * GST-1113: the scope source an attested memory_write named (source_id), allowed by the credential's attest_sources
+   * (access/attest-sources.ts). Set by the handler, never from arguments; the stored authority keeps it.
+   */
+  attestedSource?: string;
+  /**
    * #4216 — defer chunk embeddings on put_page writes: importFromContent runs
    * noEmbed and the standing embed machinery (embed phase / phase-end
    * backfill / the stale-embed sweep) picks the chunks up via the
@@ -644,7 +693,7 @@ export interface OperationContext {
    * callable. Unset on local and in-process callers. Shape only, never
    * authority: dispatch enforces callability itself.
    */
-  isCallable?: (opName: string) => boolean;
+  isCallable?: (opName: string, args?: Record<string, unknown>) => boolean;
   /**
    * Resolved global CLI options (--quiet / --progress-json / --progress-interval).
    * CLI callers populate this from `getCliOptions()`. MCP / library callers
@@ -845,7 +894,7 @@ export interface Operation {
    * fail-closed call-time backstop; stdio (local pipe) bypasses publish
    * gates entirely. Resolution lives in src/mcp/publish-gates.ts.
    */
-  publishGateKey?: 'mcp.publish_skills' | 'mcp.publish_advisor' | 'mcp.publish_memory_settings';
+  publishGateKey?: 'mcp.publish_skills' | 'mcp.publish_advisor' | 'mcp.publish_memory_settings' | 'mcp.publish_wakeshift';
   /**
    * MEMORY_VERBS v1: marks the seven frozen protocol verbs (recall, remember,
    * entity, synthesize, forget, context_pack, delta). `gbrain serve --surface

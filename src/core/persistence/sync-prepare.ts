@@ -19,7 +19,7 @@ import type { VersionHistory } from '../page-state/versions.ts';
 import { screenImportContent, screenNormalized, type ContentRefusal, type ImportScreenResult, type ImportSanityConfig } from '../import-screen.ts';
 import { ContentSanityBlockError } from '../content-sanity.ts';
 import { parseMarkdown, resolveParsedSubtype, serializePageToMarkdown, type ParseOpts } from '../markdown.ts';
-import { keepGrandfatherStamp } from './align-stored.ts';
+import { keepStoredStamps } from './align-stored.ts';
 import { resolveSlugForPath, slugifyPath, isCodeFilePath, isImageFilePath } from '../sync.ts';
 import { prepareManagedSyncImage } from './sync-image.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from '../source-config-sql.ts';
@@ -38,6 +38,8 @@ import { preserveProtectedTakes } from './protected-takes.ts';
 import { getWorktreeBinding } from './ownership.ts';
 import { sourceMirrorReadOnly } from './mirror-read-only.ts';
 import { writeThroughConfigured } from './switches.ts';
+import { isSourceDbOnlySlug } from './source-storage.ts';
+import { withStoredLabels } from './label-edit.ts';
 import { assertConfiguredSyncRoot, assertSyncEntryOrigin, readSyncFile, syncGit, syncRawHash, type SyncRename } from './sync-discovery.ts';
 import { directoryAt } from './sync-entry-fault.ts';
 import { assertSyncPageOrigin, sameSyncOrigin, syncOriginPath, syncOriginScope, type SyncOriginScope } from './sync-origin.ts';
@@ -534,7 +536,7 @@ export const PASS_LEASE_LOST_MESSAGE = 'The sync pass that admitted this checkpo
  * obligation, hold release, the retry compare-and-delete, and the pass row's converged state (`request_hwm`,
  * `open_at_stamp`, fingerprints), written under the lease token. The cursor checkpoint (`applyManagedSyncCheckpoint`) is unchanged.
  */
-async function applyPassCheckpoint(tx: BrainEngine, row: WriteRequest, p: SyncIntent, root: string, releaseHold: (tx: BrainEngine, path: string | null) => Promise<void>): Promise<Record<string, unknown>> {
+async function applyPassCheckpoint(tx: BrainEngine, row: WriteRequest, p: SyncIntent, root: string, releaseHold: (tx: BrainEngine, path: string | null) => Promise<void>, trend?: FenceTrendPrefix): Promise<Record<string, unknown>> {
   const stamp = p.stamp!;
   const lease = await fenceLockRow(tx, syncLockId(row.source_id), stamp.leaseToken);
   const pass = lease.length ? await readPassRow(tx, row.source_id, stamp.incarnation) : null;
@@ -545,7 +547,7 @@ async function applyPassCheckpoint(tx: BrainEngine, row: WriteRequest, p: SyncIn
     `Sync request ${open} of ${row.source_id} is still open or needs recovery, so checkpoint request ${row.request_id} did not commit. Let it finish; do not resubmit it. `
       + `Then run: ${checkpointRetryCommand({ sourceId: row.source_id, processingOptions: p.processingOptions, syncOptions: p.syncOptions, repoPath: p.repoPath })}`,
     { fix: syncInspectFix(row, open, false) });
-  return publishPassStamp(tx, row, p, root, releaseHold, pass, { changed: stamp.changed });
+  return publishPassStamp(tx, row, p, root, releaseHold, pass, { changed: stamp.changed, trend });
 }
 
 /**
@@ -554,7 +556,7 @@ async function applyPassCheckpoint(tx: BrainEngine, row: WriteRequest, p: SyncIn
  * and the watermark and source scope it already read.
  */
 export async function publishPassStamp(tx: BrainEngine, row: WriteRequest, p: SyncIntent, root: string, releaseHold: (tx: BrainEngine, path: string | null) => Promise<void>,
-  pass: { value: ManagedSyncPassValue }, read: { changed: number; watermark?: Awaited<ReturnType<typeof readConvergedWatermark>>; emptyScope?: boolean }): Promise<Record<string, unknown>> {
+  pass: { value: ManagedSyncPassValue }, read: { changed: number; watermark?: Awaited<ReturnType<typeof readConvergedWatermark>>; emptyScope?: boolean; trend?: FenceTrendPrefix }): Promise<Record<string, unknown>> {
   const stamp = p.stamp!;
   if (stamp.configured) {
     const emptyScope = read.emptyScope ?? emptySyncScope(root, syncGitTopLevel(root, p.passId!));
@@ -572,7 +574,7 @@ export async function publishPassStamp(tx: BrainEngine, row: WriteRequest, p: Sy
     if (stamp.stampChunker) await tx.executeRaw('UPDATE sources SET chunker_version=$2 WHERE id=$1', [row.source_id, chunkerStamp()]);
   }
   await recordPassTail(tx, row.source_id, p.passId!, { changed: read.changed, extract: stamp.extract, ...(stamp.since ? { since: stamp.since } : {}) });
-  await recordPassFenceTrend(tx, { worktreeId: row.worktree_id!, sourceId: row.source_id, passId: p.passId!, since: pass.value.obligations.converged?.request_hwm ?? null });
+  await recordPassFenceTrend(tx, { worktreeId: row.worktree_id!, sourceId: row.source_id, passId: p.passId!, since: pass.value.obligations.converged?.request_hwm ?? null, prefix: read.trend });
   for (const path of [...stamp.releasedHolds, ...await settledDeletionHolds(tx, row.source_id, stamp.deletionCandidates)]) await releaseHold(tx, path);
   if (stamp.retryTaken.length) await clearGitHoldRetryPaths(tx, row.source_id, stamp.incarnation, stamp.retryTaken);
   const watermark = read.watermark ?? await readConvergedWatermark(tx, { worktreeId: row.worktree_id!, sourceId: row.source_id, incarnation: row.source_incarnation }, row.request_id, OPEN_AT_STAMP_CAP,
@@ -597,14 +599,60 @@ export async function publishPassStamp(tx: BrainEngine, row: WriteRequest, p: Sy
  * the sync imports committed since the previous stamp's watermark. A pass that stopped before its stamp is counted by the
  * next stamp, once, so a completed pass always has its trend row and a normalization is never counted twice.
  */
-export async function recordPassFenceTrend(tx: Pick<BrainEngine, 'executeRaw'>, scope: { worktreeId: string; sourceId: string; passId: string; since: string | null }): Promise<void> {
-  const rows = await tx.executeRaw<{ path: string | null; fences: Array<{ class: string }> }>(`SELECT intent->>'path' AS path, outcome->'fences_normalized' AS fences
-    FROM persistence_requests WHERE worktree_id=$1::uuid AND source_id=$2 AND sequence > $3::bigint AND state='committed'
-      AND intent->>'kind'='managed_sync_import' AND intent->>'passId' IS NOT NULL AND jsonb_typeof(outcome->'fences_normalized')='array' ORDER BY sequence`,
-  [scope.worktreeId, scope.sourceId, scope.since ?? '0']);
-  let tally: FencesTally | undefined;
+export async function recordPassFenceTrend(tx: Pick<BrainEngine, 'executeRaw'>, scope: { worktreeId: string; sourceId: string; passId: string; since: string | null; prefix?: FenceTrendPrefix }): Promise<void> {
+  // #9646: the requests up to the prefix were tallied before the publication; a prefix read from another watermark is not used.
+  const prefix = scope.prefix && scope.prefix.since === scope.since ? scope.prefix : undefined;
+  const rows = await fenceTrendRows(tx, scope, prefix?.through ?? scope.since ?? '0', null, prefix?.open);
+  let tally = prefix?.tally;
   for (const row of rows) if (row.path && row.fences.length) tally = addFencesNormalized(tally, row.path, row.fences);
   if (tally) await recordSyncRunTrend(tx, { sourceId: scope.sourceId, runId: scope.passId, day: new Date().toISOString().slice(0, 10), count: tally.count, byClass: tally.by_class, writers: tally.dirs });
+}
+
+/** Request sequences one prefix statement reads: a range of the unique sequence index, so a statement's cost never grows with the history. */
+export const FENCE_TREND_PAGE = 5_000;
+
+/** The trend tally of a stamp's range up to `through`, read before its publication (`readFenceTrendPrefix`). */
+export interface FenceTrendPrefix { since: string | null; through: string; open?: string[]; tally?: FencesTally }
+
+/**
+ * The publication's read has no upper bound (`upTo` null) and also reads, by sequence, the imports the prefix left open; the
+ * prefix reads one range of the sequence index per statement.
+ */
+function fenceTrendRows(engine: Pick<BrainEngine, 'executeRaw'>, scope: { worktreeId: string; sourceId: string }, after: string, upTo: string | null, open: string[] = []) {
+  const range = upTo !== null ? 'sequence > $3::bigint AND sequence <= $4::bigint'
+    : open.length ? '(sequence > $3::bigint OR sequence = ANY($4::text::bigint[]))' : 'sequence > $3::bigint';
+  return engine.executeRaw<{ path: string | null; fences: Array<{ class: string }>; sequence?: string }>(`SELECT intent->>'path' AS path, outcome->'fences_normalized' AS fences${upTo === null ? '' : ', sequence::text AS sequence'}
+    FROM persistence_requests WHERE worktree_id=$1::uuid AND source_id=$2 AND ${range} AND state='committed'
+      AND intent->>'kind'='managed_sync_import' AND intent->>'passId' IS NOT NULL AND jsonb_typeof(outcome->'fences_normalized')='array' ORDER BY sequence`,
+  upTo !== null ? [scope.worktreeId, scope.sourceId, after, upTo] : open.length ? [scope.worktreeId, scope.sourceId, after, `{${open.join(',')}}`] : [scope.worktreeId, scope.sourceId, after]);
+}
+
+/**
+ * #9646: a stamp's publication runs under a 5 s statement bound, and its trend range starts at the previous watermark, or at 0
+ * for a source that never recorded one, which on a large brain is the whole request table. Read before the publication, outside
+ * it, in statements of FENCE_TREND_PAGE sequences each, this tallies the range up to the newest request now, leaving out the
+ * imports still open in it, whose sequences it records; the publication then reads only what is newer plus those sequences
+ * (`recordPassFenceTrend`), so every import is counted once, the stamp lands in bounded time and records its trend row in the
+ * same transaction, as before.
+ */
+export async function readFenceTrendPrefix(engine: Pick<BrainEngine, 'executeRaw'>, scope: { worktreeId: string; sourceId: string; incarnation: string }): Promise<FenceTrendPrefix> {
+  const since = (await readPassRow(engine, scope.sourceId, scope.incarnation))?.value.obligations.converged?.request_hwm ?? null;
+  const [newest] = await engine.executeRaw<{ through: string | null }>('SELECT max(sequence)::text AS through FROM persistence_requests');
+  const floor = BigInt(since ?? '0'), through = BigInt(newest?.through ?? '0');
+  // Read before the tally: an import open now that commits during it is skipped here and read by the publication, once.
+  // The worktree's open requests are few, and persistence_requests_open indexes exactly them by sequence.
+  const open = through > floor ? (await engine.executeRaw<{ sequence: string }>(`SELECT sequence::text AS sequence FROM persistence_requests
+    WHERE worktree_id=$1::uuid AND sequence > $2::bigint AND sequence <= $3::bigint AND state IN ('queued','deferred','running','recovering')
+      AND source_id=$4 AND intent->>'kind'='managed_sync_import' ORDER BY sequence`, [scope.worktreeId, String(floor), String(through), scope.sourceId])).map(row => row.sequence) : [];
+  const skip = new Set(open);
+  let tally: FencesTally | undefined;
+  for (let low = floor; low < through; low += BigInt(FENCE_TREND_PAGE)) {
+    const high = low + BigInt(FENCE_TREND_PAGE) < through ? low + BigInt(FENCE_TREND_PAGE) : through;
+    for (const row of await fenceTrendRows(engine, scope, String(low), String(high))) {
+      if (row.path && row.fences.length && !skip.has(row.sequence!)) tally = addFencesNormalized(tally, row.path, row.fences);
+    }
+  }
+  return { since, through: String(through > floor ? through : floor), ...(open.length ? { open } : {}), ...(tally ? { tally } : {}) };
 }
 
 /** The checkpoint request's publication: the whole run committed, so `last_commit` (and the slug-root pin) advance under the guard. */
@@ -676,10 +724,14 @@ export type SyncPreparedMutation = PreparedMutation & { importProvenance?: SyncI
  */
 export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: WriteRequest, config: GBrainConfig, clock?: ClaimPhaseClock,
   screening?: { unsaved: true }): Promise<SyncPreparedMutation> {
-  const at: { root?: string } = {};
-  const prepared = await prepareSyncMutation(unbounded, row, config, clock, screening, at);
   const p = row.intent as SyncIntent | null;
-  return p?.kind === 'managed_sync_import' && p.stamp?.fold && at.root && !screening ? foldPassCheckpoint(prepared, { row, p, root: at.root }) : prepared;
+  const at: { root?: string; trend?: FenceTrendPrefix } = {};
+  // #9646: a stamp's trend range is tallied here, outside its publication (readFenceTrendPrefix).
+  if (p?.passId && row.worktree_id && !screening && (p.kind === 'managed_sync_checkpoint' || (p.kind === 'managed_sync_import' && p.stamp?.fold))) {
+    at.trend = await readFenceTrendPrefix(unbounded, { worktreeId: row.worktree_id, sourceId: row.source_id, incarnation: row.source_incarnation });
+  }
+  const prepared = await prepareSyncMutation(unbounded, row, config, clock, screening, at);
+  return p?.kind === 'managed_sync_import' && p.stamp?.fold && at.root && !screening ? foldPassCheckpoint(prepared, { row, p, root: at.root, trend: at.trend }) : prepared;
 }
 
 /** #6722 and #7106: what a committed sync write left the page's embedding and search index in, for its receipt. */
@@ -688,8 +740,18 @@ async function syncWriteState(tx: BrainEngine, row: WriteRequest, page: Paramete
   return { ...await sizeStateField(tx, row.source_id, row.slug, page), ...segmentedOutcome(segmented, isQuarantined(frontmatter)) };
 }
 
+/**
+ * GST-2519: a file under a declared storage.db_only path imports keeping the privacy labels its live page holds and the
+ * file does not state (a label repair writes them to the database only there), so a commit to the file never widens it.
+ */
+function keepDbOnlyLabels(root: string, slug: string, base: Snapshot | undefined, text: string, incoming?: Record<string, unknown>): string {
+  if (!base || base.page.deleted_at || !isSourceDbOnlySlug(root, slug, 'not_db_only')) return text;
+  return withStoredLabels(text, base.page.frontmatter as Record<string, unknown>, incoming ?? parseMarkdown(text, `${slug}.md`).frontmatter) ?? text;
+}
+
+/** #8729: a screen (`screening`) publishes nothing, so the segmented staging its import opened is aborted (unbounded: past the screen's deadline too) as soon as the import hands it over, never left live beside the admitted write's. */
 async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _config: GBrainConfig, clock: ClaimPhaseClock | undefined,
-  screening: { unsaved: true } | undefined, at: { root?: string }): Promise<SyncPreparedMutation> {
+  screening: { unsaved: true } | undefined, at: { root?: string; trend?: FenceTrendPrefix }): Promise<SyncPreparedMutation> {
   const engine = boundedReads(unbounded, clock, { engineReads: true });
   const p = row.intent as SyncIntent | null;
   if (!p || !['managed_sync_import', 'managed_sync_delete', 'managed_sync_checkpoint'].includes(p.kind)) throw syncPublicationRefusal('invalid_params', 'Unsupported internal sync intent.', row, p,
@@ -784,7 +846,7 @@ async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _c
     }
   };
   if (p.kind === 'managed_sync_checkpoint') return { sourceExclusive: true, observedRevision: null, validate,
-    apply: tx => p.passId ? applyPassCheckpoint(tx, row, p, root, releaseHold) : applyManagedSyncCheckpoint(tx, row, p, root, releaseHold) };
+    apply: tx => p.passId ? applyPassCheckpoint(tx, row, p, root, releaseHold, at.trend) : applyManagedSyncCheckpoint(tx, row, p, root, releaseHold) };
   const source = { sourceId: row.source_id };
   enterClaimStep(clock, 'page_snapshot', undefined, 'db');
   const read = await engine.readPageSnapshot(row.slug, { ...source, includeDeleted: true });
@@ -868,14 +930,14 @@ async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _c
     throw syncPublicationRefusal('source_changed', 'Newer working-tree bytes and the current page disagree with this pinned Git import.', row, p,
       `The working tree holds newer bytes for ${row.slug} that match neither the pinned import nor the current page; sync did not overwrite them. Preserve the local edit and commit it.`);
   }
-  let importContent = p.content;
+  let importContent = keepDbOnlyLabels(root, row.slug, base, p.content, parsedInput.frontmatter);
   if (row.authority.remote) {
     const stored = base ? fenceBody(base.page) : null;
     const compiled_truth = preserveProtectedTakes(parsedInput.compiled_truth, stored?.compiled_truth ?? '');
     const timeline = preserveProtectedTakes(parsedInput.timeline ?? '', stored?.timeline ?? '');
     if (compiled_truth !== parsedInput.compiled_truth || timeline !== (parsedInput.timeline ?? '')) {
-      importContent = serializePageToMarkdown({ ...(base ? withoutBody(base.page) : { id: 0, source_id: row.source_id, created_at: new Date(), updated_at: new Date() }),
-        ...parsedInput, compiled_truth, timeline } as Page, parsedInput.tags);
+      importContent = keepDbOnlyLabels(root, row.slug, base, serializePageToMarkdown({ ...(base ? withoutBody(base.page) : { id: 0, source_id: row.source_id,
+        created_at: new Date(), updated_at: new Date() }), ...parsedInput, compiled_truth, timeline } as Page, parsedInput.tags));
     }
   }
   let prepared: PreparedContentImport | undefined;
@@ -886,24 +948,22 @@ async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _c
     filename: basename(p.sourcePath).replace(/\.mdx?$/i, ''), sourcePath: p.sourcePath, allowEmptyOverwrite: true, history,
     segmentedOwner: { kind: 'sync' as const, principalKind: row.principal_kind, principalId: row.principal_id, baseRevision: base?.revision ?? null } };
   const result = await importFromContent(engine, renamed?.slug ?? row.slug, importContent, { ...importOptions,
-    prepare: async value => { prepared = value; return value.result; } }).catch(error => {
+    prepare: async value => { prepared = value; if (screening) await abortSegmentedStaging(unbounded, value.segmented?.prepared); return value.result; } }).catch(error => {
     if (!(error instanceof ContentSanityBlockError)) throw error;
     throw syncContentRefusal({ code: 'content_rejected', message: error.message }, row, p);
   });
   if (!prepared) throw result.refusal ? syncContentRefusal(result.refusal, row, p) : syncPublicationRefusal('invalid_params', result.error ?? 'The sync file could not be prepared.', row, p,
     `The file could not be prepared as page ${row.slug}.`);
   const ready = prepared;
-  if (ready.observedRevision !== (base?.revision ?? null)) throw syncPublicationRefusal('revision_conflict', 'The page changed during sync preparation.', row, p,
-    `Page ${renamed?.slug ?? row.slug} changed while this sync was being prepared.`);
+  if (ready.observedRevision !== (base?.revision ?? null)) throw syncPublicationRefusal('revision_conflict', 'The page changed during sync preparation.', row, p, `Page ${renamed?.slug ?? row.slug} changed while this sync was being prepared.`);
   if (ready.slug !== (renamed?.slug ?? row.slug)) {
     // Cross-slug dedup must never advance the origin's checkpoint without a
     // guarded proof about the other identity. Keep the cursor explicitly blocked.
     throw syncPublicationRefusal('revision_conflict', 'A different page already owns this file identity; resolve the duplicate before syncing.', row, p,
       `Page ${ready.slug} already holds the content identity of ${renamed?.slug ?? row.slug}; resolve the duplicate pages first.`);
   }
-  const parsed = parseMarkdown(p.content, `${row.slug}.md`, { activePack });
-  resolveParsedSubtype(parsed, base?.page);
-  keepGrandfatherStamp(parsed.frontmatter, base?.page);
+  const parsed = parseMarkdown(keepDbOnlyLabels(root, row.slug, base, p.content, parsedInput.frontmatter), `${row.slug}.md`, { activePack });
+  keepStoredStamps(parsed, base?.page);
   const tags = [...new Set([...(base?.tags ?? []), ...ready.parsedPage.tags])].sort();
   const renderedPage = { ...(base ? withoutBody(base.page) : { id: 0, source_id: row.source_id, created_at: new Date(), updated_at: new Date() }), ...ready.parsedPage } as Page;
   if (renamed && parsedInput.typeExplicit !== true) renderedPage.type = parsedInput.type;

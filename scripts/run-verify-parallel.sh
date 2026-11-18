@@ -107,10 +107,14 @@ CHECKS=(
   "check:skill-brain-first"
   # A-NEW-3: bundled SKILL.md files pass the shared-skill publication parser.
   "check:skill-publication"
+  # GBRA-225: skill drift against the live CLI surface, and per-skill size ceilings.
+  "check:skill-health"
   "check:conversation-parser"
   "check:resolver"
   "check:privacy"
   "check:test-names"
+  # A test that opens a changelog.d fragment by name breaks on the release commit.
+  "check:test-fragment-reads"
   "check:test-isolation"
   # D7: a test that gates execution on a GBRAIN_* opt-in the operator-env
   # preload strips is a silent skip; TS AST scan, ~2s.
@@ -139,15 +143,21 @@ CHECKS=(
   "check:eval-glossary"
   "check:tool-catalog"
   "check:skills-manifest"
+  # GBRA-225: skills.lock.history.json covers the lock and only grows.
+  "check:skills-lock-history"
   "check:no-pii-agent-voice"
   "check:synthetic-corpus-privacy"
   "check:operations-filter-bypass"
   "check:gateway-routed"
   "check:worker-pool-atomicity"
   "check:doc-history"
+  # GST-2548: documented scripts/ and test/ paths exist. The unit and census
+  # lanes skip a doc-only pull request; verify does not.
+  "check:docs-repo-paths"
   "check:fixture-privacy"
   "check:source-scope-onboard"
   "check:getpage-scope"
+  "check:relative-dotdot"
   "check:origin-assignment"
   "check:no-double-retry"
   "check:batch-audit-site"
@@ -158,6 +168,7 @@ CHECKS=(
   "check:pin-doc-privacy"
   "check:worker-lock-renewal-shape"
   "check:bootstrap-tag"
+  "check:install-ref"
   "check:plugin-tree"
   "check:skill-refs"
   # Previously reachable ONLY from the deleted check:all (i.e. never run):
@@ -195,6 +206,11 @@ CHECKS=(
   # Goal (a) (refactor wave 1): engine SQL only shrinks; baseline
   # scripts/engine-sql-baseline.tsv.
   "check:engine-sql-ratchet"
+  # D6 (docs/designs/RUST_ENGINE.md): raw SQL outside the engines and two-way
+  # pglite/postgres branches only fall; baselines scripts/engine-raw-sql-baseline.tsv
+  # and scripts/engine-kind-branches-baseline.tsv.
+  "check:engine-raw-sql-ratchet"
+  "check:engine-kind-branches"
   # GBRA-248 W1: world reads in src/core (loadConfig, env, fs, module state,
   # spawn, process hooks) only fall; baseline scripts/core-world-reads-baseline.tsv.
   "check:core-world-reads"
@@ -210,6 +226,8 @@ CHECKS=(
   # CQ3 / EO17 (refactor wave 1): engine-sql splices only constant text, no
   # composed $n, no expanded IN lists.
   "check:engine-sql-dynamic"
+  # #9192: a migration that changes what the page revision trigger watches empties search until the rebuild.
+  "check:migration-projection"
   # GBRA-218: the remote-privacy relaxations are read only in private-visibility.ts.
   "check:remote-privacy-reads"
   # EO4 (refactor wave 1): RLS read brands stay unforgeable; brand factories
@@ -231,6 +249,9 @@ CHECKS=(
   # A since: 'TBD' BEHAVIOR_CHANGES row never ships: refused on a stamped tree
   # (VERSION has a CHANGELOG header and differs from origin/master's) and on master.
   "check:behavior-since"
+  # Stable's promise (docs/STABILITY.md): a documented command, flag, MCP tool, config key or exit code the base has
+  # leaves only through a matured deprecations.d record; new behavior-changes.d rows carry kind:.
+  "check:public-surface"
   # CHANGELOG.md keeps every release heading origin/master has (a cut file is refused).
   "check:changelog-headings"
   "check:structural-manifest"
@@ -291,7 +312,7 @@ if [ -n "${GBRAIN_VERIFY_LOG_DIR:-}" ]; then
   LOG_DIR="$GBRAIN_VERIFY_LOG_DIR"
   mkdir -p "$LOG_DIR" || { echo "ERROR: cannot create $LOG_DIR" >&2; exit 2; }
 else
-  LOG_DIR="$(mktemp -d /tmp/gbrain-verify-XXXXXX)"
+  LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gbrain-verify-XXXXXX")"
   KEEP_LOGS=0
   trap '[ "$KEEP_LOGS" = "1" ] || rm -rf "$LOG_DIR"' EXIT
 fi

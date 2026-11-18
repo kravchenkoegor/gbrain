@@ -40,7 +40,8 @@ describe('data-safety native CI coverage', () => {
     const names = job.steps.map(step => step.name ?? step.uses ?? '');
     const start = job.steps.findIndex(step => step.name === 'Start the diagnostic heartbeat');
     const stop = job.steps.findIndex(step => step.name === 'Stop the diagnostic heartbeat');
-    expect(names[start - 1]).toStartWith('actions/checkout@');
+    expect(names[start - 2]).toStartWith('actions/checkout@');
+    expect(names[start - 1]).toBe('Check out again after a stalled first attempt');
     expect(stop).toBe(job.steps.length - 1);
     const env = {
       GH_TOKEN: '${{ github.token }}',
@@ -63,7 +64,7 @@ describe('data-safety native CI coverage', () => {
   test('a Linux job after every cell finalizes a darwin-x64 heartbeat its cell left pending, never on a fork pull request', () => {
     const finalize = (workflow.jobs as unknown as Record<string, { needs: string[]; if: string; 'runs-on': string; permissions: Record<string, string>; steps: Step[] }>)['heartbeat-finalize']!;
     expect(finalize.needs).toEqual(['native']);
-    expect(finalize.if).toBe("${{ always() && inputs.scope != 'smoke' }}");
+    expect(finalize.if).toBe("${{ always() && inputs.scope != 'smoke' && github.event_name != 'pull_request' }}");
     expect(finalize['runs-on']).toBe('ubicloud-standard-2-ubuntu-2404');
     expect(finalize.permissions).toEqual({ actions: 'read', contents: 'read', statuses: 'write' });
     const step = finalize.steps.at(-1)!;

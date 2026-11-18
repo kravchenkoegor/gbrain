@@ -30,8 +30,10 @@ import { slugifySegment } from '../sync.ts';
 const siblingCanonical: typeof import('../mentions/siblings.ts').siblingCanonical = async (...args) =>
   (await import('../mentions/siblings.ts')).siblingCanonical(...args);
 import { isMissingSchemaObject } from '../utils.ts';
-import { privatePagesFilterFragment } from '../search/private-visibility.ts';
+import { privatePagesFilterForCaller, remoteReadFloorSql } from '../search/private-visibility.ts';
 import { rankingLinkSql } from '../link-ranking-policy.ts';
+import { isHoldingSlug } from '../facts-fence.ts';
+import { BASENAME_DIRS, PREFIX_EXPANSION_DIRS } from './basename-dirs.ts';
 
 /**
  * Canonicalize a free-form entity reference to a page slug.
@@ -126,7 +128,7 @@ export async function resolveEntitySlug(
  * (`slugifySegment`), so `Мария` lands on `мария`, not `''`. Latin names keep
  * the ASCII form (`o-brien`, `soren`). Null when nothing is left.
  */
-function fallbackSlugify(trimmed: string): string | null {
+export function fallbackSlugify(trimmed: string): string | null {
   const slug = trimmed.split('/').map(fallbackSegment).filter(Boolean).join('/');
   return slug || null;
 }
@@ -166,7 +168,7 @@ const NAME_NOISE_TOKENS = new Set(['the', 'inc', 'llc', 'ltd', 'co', 'corp', 'co
 
 /** True for pages that name one real-world person, company, fund or organization. */
 export function isIdentityEntity(slug: string, type?: string | null): boolean {
-  return (type != null && IDENTITY_TYPES.has(type)) || IDENTITY_DIRS.some(dir => slug.startsWith(dir));
+  return !isHoldingSlug(slug) && ((type != null && IDENTITY_TYPES.has(type)) || IDENTITY_DIRS.some(dir => slug.startsWith(dir)));
 }
 
 const FACT_ENTITY_TYPES = new Set(['concept', 'project', 'deal']);
@@ -174,8 +176,8 @@ const FACT_ENTITY_DIRS = ['hosts/', 'projects/', 'concepts/', 'deals/'];
 
 /** Pages a fuzzy fact attribution may land on: entities, never meetings, notes or other documents. */
 export function isFactEntityPage(slug: string, type: string | null): boolean {
-  return isIdentityEntity(slug, type) || (type != null && FACT_ENTITY_TYPES.has(type))
-    || FACT_ENTITY_DIRS.some(dir => slug.startsWith(dir));
+  return !isHoldingSlug(slug) && (isIdentityEntity(slug, type) || (type != null && FACT_ENTITY_TYPES.has(type))
+    || FACT_ENTITY_DIRS.some(dir => slug.startsWith(dir)));
 }
 
 function nameTokens(value: string): string {
@@ -350,15 +352,7 @@ function isBareName(raw: string): boolean {
   return true;
 }
 
-// hosts/projects joined people/companies after the 2026-08-06 memory eval: a
-// bare infra token ("hive") fell through to slugify and recall returned
-// nothing while the canonical hosts/<token> page + its facts sat one prefix
-// away. `infra/` is deliberately NOT here — it is a mixed namespace of
-// analysis/runbook documents (`infra/hive-dependency-audit-…`), and any such
-// doc would trip the ambiguity gate and re-break bare-token resolution.
-const PREFIX_EXPANSION_DIRS = ['people', 'companies', 'hosts', 'projects'] as const;
-/** Directories a bare entity name resolves under (findExactBasenameCandidates); factEntitySlugs reads the same set. */
-export const BASENAME_DIRS = [...PREFIX_EXPANSION_DIRS, 'concepts'] as const;
+export { BASENAME_DIRS };
 
 async function findExactBasenameCandidates(
   engine: BrainEngine,
@@ -480,17 +474,19 @@ export type StrictResolution =
  * same-name trigram arm. Never guesses from a bare-name prefix and never
  * falls back to a slugified name. With `excludePrivate`, private pages are
  * removed before uniqueness is counted, so an unreadable namesake can neither
- * be returned nor change the outcome for a remote caller.
+ * be returned nor change the outcome for a remote caller. `forCaller` reads with
+ * the caller's policy (a remote read); without it the plain privacy fragment
+ * applies, which a derived-visibility decision needs.
  */
 export async function resolveStrictEntityReference(
   engine: BrainEngine,
   source_id: string,
   raw: string,
-  opts: { sameName?: boolean; excludePrivate?: boolean } = {},
+  opts: { sameName?: boolean; excludePrivate?: boolean; forCaller?: boolean } = {},
 ): Promise<StrictResolution> {
   const trimmed = raw.trim();
   if (!trimmed) return { slug: null, miss: 'no_page' };
-  const privacy = opts.excludePrivate ? `AND ${privatePagesFilterFragment('p')}` : '';
+  const privacy = opts.excludePrivate ? `AND ${opts.forCaller ? privatePagesFilterForCaller('p') : remoteReadFloorSql('p')}` : '';
   const live = async (slugs: string[]) => slugs.length === 0 ? [] : engine.executeRaw<{ slug: string; type: string | null }>(
     `SELECT p.slug, p.type FROM pages p
       WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.slug = ANY($2::text[]) ${privacy}`,
@@ -567,12 +563,12 @@ export async function entityReferenceCandidates(
   engine: BrainEngine,
   source_id: string,
   raw: string,
-  opts: { excludePrivate?: boolean } = {},
+  opts: { excludePrivate?: boolean; forCaller?: boolean } = {},
 ): Promise<string[]> {
   const trimmed = raw.trim();
   const token = slugify(trimmed);
   if (!token) return [];
-  const privacy = opts.excludePrivate ? `AND ${privatePagesFilterFragment('p')}` : '';
+  const privacy = opts.excludePrivate ? `AND ${opts.forCaller ? privatePagesFilterForCaller('p') : remoteReadFloorSql('p')}` : '';
   const aliases = await aliasHitSlugs(engine, source_id, trimmed).catch(() => [] as string[]);
   const prefixed = (await findPrefixCandidates(engine, source_id, token)).map(c => c.slug);
   const named = await engine.executeRaw<{ slug: string }>(

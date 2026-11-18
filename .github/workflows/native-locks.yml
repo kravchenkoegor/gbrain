@@ -41,7 +41,14 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        timeout-minutes: 3
+        continue-on-error: true
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        timeout-minutes: 3
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 24.18.0
@@ -72,16 +79,24 @@ jobs:
       matrix:
         bun: ['1.4.4']
         target: [linux-x64-glibc, linux-arm64-glibc, darwin-arm64, darwin-x64, win32-x64, win32-arm64]
-        # Pull requests: primary Bun on every target (native paths changed) or
-        # the Linux x64 glibc smoke cell. Runners map from the target above.
-        # Named exception: PR scope reduction, covered by scope=full runs (docs/TESTING.md#event-parity).
-        exclude: ${{ fromJSON(inputs.scope == 'smoke' && '[{"target":"linux-arm64-glibc"},{"target":"darwin-arm64"},{"target":"darwin-x64"},{"target":"win32-x64"},{"target":"win32-arm64"}]' || '[]') }}
+        # Pull requests: primary Bun on every target but macOS (native paths
+        # changed) or the Linux x64 glibc smoke cell. Runners map from the target above.
+        # Named exception: PR scope reduction, covered by scope=full runs (docs/TESTING.md#event-parity);
+        # a pull request runs no darwin cell (docs/ci-event-parity.md#macos-runners).
+        exclude: ${{ fromJSON(inputs.scope == 'smoke' && '[{"target":"linux-arm64-glibc"},{"target":"darwin-arm64"},{"target":"darwin-x64"},{"target":"win32-x64"},{"target":"win32-arm64"}]' || github.event_name == 'pull_request' && '[{"target":"darwin-arm64"},{"target":"darwin-x64"}]' || '[]') }}
     steps:
       # The data-safety step stops its suites before this job's timeout: a timeout cancel keeps no log.
       - name: Record the job deadline
         shell: bash
         run: echo "GBRAIN_JOB_DEADLINE=$(( $(date +%s) + 15 * 60 ))" >> "$GITHUB_ENV"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        timeout-minutes: 3
+        continue-on-error: true
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        timeout-minutes: 3
       # A wedged darwin-x64 runner uploads no log at all (#7457's cell, #7419, #7303, #7238), so a background loop posts
       # the current step or suite, free memory, swap, load and the busiest process names as the commit status
       # diag/native-heartbeat/<cell>; GitHub keeps every status, so the last one before a wedge survives it. Nothing on a
@@ -191,6 +206,7 @@ jobs:
           fi
           bun scripts/native/compiled-smoke.ts --binary bin/gbrain-native-validation
           bun scripts/native/cli-persistence-smoke.ts --binary bin/gbrain-native-validation
+          bun scripts/native/compiled-admin-smoke.ts --binary bin/gbrain-native-validation
       # The terminal status, naming the job result: a run that ends, even cancelled, leaves nothing pending; a machine
       # that dies keeps its last heartbeat.
       - name: Stop the diagnostic heartbeat
@@ -206,12 +222,12 @@ jobs:
   # post timed out), so its diag/native-heartbeat/<cell> status stays pending on a job that passed. This Linux job runs
   # after every cell and posts success, naming the cell's real conclusion and last heartbeat, on any cell context still
   # pending (scripts/native/heartbeat-finalize.ts). Nothing on a fork's pull request, whose token cannot write.
-  # Named exception: PR scope reduction, covered by scope=full runs (docs/TESTING.md#event-parity); scope=smoke runs
+  # Named exception: PR scope reduction, covered by scope=full runs (docs/TESTING.md#event-parity); a pull request runs
   # no darwin-x64 cell, so there is nothing to finalize.
   heartbeat-finalize:
     name: darwin-x64 heartbeat finalize
     needs: [native]
-    if: ${{ always() && inputs.scope != 'smoke' }}
+    if: ${{ always() && inputs.scope != 'smoke' && github.event_name != 'pull_request' }}
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
     # statuses: the darwin-x64 cells' diag/native-heartbeat/<cell> contexts; actions: read the run's jobs and conclusions.
@@ -220,7 +236,18 @@ jobs:
       contents: read
       statuses: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        timeout-minutes: 3
+        continue-on-error: true
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/native/heartbeat-finalize.ts
+          sparse-checkout-cone-mode: false
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        timeout-minutes: 3
         with:
           persist-credentials: false
           sparse-checkout: scripts/native/heartbeat-finalize.ts
@@ -319,7 +346,14 @@ jobs:
         bun: ['1.4.4']
         target: [linux-x64-musl, linux-arm64-musl]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        timeout-minutes: 3
+        continue-on-error: true
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        timeout-minutes: 3
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: ${{ matrix.bun }}

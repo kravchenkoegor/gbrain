@@ -25,6 +25,7 @@
  * process is gone.
  */
 import type { SkillsIndexState, SkillsIndexView } from '../../../core/setup/skills-block.ts';
+import type { SkillResolverView } from './skill-resolver.ts';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join } from 'node:path';
@@ -37,6 +38,7 @@ import { resolveGbrainBin } from '../../../core/gbrain-bin.ts';
 import { enabledPluginLanes } from '../../../core/bootstrap/plugin-lanes.ts';
 import { claudeConfigDir, claudeUserSettingsPath, opencodeProjectConfigPath } from '../../../core/bootstrap/host-specs.ts';
 import { readReceipt } from '../../../core/bootstrap/format.ts';
+import { CODEX_PROJECT_CONFIG } from '../../../core/bootstrap/adopted-connections.ts';
 import { resolveGbrainHome } from '../../../core/gbrain-home.ts';
 import type { Action } from '../../../core/agent-output.ts';
 import type { Check } from '../../doctor.ts';
@@ -141,10 +143,17 @@ export function parseCodexRegistration(text: string, name: string, source: strin
 const codexConfigPath = () => join(process.env.CODEX_HOME || join(home(), '.codex'), 'config.toml');
 const opencodeConfigPath = () => join(process.env.XDG_CONFIG_HOME || join(home(), '.config'), 'opencode', 'opencode.json');
 
+/** #9398: the user config first, then the receipt workspace's project config (the one `--adopt` records). */
 function codexRegistration(name: string): HarnessRegistration | null {
-  const path = codexConfigPath();
-  if (!existsSync(path)) return null;
-  try { return parseCodexRegistration(readFileSync(path, 'utf8'), name, path); } catch { return null; }
+  const ws = bootstrapReceipt()?.workspace_dir;
+  for (const path of [codexConfigPath(), ...(ws ? [join(ws, CODEX_PROJECT_CONFIG)] : [])]) {
+    if (!existsSync(path)) continue;
+    try {
+      const registration = parseCodexRegistration(readFileSync(path, 'utf8'), name, path);
+      if (registration) return registration;
+    } catch { /* unreadable: try the next config */ }
+  }
+  return null;
 }
 
 function opencodeRegistration(name: string): HarnessRegistration | null {
@@ -176,7 +185,7 @@ function recordedUnreadableRegistrations(harnesses: readonly ReadinessHarness[])
   if (!receipt) return [];
   const configFor = (harness: ReadinessHarness, scope: string): string => harness === 'claude-code'
     ? (scope === 'project' ? join(receipt.workspace_dir, '.mcp.json') : join(home(), '.claude.json'))
-    : harness === 'codex' ? codexConfigPath() : scope === 'project' ? opencodeProjectConfigPath(receipt.workspace_dir) : opencodeConfigPath();
+    : harness === 'codex' ? (scope === 'project' ? join(receipt.workspace_dir, CODEX_PROJECT_CONFIG) : codexConfigPath()) : scope === 'project' ? opencodeProjectConfigPath(receipt.workspace_dir) : opencodeConfigPath();
   const readable = (path: string) => { try { readFileSync(path); return true; } catch { return false; } };
   return receipt.registrations
     .filter((r) => harnesses.includes(r.host) && (r.detail?.split('+') ?? []).includes('mcp'))
@@ -494,6 +503,7 @@ function repairArgv(v: InstructionBlockView): Action {
   const argv = ['gbrain', 'setup', v.harness, '--instructions-only',
     ...(access?.kind === 'mcp' && access.server !== 'gbrain' ? ['--name', access.server] : []),
     ...(access?.kind === 'mcp' && access.surface ? ['--surface', access.surface] : []),
+    ...(access?.kind === 'mcp' && access.serves === 'several' ? ['--serves', 'several'] : []),
     ...(v.harness === 'openclaw' ? ['--workspace', dirname(v.path)] : []),
     ...(v.harness === 'claude-code' && basename(v.path) === 'CLAUDE.local.md' ? ['--scope', 'project'] : [])];
   const why = `Writes or upgrades only the marked brain-first block in ${v.path}; text outside the markers is left as it is. \`--no-instructions\` opts out instead.`;
@@ -602,12 +612,15 @@ export function withHookLaunchers(check: Check, problem: HookLauncherProblem | n
   return { name: NAME, status: 'warn', message, details: { ...details, code: 'hook_session_cwd', hook_launcher_reason: problem.reason }, fix };
 }
 
-/** Registration read (full run) or registration read + smoke (`--only harness_wiring`), plus the brain-first block, its per-turn hook and the hook launcher. */
-export async function harnessWiringCheck(opts: { smoke: boolean }): Promise<Check> {
+/** Registration read (full run) or registration read + smoke (`--only harness_wiring`), plus the brain-first block, its per-turn hook, the hook launcher and the skill-resolver lane (when configured). */
+export async function harnessWiringCheck(opts: { smoke: boolean; skillResolver?: SkillResolverView | null }): Promise<Check> {
   const regs = readHarnessRegistrations();
   const { skillsIndexViews } = await import('../../../core/setup/skills-block.ts');
   const views = instructionBlockViews(regs);
-  return withSkillsIndex(withHookLaunchers(withSurfaceNote(withTurnHooks(withInstructionBlocks(await registrationCheck(opts, regs), views), views, turnHookViews(views)), regs), hookLauncherProblems(views)), skillsIndexViews());
+  const check = withSkillsIndex(withHookLaunchers(withSurfaceNote(withTurnHooks(withInstructionBlocks(await registrationCheck(opts, regs), views), views, turnHookViews(views)), regs), hookLauncherProblems(views)), skillsIndexViews());
+  if (!opts.skillResolver) return check;
+  const { describeSkillResolver } = await import('./skill-resolver.ts');
+  return { ...check, message: `${check.message} ${describeSkillResolver(opts.skillResolver)}`, details: { ...(check.details ?? {}), skill_resolver: opts.skillResolver } };
 }
 
 /**
@@ -668,16 +681,30 @@ async function registrationCheck(opts: { smoke: boolean }, regs: HarnessRegistra
 
 async function runHarnessWiring(ctx: DoctorContext): Promise<Check[]> {
   const checks: Check[] = [];
+  const { skillResolverCheck, skillResolverView } = await import('./skill-resolver.ts');
+  let skillResolver: SkillResolverView | null = null;
+  let resolverError: unknown = null;
   try {
-    checks.push(await harnessWiringCheck({ smoke: !!ctx.only?.has('harness_wiring') }));
+    skillResolver = await skillResolverView();
+  } catch (e) {
+    resolverError = e;
+  }
+  try {
+    checks.push(await harnessWiringCheck({ smoke: !!ctx.only?.has('harness_wiring'), skillResolver }));
   } catch (e) {
     checks.push(checkError('harness_wiring', 'read the harness registrations', e));
+  }
+  if (resolverError) {
+    checks.push(checkError('skill_resolver', 'read the skill resolver state', resolverError));
+  } else {
+    const resolverCheck = skillResolverCheck(skillResolver);
+    if (resolverCheck) checks.push(resolverCheck);
   }
   return checks;
 }
 
 export const harnessWiringDoctorEntry: DoctorEntry = {
   name: 'harness_wiring',
-  emits: ['harness_wiring'],
+  emits: ['harness_wiring', 'skill_resolver'],
   run: runHarnessWiring,
 };

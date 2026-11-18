@@ -57,7 +57,7 @@ into your user-scope skills dir with a local-edit-respecting update lens
 (CLI form: `claude plugin marketplace add garrytan/gbrain` +
 `claude plugin install gbrain@gbrain`.) Prerequisites and behavior match the
 [Codex plugin](CODEX.md#install-as-a-codex-plugin-recommended): the gbrain CLI
-installed (`bun install -g github:garrytan/gbrain#latest-stable`), a brain
+installed (`bun install -g github:garrytan/gbrain#stable`), a brain
 (`gbrain init`), `full` MCP surface with `--source-guard`, and the same
 routing rules (`GBRAIN_SOURCE`/`GBRAIN_BRAIN_ID` env — dotfiles don't apply
 to a plugin-launched serve). Positioning: the plugin is the lightweight
@@ -108,8 +108,8 @@ tunnel, no token needed. Works with both PGLite and Supabase engines.
 `--surface starter` lists the daily-driver tools: the seven memory verbs
 ([MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)), `search`, `query`,
 `get_page`, `put_page`, `capture`, graph reads and skills. It is the surface every
-new registration gbrain writes pins (a bare `serve` still defaults to full). A parameter it leaves out is still accepted,
-and `request_tools` returns full schemas or widens the session to a left-out tool. `--surface full` lists every
+new registration gbrain writes pins (a bare `serve` still defaults to full). A parameter it leaves out is refused (`param_not_on_surface`) apart from a short reviewed list,
+and `request_tools` returns the schemas this surface may pass or widens the session to a left-out tool. `--surface full` lists every
 operation (`put_pages`, admin and tuning ops) and is the opt-in; `--surface verbs`
 lists only the seven verbs.
 
@@ -176,7 +176,8 @@ claude mcp add gbrain -t http \
 Replace the host with your MagicDNS name (or your ngrok domain) and
 `YOUR_TOKEN` with a token from `gbrain auth create "claude-code"`.
 
-> A `gbrain auth create` token is a long-lived, full-access secret. Keep it
+> A `gbrain auth create` token is a long-lived secret that carries its grant's
+> scopes (full-access when minted without `--scopes`). Keep it
 > private (it lands in `~/.claude.json`), and prefer a scoped/short-lived token
 > where your host supports one.
 

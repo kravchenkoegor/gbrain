@@ -171,6 +171,12 @@ export class GoogleApiClient {
         if (expired) throw new GoogleCursorExpiredError(res.status, url);
         throw new GoogleSyncTokenRejectedError(url, body.error?.message ?? 'no detail');
       }
+      // #8906: a connections pageToken Google no longer honors (a re-list resumed from its checkpoint).
+      if (res.status === 400 && apiHint === 'people') {
+        const u = new URL(url);
+        const pageTokenRejected = /page[ _]?token/i.test(`${body.error?.message ?? ''} ${JSON.stringify(body.error?.details ?? [])}`);
+        if (u.pathname.endsWith('/people/me/connections') && u.searchParams.get('pageToken') && pageTokenRejected) throw new GoogleCursorExpiredError(res.status, url);
+      }
       throw new CredentialError('upstream', `: HTTP ${res.status} on ${apiHint} (${body.error?.message ?? 'no detail'})`);
     }
     throw new CredentialError('upstream', `: unreachable ${apiHint}`);
@@ -352,7 +358,10 @@ export function extractBody(part: RawGmailPart | undefined): { text: string; isH
       continue;
     }
     if (p.mimeType === 'text/plain' && p.body?.data) {
-      return { text: decodeB64Url(p.body.data), isHtml: false };
+      const plain = decodeB64Url(p.body.data);
+      // A text/plain part that is itself an HTML document is markup: flag it so
+      // the caller strips it instead of storing raw tags and CSS as the body.
+      return { text: plain, isHtml: /^\s*(<!doctype\s|<html[\s>]|<head[\s>])/i.test(plain) };
     }
     if (p.mimeType === 'text/html' && p.body?.data && html === null) {
       html = decodeB64Url(p.body.data);
@@ -769,6 +778,13 @@ function contactData(p: RawPerson): ContactData {
   };
 }
 
+function connectionsUrl(syncToken: string | null | undefined, pageToken: string | null): string {
+  const params = new URLSearchParams({ personFields: CONTACT_PERSON_FIELDS, pageSize: '200', requestSyncToken: 'true' });
+  if (syncToken) params.set('syncToken', syncToken);
+  if (pageToken) params.set('pageToken', pageToken);
+  return `${PEOPLE_BASE}/people/me/connections?${params.toString()}`;
+}
+
 export class PeopleClient extends GoogleApiClient {
   /** Incremental with syncToken; full otherwise. 410 → GoogleCursorExpiredError. */
   async listConnections(opts: {
@@ -777,16 +793,7 @@ export class PeopleClient extends GoogleApiClient {
   }): Promise<{ contacts: ContactData[]; nextSyncToken: string | null }> {
     let nextSyncToken: string | null = null;
     const raw = await this.drainPages<RawPerson>(
-      (t) => {
-        const params = new URLSearchParams({
-          personFields: CONTACT_PERSON_FIELDS,
-          pageSize: '200',
-          requestSyncToken: 'true',
-        });
-        if (opts.syncToken) params.set('syncToken', opts.syncToken);
-        if (t) params.set('pageToken', t);
-        return `${PEOPLE_BASE}/people/me/connections?${params.toString()}`;
-      },
+      (t) => connectionsUrl(opts.syncToken, t),
       (body) => {
         if (typeof body.nextSyncToken === 'string') nextSyncToken = body.nextSyncToken;
         return {
@@ -798,6 +805,21 @@ export class PeopleClient extends GoogleApiClient {
       opts,
     );
     return { contacts: raw.map(contactData), nextSyncToken };
+  }
+
+  /**
+   * #8906: one page of a full list, so a re-list can checkpoint between pages.
+   * `nextSyncToken` arrives only on the last page; a stale `pageToken` (400 or
+   * 410) is a GoogleCursorExpiredError.
+   */
+  async listConnectionsPage(pageToken: string | null, opts: { signal?: AbortSignal } = {}):
+    Promise<{ contacts: ContactData[]; nextPageToken: string | null; nextSyncToken: string | null }> {
+    const body = await this.fetchJSON<Record<string, unknown>>(connectionsUrl(null, pageToken), 'people', opts);
+    return {
+      contacts: ((body.connections as RawPerson[] | undefined) ?? []).map(contactData),
+      nextPageToken: (body.nextPageToken as string | undefined) ?? null,
+      nextSyncToken: typeof body.nextSyncToken === 'string' ? body.nextSyncToken : null,
+    };
   }
 
   /**

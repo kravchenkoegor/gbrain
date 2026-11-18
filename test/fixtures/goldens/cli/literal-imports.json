@@ -55,6 +55,9 @@
       "core": [
         "./commands/core.ts"
       ],
+      "dedupe": [
+        "./commands/dedupe.ts"
+      ],
       "diag": [
         "./commands/diag.ts"
       ],
@@ -65,6 +68,7 @@
         "./commands/edges-backfill.ts"
       ],
       "embed": [
+        "./commands/embed-slug-args.ts",
         "./commands/embed.ts",
         "./core/held-embedding.ts"
       ],
@@ -99,8 +103,14 @@
       "graph-query": [
         "./commands/graph-query.ts"
       ],
+      "guests": [
+        "./commands/guests.ts"
+      ],
       "import": [
-        "./commands/import.ts"
+        "./commands/import.ts",
+        "./core/agent-output.ts",
+        "./core/agent-markers.ts",
+        "./core/interaction.ts"
       ],
       "jobs": [
         "./commands/jobs.ts"
@@ -116,6 +126,9 @@
       ],
       "mcp": [
         "./commands/mcp.ts"
+      ],
+      "memory-proposals": [
+        "./commands/memory-proposals.ts"
       ],
       "migrate": [
         "./commands/migrate-embeddings.ts",
@@ -157,6 +170,7 @@
         "./commands/reindex.ts",
         "./commands/reindex-multimodal.ts",
         "./core/sync-concurrency.ts",
+        "./commands/reindex-synopsis.ts",
         "./core/oversized-backfill.ts",
         "./commands/reindex-vectors.ts",
         "./commands/reindex-aliases.ts",
@@ -184,6 +198,9 @@
       ],
       "salience": [
         "./commands/salience.ts"
+      ],
+      "secrets": [
+        "./commands/secrets.ts"
       ],
       "serve": [
         "./core/serve-log.ts",
@@ -220,10 +237,14 @@
         "./commands/trust-claim.ts",
         "./core/eligibility/explain.ts",
         "./core/eligibility/scan.ts",
+        "./core/trust/label-lowerings.ts",
         "./core/trust/backfill.ts"
       ],
       "waiting": [
         "./commands/loops.ts"
+      ],
+      "wakeshift": [
+        "./commands/wakeshift.ts"
       ],
       "watch": [
         "./commands/watch.ts"

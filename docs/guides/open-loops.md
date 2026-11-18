@@ -29,6 +29,14 @@ zero LLM, free, always on). For every synced Gmail thread:
   keeps running. "Will do" counts as a reply.
 - a question mark inside a link (`https://docs.example.com/view?id=42`) is
   not a question, so an FYI that only shares a link opens nothing.
+- a forward is judged by the note above the forwarded message. "FYI, see
+  below." over someone else's question asks nothing, so it opens no loop (and
+  a "Thanks!" answers one sent to you); "Can you take this one?" above the
+  same forward is an ask. The note ends at Gmail's "Forwarded message" line
+  or Apple Mail's "Begin forwarded message:"; a forward in any other format
+  (a translated separator) is still judged by its whole body. A classic
+  Outlook forward is stored only up to its "Original Message" line, so it
+  is judged by its note too.
 - "unanswered" is measured from the oldest unanswered message since the
   last turn flip (the first one addressed to you, or your first question),
   so a nudge or follow-up never restarts the clock — a request that waited
@@ -77,7 +85,8 @@ commitments with direction ("I'll send the deck by Friday" →
 `commitment_owed_by_me`, counterparty, due date, verbatim quote) and pending
 decisions. One extractor, three projections per item:
 
-- the `open_loops` row itself
+- the `open_loops` row itself, one per thread, direction and verbatim quote,
+  so a later pass that words the same sentence differently updates that loop
 - a `facts` row (`kind=commitment`, fence-first, deduped) — so `entity`,
   `context_pack`, and `recall` see it through existing read paths
 - a typed edge thread-page → person-page (`owes_to` / `awaiting_reply_from`)
@@ -313,8 +322,9 @@ rule withheld (`loop_withheld_senders`: reason, count, last time; at most
 thread of up to 500 senders with open reply-owed loops, so the record covers
 older loops. `gbrain waiting` then prints how many open reply-owed loops come
 from those senders and the exact `gbrain loops drop sender <email> --source
-<id> --dry-run` to preview for each (JSON and the `open_loops` grouped view:
-`withheld_noise`). Nothing is closed automatically. The sync log prints
+<id> --dry-run` to preview for each: the 10 senders with the most loops,
+then a count of the rest. `gbrain waiting --json` and the `open_loops` grouped
+view list every sender in `withheld_noise`. Nothing is closed automatically. The sync log prints
 `[google] reply-owed loops withheld: automated_mail=N`.
 
 **Opt-in: Updates mail needs reciprocity.** With
@@ -378,7 +388,10 @@ instead: the answer covered only the sources the call read (named, all inside
 the grant), pass `source_id` for a granted google source, and the fix lists
 them.
 The notice never names a source outside the grant, so it reads the same
-whether or not one exists.
+whether or not one exists. When the sources table cannot be read at all, the
+answer carries `no_google_sources: null` and `completeness: "partial"` with
+a `loops_source_read_failed` notice (no database error text): presence, sync
+ages and held mail are unknown, so an empty answer is not "inbox clean".
 
 Memory verbs: entity cards' `open_threads[]` entries backed by loop rows
 carry additive optional fields (`direction`, `due`, `counterparty`,

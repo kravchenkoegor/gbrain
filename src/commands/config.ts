@@ -29,10 +29,16 @@ import {
 // history + scrollback. This helper is the single source of truth so the
 // two surfaces can't drift again. Match on word-segments to avoid
 // false-positives (e.g. `monkey` doesn't match `key`).
+// #8920: plurals (apiKeys, tokens), acronyms (APIKey, apikey) and credential, authorization and passphrase match too,
+// except after a count word (max_tokens, max_output_tokens, budget_tokens, max_pending_per_credential), which names
+// a limit rather than a secret.
+const SECRET_WORD = /^(key|secret|token|password|pwd|passwd|auth)$/;
+const SECRET_WORD_8920 = /^(keys|secrets|tokens|passwords|credentials?|authorization|passphrases?|apikeys?)$/;
+const COUNT_WORDS = new Set(['max', 'min', 'budget', 'limit', 'avg', 'total', 'count', 'num', 'input', 'output', 'prompt', 'context', 'completion', 'reasoning', 'per']);
 export function isSensitiveConfigKey(key: string): boolean {
-  const lower = key.toLowerCase();
-  // Word-boundary matches: foo_key, foo.key, key_foo, key, api_key, ...
-  return /(^|[._-])(key|secret|token|password|pwd|passwd|auth)([._-]|$)/.test(lower);
+  const words = key.replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2').replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().split(/[._-]+/);
+  // Whole-word matches: foo_key, foo.key, key_foo, key, api_key, secretAccessKey, ...
+  return words.some((word, i) => SECRET_WORD.test(word) || (SECRET_WORD_8920.test(word) && !words.slice(0, i).some(w => COUNT_WORDS.has(w))));
 }
 
 /**
@@ -58,6 +64,7 @@ export function isSensitiveConfigKey(key: string): boolean {
 const FILE_PLANE_DOTTED_KEYS: ReadonlySet<string> = new Set([
   'push.allow_unverified_remote',
   'hooks.stop_push_debounce_min',
+  'secrets.on_push', // GST-2988: every publisher reads it engine-free (git/redact-unpushed.ts onPushMode)
   'backup.check_enabled',
   'backup.check_interval_days',
   // #4748: resolveMcpInstructions reads ONLY the file plane (all three MCP
@@ -77,9 +84,11 @@ const FILE_PLANE_DOTTED_KEYS: ReadonlySet<string> = new Set([
  * never written to a DB row nothing reads. */
 const SELF_UPGRADE_KEY_PREFIX = 'self_upgrade.';
 
+/** GBRA-377: skills.resolver.* are file-plane only, set|unset|get before any engine (logic in core/setup/skill-resolver-config.ts). */
+const runSkillResolverKey = async (args: string[]) => (await import('../core/setup/skill-resolver-config.ts')).runSkillResolverConfigKey(args, (await import('../core/config.ts')).configDir());
 /** The single membership test the get/set/unset lanes share. */
 function isFilePlaneDottedKey(key: string): boolean {
-  return FILE_PLANE_DOTTED_KEYS.has(key) || key.startsWith(SELF_UPGRADE_KEY_PREFIX) || isConsentConfigKey(key);
+  return FILE_PLANE_DOTTED_KEYS.has(key) || key.startsWith(SELF_UPGRADE_KEY_PREFIX) || key.startsWith('skills.resolver.') || isConsentConfigKey(key);
 }
 
 /** Delete the DB-plane row of a file-plane key: a `config set` from before
@@ -278,7 +287,16 @@ export function redactConfigValue(key: string, value: string): string {
   // canonical single home (drops the whole userinfo, both schemes).
   if (/postgres(ql)?:\/\//.test(value)) return redactPgUrl(value);
   if (isSensitiveConfigKey(key)) return '***';
-  return value;
+  // #8920: userinfo (user:pass@) in a URL of any other scheme; an `@` after the host (a path, query or fragment) is not userinfo.
+  return value.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/?#\s]*@/gi, '$1***@');
+}
+
+/** An object config value with every sensitive field masked at any depth (#7346: storage.secretAccessKey). */
+function redactNestedConfig(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactNestedConfig);
+  if (value === null || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).map(([k, v]) => [k,
+    typeof v === 'string' ? redactConfigValue(k, v) : v !== null && v !== undefined && isSensitiveConfigKey(k) ? '***' : redactNestedConfig(v)]));
 }
 
 // #3661: the flags `config set` actually honors. Everything else that looks
@@ -361,6 +379,7 @@ export async function handleDbPlaneRoutedKeys(key: string, value: string): Promi
  * to change when the engine can't connect. Returns true when handled.
  */
 export async function tryRunConfigEngineFree(args: string[]): Promise<boolean> {
+  if (args[1]?.startsWith('skills.resolver.')) return runSkillResolverKey(args);
   if (args[0] !== 'set') return false;
   const key = args[1];
   const value = args.slice(2).find((a) => !a.startsWith('-'));
@@ -411,6 +430,7 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
   if (key === 'sync.slug_conflicts.auto_remove') { const err = (await import('../core/repair/slug-autoheal.ts')).slugAutoRemoveValueRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
   if (key === 'sync.origin_twins.auto_resolve') { const err = (await import('../core/repair/origin-twins-heal.ts')).originAutoResolveValueRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
   if (key === 'sync.repo_path') { const err = (await import('../core/sync-config-keys.ts')).syncRepoPathRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
+  if (key === 'cycle.purge.mcp_request_log_retention_days') { const err = (await import('../core/mcp-request-log-retention.ts')).mcpLogRetentionRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
   if (key.startsWith('search.')) (await import('./config/keyword-timeout-value.ts')).refuseInvalidKeywordTimeoutValue(key, value);
   if (key === 'persistence.max_claim_ms') {
     const { validateMaxClaimConfigValue } = await import('../core/persistence/claim-phase.ts');
@@ -555,6 +575,14 @@ async function setFilePlaneKey(key: string, value: string, tail: string[]): Prom
           'gbrain config set push.allow_unverified_remote false',
       );
     }
+  } else if (key === 'secrets.on_push') {
+    if (value !== 'redact' && value !== 'refuse') {
+      console.error(`[config] ${key} must be redact (the default: secrets in unpushed commits are replaced by store markers before the push) or refuse (the push is held instead)`);
+      process.exit(1);
+    }
+    cfg.secrets = { ...(cfg.secrets ?? {}), on_push: value };
+    saveConfig(cfg);
+    console.log(`Set ${key} = ${value} (file plane: ~/.gbrain/config.json)`);
   } else if (key === 'backup.check_enabled') {
     const on = isConfigTruthy(value);
     cfg.backup = { ...(cfg.backup ?? {}), check_enabled: on };
@@ -623,6 +651,7 @@ async function setFilePlaneKey(key: string, value: string, tail: string[]): Prom
  * refusal. Returns true when handled.
  */
 export async function tryRunConfigThinClient(args: string[]): Promise<boolean> {
+  if (args[1]?.startsWith('skills.resolver.')) return runSkillResolverKey(args);
   const [action, key, ...rest] = args;
   if (!key || !key.startsWith(SELF_UPGRADE_KEY_PREFIX) || rest.some((a) => a.startsWith('-'))) return false;
   if (action === 'set' && rest.length === 1) {
@@ -677,7 +706,7 @@ async function showConfig(engine: BrainEngine): Promise<void> {
     const display = typeof v === 'string'
       ? redactConfigValue(k, v)
       : v !== null && typeof v === 'object'
-        ? (isSensitiveConfigKey(k) ? '***' : JSON.stringify(v))
+        ? (isSensitiveConfigKey(k) ? '***' : JSON.stringify(redactNestedConfig(v)))
         : v;
     console.log(`  ${k}: ${display}`);
   }
@@ -917,6 +946,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     // the runtime does — env/file plane wins over DB (loadConfig() already
     // overlays env onto the file) — and report which plane answered on
     // stderr, keeping stdout a bare value for scripts.
+    if (key === 'mcp.publish_wakeshift') return (await import('./wakeshift.ts')).printWakeshiftGate();
     const filePlane = loadConfig() as Record<string, unknown> | null;
     // Dotted keys (push.allow_unverified_remote, hooks.stop_push_debounce_min)
     // are stored NESTED by `set`; resolve the path so `get`/`unset` see them.
@@ -950,7 +980,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     if (val !== null && val !== undefined) {
       // #3943: redact by default like `show`/`set` — `get` output lands in
       // agent transcripts and shell history; scripts opt out with the flag.
-      const out = typeof val === 'string' ? val : JSON.stringify(val);
+      const out = typeof val === 'string' ? val : JSON.stringify(rawFlag ? val : redactNestedConfig(val));
       console.log(rawFlag ? out : redactConfigValue(key, out));
       if (dbAuthoritative) {
         console.error(`[config] source: ${dbVal !== null && dbVal !== undefined ? 'db plane (authoritative for this key)' : 'file mirror (no DB row)'}${await writebackLanesNote(engine, key)}`);
@@ -1041,7 +1071,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
         process.exit(1);
       }
       console.log(`Set ${key} = ${audience} (${hostPlane ? 'file + db planes' : 'db plane only — mounted brain'})`);
-      return;
+      return (await import('./archive-rescope.ts')).rescopeArchiveAfter(engine);
     }
     if (key === 'memory.agent_writeback') return (await import('./config-agent-writeback.ts')).setAgentWritebackFromCli(engine, value);
     if (MEMORY_DUAL_PLANE_KEYS.has(key)) {
@@ -1470,8 +1500,8 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
           newMode: value,
           engine,
           isTty: Boolean(process.stdout.isTTY && process.stdin.isTTY),
-          // CLI doesn't thread --yes here today; reserved for /ship-style
-          // automation paths that can opt into auto-submit.
+          // CLI doesn't thread --yes here today; --yes would skip the
+          // prompt and print the preview command (it never spends).
           yesFlag: false,
         });
       } catch (err) {

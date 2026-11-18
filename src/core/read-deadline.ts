@@ -11,13 +11,37 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-const store = new AsyncLocalStorage<number | undefined>();
+interface ReadDeadlineScope { deadlineAt: number; signal?: AbortSignal }
+const store = new AsyncLocalStorage<ReadDeadlineScope | undefined>();
 
-export function withReadDeadline<T>(deadlineAt: number, fn: () => T): T {
-  return store.run(deadlineAt, fn);
+/** #8651: a read refused because its deadline passed before it had a connection; nothing was sent. */
+export class ReadDeadlineError extends Error {
+  readonly code = 'read_deadline';
+  constructor() {
+    super('The read was not sent: its deadline passed while it waited for a database connection.');
+    this.name = 'ReadDeadlineError';
+  }
+}
+
+/**
+ * `signal` is the preparation's cancellation (the claim clock's): a read that has its connection ends at once when it
+ * aborts, and the connection is discarded (#8155), so a socket that stopped answering cannot keep it past the budget.
+ */
+export function withReadDeadline<T>(deadlineAt: number, fn: () => T, signal?: AbortSignal): T {
+  return store.run(signal ? { deadlineAt, signal } : { deadlineAt }, fn);
+}
+
+/** Runs `fn` with no read deadline: a read several preparations share takes no member's deadline or signal. */
+export function withoutReadDeadline<T>(fn: () => T): T {
+  return store.run(undefined, fn);
 }
 
 /** The epoch-millisecond deadline of the work this read runs for, or undefined. */
 export function readDeadline(): number | undefined {
-  return store.getStore();
+  return store.getStore()?.deadlineAt;
+}
+
+/** The cancellation of the work this read runs for, or undefined. */
+export function readDeadlineSignal(): AbortSignal | undefined {
+  return store.getStore()?.signal;
 }

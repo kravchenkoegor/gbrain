@@ -47,9 +47,11 @@ const load_salience = () => import('./ops/salience.ts') as Promise<Record<string
 const load_schema_packs = () => import('./ops/schema-packs.ts') as Promise<Record<string, unknown>>;
 const load_search_exact = () => import('./ops/search-exact.ts') as Promise<Record<string, unknown>>;
 const load_search = () => import('./ops/search.ts') as Promise<Record<string, unknown>>;
+const load_secrets = () => import('./ops/secrets.ts') as Promise<Record<string, unknown>>;
 const load_skillopt = () => import('./ops/skillopt.ts') as Promise<Record<string, unknown>>;
 const load_skills_catalog = () => import('./ops/skills-catalog.ts') as Promise<Record<string, unknown>>;
 const load_sources = () => import('./ops/sources.ts') as Promise<Record<string, unknown>>;
+const load_storage_manifest = () => import('./ops/storage-manifest.ts') as Promise<Record<string, unknown>>;
 const load_sync_status = () => import('./ops/sync-status.ts') as Promise<Record<string, unknown>>;
 const load_tags = () => import('./ops/tags.ts') as Promise<Record<string, unknown>>;
 const load_takes = () => import('./ops/takes.ts') as Promise<Record<string, unknown>>;
@@ -57,6 +59,7 @@ const load_timeline = () => import('./ops/timeline.ts') as Promise<Record<string
 const load_transcripts = () => import('./ops/transcripts.ts') as Promise<Record<string, unknown>>;
 const load_trust = () => import('./ops/trust.ts') as Promise<Record<string, unknown>>;
 const load_usage = () => import('./ops/usage.ts') as Promise<Record<string, unknown>>;
+const load_wakeshift = () => import('./ops/wakeshift.ts') as Promise<Record<string, unknown>>;
 const load_whois = () => import('./ops/whois.ts') as Promise<Record<string, unknown>>;
 const load_verbs = () => import('./verbs.ts') as Promise<Record<string, unknown>>;
 
@@ -118,6 +121,7 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "quarantine_list": [load_admin, "adminOperations"],
   "get_write_attribution": [load_attribution, "attributionOperations"],
   "confirm_memory": [load_trust, "trustOperations"],
+  "promote_guest_note": [load_trust, "trustOperations"],
   "list_skills": [load_skills_catalog, "skillsCatalogOperations"],
   "get_skill": [load_skills_catalog, "skillsCatalogOperations"],
   "list_brain_skillpack": [load_skills_catalog, "skillsCatalogOperations"],
@@ -149,6 +153,12 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "file_url": [load_files, "filesOperations"],
   "file_register": [load_files, "filesOperations"],
   "file_verify": [load_files, "filesOperations"],
+  "storage_find": [load_storage_manifest, "storageManifestOperations"],
+  "storage_get": [load_storage_manifest, "storageManifestOperations"],
+  "storage_list": [load_storage_manifest, "storageManifestOperations"],
+  "storage_register": [load_storage_manifest, "storageManifestOperations"],
+  "storage_update": [load_storage_manifest, "storageManifestOperations"],
+  "reveal_secret": [load_secrets, "secretsOperations"],
   "submit_job": [load_jobs, "jobsOperations"],
   "get_job": [load_jobs, "jobsOperations"],
   "wait_job": [load_jobs, "jobsOperations"],
@@ -163,6 +173,12 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "submit_agent": [load_jobs, "jobsOperations"],
   "get_agent_job": [load_jobs, "jobsOperations"],
   "get_job_stats": [load_jobs, "jobsOperations"],
+  "watch_job": [load_wakeshift, "wakeshiftOperations"],
+  "watch_write_request": [load_wakeshift, "wakeshiftOperations"],
+  "watch_cron": [load_wakeshift, "wakeshiftOperations"],
+  "accept_wakeshift_terms": [load_wakeshift, "wakeshiftOperations"],
+  "list_watches": [load_wakeshift, "wakeshiftOperations"],
+  "unwatch": [load_wakeshift, "wakeshiftOperations"],
   "find_orphans": [load_orphans, "orphansOperations"],
   "rank_entities": [load_graph_rank, "graphRankOperations"],
   "get_calibration_profile": [load_calibration, "calibrationOperations"],
@@ -217,6 +233,7 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "unpurge_page": [load_purge, "purgeOperations"],
   "memory_recall": [load_qm_memory, "qmMemoryOperations"],
   "memory_write": [load_qm_memory, "qmMemoryOperations"],
+  "memory_propose": [load_qm_memory, "qmMemoryOperations"],
   "get_memory_settings": [load_memory_settings, "memorySettingsOperations"],
   "set_memory_writeback": [load_memory_settings, "memorySettingsOperations"],
   "memory_conversation_mode": [load_memory_settings, "memorySettingsOperations"],

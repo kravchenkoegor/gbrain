@@ -54,6 +54,12 @@ const ALLOWLIST = new Map([
 // reason 'script-reachable', which the guard verifies.
 const PERMITTED_TEST_ONLY = [
   { path: 'src/core/bootstrap/template-repo.ts', reason: 'script-reachable' },
+  { path: 'src/core/rust-engine.ts', reason: "held: the Rust engine shell (plan PR 8, docs/designs/RUST_ENGINE.md); the addon loader PR on rust-engine/core wires openRustEngine into engine construction" },
+  { path: 'src/core/rust-engine/members.ts', reason: 'held: the Rust engine shell member table; reached through src/core/rust-engine.ts once the addon loader wires openRustEngine' },
+  { path: 'src/core/rust-engine/addon-errors.ts', reason: 'held: the Rust engine addon loader (loadRustEngineAddon); the addon release PR wires it into engine construction with the rust config value' },
+  { path: 'src/core/rust-engine/addon-loader.ts', reason: 'held: the Rust engine addon loader (loadRustEngineAddon); the addon release PR wires it into engine construction with the rust config value' },
+  { path: 'src/core/rust-engine/addon-manifest.ts', reason: 'held: the Rust engine addon loader (loadRustEngineAddon); the addon release PR wires it into engine construction with the rust config value' },
+  { path: 'src/core/rust-engine/addon-target.ts', reason: 'held: the Rust engine addon loader (loadRustEngineAddon); the addon release PR wires it into engine construction with the rust config value' },
   { path: 'src/eval/longmemeval/diagnostics.ts', reason: 'script-reachable' },
   { path: 'src/eval/longmemeval/evidence-brief.ts', reason: 'held: eval-only wave 1 brief builder (10x memory advantage plan A3), loaded by path from gbrain-evals eval/runner/pilot; product wiring is plan item A8, conditional on the A5 pilot' },
   { path: 'src/eval/longmemeval/evidence-packet.ts', reason: 'script-reachable' },
@@ -66,6 +72,7 @@ const PERMITTED_TEST_ONLY = [
   { path: 'src/core/progressive-batch/orchestrator.ts', reason: 'held: TODOS.md keeps an open item to re-compose progressive-batch with --workers on the 3 reindex sites (callers dropped in the v0.41.17.0 merge)' },
   { path: 'src/core/progressive-batch/retrofit-wrap.ts', reason: 'held: progressive-batch re-compose item still open in TODOS.md' },
   { path: 'src/core/progressive-batch/stage-report.ts', reason: 'held: progressive-batch re-compose item still open in TODOS.md' },
+  { path: 'src/commands/sources-writer-movement.ts', reason: 'held: released updaters from about v0.60.150 to v0.60.248 import this path into the old process after the swap, so it stays a leaf no current runtime imports (GST-2688, test/upgrade-old-updater-leaf.test.ts)' },
   { path: 'src/core/ingestion/daemon.ts', reason: 'held: ingestion cluster awaits a wire-up vs delete product decision (public gbrain/ingestion export, docs/guides/data-ingestion.md)' },
   { path: 'src/core/ingestion/dedup.ts', reason: 'held: ingestion cluster awaits a wire-up vs delete product decision' },
   { path: 'src/core/ingestion/skillpack-load.ts', reason: 'held: ingestion cluster awaits a wire-up vs delete product decision' },

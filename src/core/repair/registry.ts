@@ -54,7 +54,11 @@ import { embeddingEffectsRepair } from './embedding-effects.ts';
 import { googleFileModesRepair } from './google-file-modes.ts';
 import { staleAtomsRepair } from './stale-atoms.ts';
 import { atomsRestoreRepair } from './atoms-restore.ts';
+import { atomFenceRowsRepair } from './atom-fence-rows.ts';
 import { extractorFactsRepair } from './extractor-facts.ts';
+import { unwithdrawnFactsRepair } from './unwithdrawn-facts.ts';
+import { purgedPageFactsRepair } from './purged-page-facts.ts';
+import { purgedChangeReasonsRepair } from './purged-change-reasons.ts';
 import { conversationLabelsRepair } from './conversation-labels.ts';
 import { capturedFactsRepair } from './captured-facts.ts';
 import { agentSessionFactsRepair, agentSessionFlagArgs } from './agent-session-facts.ts';
@@ -78,6 +82,7 @@ import { stuckRecoveryRepair } from './stuck-recovery.ts';
 import { ghostPagesRepair, GHOST_CONSENT_TEXT, GHOST_CONSEQUENCES, GHOST_PURGE_FUSE_HOURS } from './ghost-pages.ts';
 import { legacyTwinsRepair, LEGACY_TWINS_CONSENT_TEXT, LEGACY_TWINS_PURGE_FUSE_HOURS } from './legacy-twins.ts';
 import { originTwinsRepair, ORIGIN_TWINS_CONSENT_TEXT, ORIGIN_TWINS_PURGE_FUSE_HOURS } from './origin-twins.ts';
+import { movedPagesRepair, MOVED_PAGES_CONSENT_TEXT, MOVED_PAGES_PURGE_FUSE_HOURS } from './moved-pages.ts';
 import { receiptCompactionRepair } from './receipt-compaction.ts';
 import { aliasesRepair } from './aliases.ts';
 import { renameIdentityRepair, RENAME_IDENTITY_CONSENT_TEXT } from './rename-identity.ts';
@@ -91,7 +96,12 @@ import { factClaimDatesRepair } from './fact-claim-dates.ts';
 import { provenanceRepair } from './provenance.ts';
 import { secretSpansRepair } from './secret-spans.ts';
 import { rowsBehindRepair } from './rows-behind.ts';
+import { factsHomeRepair } from './facts-home.ts';
+import { privateLabelsRepair, type PrivateLabelsLedger } from './private-labels.ts';
+import { openFactsApplyArgs, openFactsRepair, type OpenFactsRequest } from './open-facts.ts';
+import type { ReadersRequest } from './readers.ts';
 import { generationsRepair, generationsSelectionArgv, type GenerationsSelection } from '../generations/repair.ts';
+import { lostFenceRowsRepair } from './lost-fence-rows.ts';
 import { restoreDaysHint } from '../generations/config.ts';
 import { ERROR_CATALOGUE, catalogueError } from '../error-catalogue.ts';
 import { shellQuote } from '../shell-quote.ts';
@@ -111,6 +121,11 @@ export interface RepairKindSpec {
   explicit_only?: true;
   /** The preview prints a hash and `--apply --expect <hash>` applies exactly that set (accepted with or without `explicit_only`). */
   preview_bound?: true;
+  /**
+   * `unlisted`: an explicit-only kind whose preview needs inputs only the operator can name, so no command a surface prints
+   * would run as pasted; `--all`, the no-kind preview and the remediation plan leave it out of their explicit-only lists.
+   */
+  unlisted?: true;
   /** `destructive`: the apply rewrites user files or retires stored rows, so it also needs the user's consent (`--yes` with the preview hash, or a terminal prompt). */
   consent?: 'destructive';
   /** The consent payload's wording for a destructive kind: what the apply does and how to undo it (default: the frontmatter file rewrite). */
@@ -222,12 +237,56 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'that writes the canonical file back, its request id in the outcome); an atom that changed since reports changed_since_preview and stays deleted. '
       + 'The purge holds these atoms for 30 days after deletion. Runs only when named; never on upgrade.',
   },
+  'atom-fence-rows': {
+    handler: atomFenceRowsRepair, embeds: 'effect', checks: ['atom_fence_rows'], explicit_only: true, preview_bound: true,
+    summary: 'Narrow to private the world atoms whose title, body or source_quote carries the claim of a fence row their source page shows only to the owner '
+      + '(a facts row whose visibility is not world, a takes row whose holder is not world), copied by an extraction that read the whole page. The preview lists '
+      + 'each atom with its source page and the row kinds and numbers, never the row text, and changes nothing. Preview-bound: --apply --expect <hash> sets '
+      + 'visibility: private on exactly the previewed set through a revision-bound put_page; an atom that changed since reports changed_since_preview. '
+      + 'Source pages stored in segments are not read (origin_unread). Runs only when named; never on upgrade.',
+  },
   'extractor-facts': {
     handler: extractorFactsRepair, embeds: 'none', checks: ['extractor_facts_expired'], explicit_only: true,
     summary: 'Restore conversation-extractor facts that the pre-v0.60.11.0 canonical projection expired (#5731). Restores only facts with receipt evidence '
       + '(a committed write of the page completed in the same transaction, by an older consumer); --include-ambiguous widens the hashed set to facts '
       + 'without that evidence. Preview-bound: --apply --expect <hash> restores exactly the previewed set; a fact that changed since reports '
       + 'changed_since_preview and stays expired. Superseded, withdrawn and duplicated facts are never restored. Database-only; no page is rewritten.',
+  },
+  'unwithdrawn-facts': {
+    handler: unwithdrawnFactsRepair, embeds: 'none', checks: ['unwithdrawn_facts'], explicit_only: true, preview_bound: true,
+    summary: 'Restore facts a facts-fence generation retired although no fence of their page ever held them (#8819), first generations included. '
+      + 'Restores the original fact ids and recorded lifecycle from the generation ledger; a fact a fence held (a genuine withdrawal), a withdrawn, '
+      + 'superseded or duplicated fact is never restored; --include-ambiguous adds facts of pages whose version history has a gap. Preview-bound: '
+      + '--apply --expect <hash> restores exactly the previewed set, bound to each page\'s revision; a changed page or fact reports changed_since_preview. '
+      + 'Database-only; no page is rewritten.',
+  },
+  'purged-page-facts': {
+    handler: purgedPageFactsRepair, embeds: 'none', checks: ['purged_page_facts'], explicit_only: true, preview_bound: true, consent: 'destructive',
+    consentText: {
+      what: 'Retire the previewed facts that purges left active after their page was gone',
+      why: 'The preview listed each fact extracted from a page that no longer exists; applying it expires exactly those rows.',
+      risk: 'Database rows only: no page or file changes. Rows are expired, not deleted, so their history stays; recall stops returning them. '
+        + 'A row that changed since the preview, or whose page came back, is kept.',
+      user_message: 'Retire the previewed facts left over from purged pages? Recall stops returning them; the rows are expired, not deleted.',
+    },
+    summary: 'Retire facts that purges before the #8859 fix left active: page-extraction facts filed on no page whose context names a page that no longer '
+      + 'exists. Rows of a page the purge ledger records are evidenced; rows of a page gone with no purge record (a retention purge, or a rename that did '
+      + 'not carry its facts) are retired only with --include-ambiguous; withdrawn, superseded and referenced rows are never touched. Preview-bound: '
+      + '--apply --expect <hash> --yes expires exactly the previewed rows; a row that changed since reports changed_since_preview. Database-only; runs only when named.',
+  },
+  'purged-change-reasons': {
+    handler: purgedChangeReasonsRepair, embeds: 'none', checks: [], explicit_only: true, preview_bound: true, consent: 'destructive',
+    consentText: {
+      what: "Set the previewed page-history change reasons that quote a purged claim to '[purged]'",
+      why: 'The preview listed each stored change reason whose text is the Git reason of a (commit, path) a fact purge tombstoned; applying it redacts exactly those rows.',
+      risk: "Database rows only: page_versions.change_reason becomes '[purged]', as the purge itself writes; no page, file or Git commit changes. "
+        + 'A row whose reason changed since the preview is kept. The old text is not kept anywhere by this repair.',
+      user_message: "Redact the previewed page-history change reasons that still quote a purged claim? They become '[purged]'; pages, files and Git history are unchanged.",
+    },
+    summary: 'Redact change reasons that a sync stored after a fact purge tombstoned them (before the #8635 fix): a page version in a source whose '
+      + 'change_reason equals the Git reason trailer of a tombstoned (commit, path), re-read from the checkout. Rows whose source_path is that path are '
+      + 'evidenced; the same text under another path is kept unless --include-ambiguous. Preview-bound: --apply --expect <hash> --yes sets exactly the '
+      + "previewed rows to '[purged]'; a row that changed since reports changed_since_preview. Repo-less sources have nothing to check. Database-only; runs only when named.",
   },
   'conversation-labels': {
     handler: conversationLabelsRepair, embeds: 'none', checks: ['conversation_label_facts'], explicit_only: true, consent: 'destructive',
@@ -432,7 +491,13 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'gets one revision_conflict). Preview-bound: --apply --expect <hash> sweeps exactly the previewed set; runs only when named.',
   },
   'file-drift': {
-    handler: fileDriftRepair, embeds: 'effect', checks: ['maintenance_write_drift'], explicit_only: true, preview_bound: true,
+    handler: fileDriftRepair, embeds: 'effect', checks: ['maintenance_write_drift'], explicit_only: true, preview_bound: true, consent: 'destructive',
+    consentText: {
+      what: 'Apply the previewed file-drift resolutions: each listed page takes the preferred side, and the other copy is replaced.',
+      why: 'The preview listed each page and the side that wins it.',
+      risk: 'A file rewrite is a new commit (git revert brings the edit back) and reconcile keeps a private backup of the replaced copy; a page that changed since the preview is skipped.',
+      user_message: 'Apply the previewed file-drift repair? Each listed page takes the side the preview showed, and the other copy is replaced.',
+    },
     summary: 'Resolve pages whose canonical file differs from the database (source_changed / file_database_drift, #6643) through canonical reconciliation: '
       + '--prefer file or --prefer database wins every ordinary field, within reconcile\'s protections (protected metadata stays as stored, tags are '
       + 'the union, protected takes and private fact rows are kept; the preview lists each page\'s exceptions). Select with --slug <slug>, --request '
@@ -444,7 +509,9 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'deleted only in the worktree is listed deletion_uncommitted and routed to committing the deletion or repair ghost-pages. --held [--side both|unknown|deleted '
       + '[--state tombstone_edited|purged_differs|file_gone]] selects the source\'s held file_drift pages of one Decision (several sides or states are refused; '
       + '--side deleted needs --state): a deleted page whose file changed is restored and imported (--prefer file) or keeps its deletion while the file is '
-      + 'removed by a coordinated commit (--prefer database); a purged page\'s file is imported as a new page or removed. Trusted local CLI only; runs only when named.',
+      + 'removed by a coordinated commit (--prefer database); a purged page\'s file is imported as a new page or removed. --prefer database never overwrites a file '
+      + 'edit sync never imported in bulk: such a page is listed kept_newer_file and skipped, and an exact --slug selection names the commit it discards (GST-2579). '
+      + 'The apply needs the user\'s consent (--yes), which names those edits. Trusted local CLI only; runs only when named.',
   },
   'stuck-recovery': {
     handler: stuckRecoveryRepair, embeds: 'none', checks: [], explicit_only: true, preview_bound: true, consent: 'destructive',
@@ -483,6 +550,17 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'commands to decide it; --slug <kept-slug> then only detaches the other pages (they forget the file and stay live). Refused when merges are over half of '
       + 'the source\'s file-backed pages unless GBRAIN_ALLOW_MASS_RECONCILE=1. Once no source has a group, --apply builds the pages_live_origin_key index. '
       + 'Preview-bound: --apply --expect <hash> --yes resolves exactly the previewed set. Runs only when named.',
+  },
+  'moved-pages': {
+    handler: movedPagesRepair, embeds: 'none', checks: ['ghost_pages'], explicit_only: true, preview_bound: true, consent: 'destructive',
+    consentText: MOVED_PAGES_CONSENT_TEXT,
+    summary: 'Fold a page left behind by a file that moved into the page the moved file imported as (GST-2584): sync follows a move only when it happens, so when the old '
+      + 'page\'s deletion was held (file_gone) the new path imports as a fresh page and the old one stays. Needs --source; refused off the canonical owner host. A page is '
+      + 'folded only on proof read from Git: its old path\'s last committed content is the content a new path took in the commit that deleted it (or that path\'s first '
+      + 'commit), exactly one live page descends from it, and the old page still holds it. Its links in every role, relationship dates, timeline, raw data, files, user '
+      + `tags, aliases, facts and saved versions move to the moved page, its slug becomes an alias, its hold is cleared, and it is soft-deleted and purged after ${MOVED_PAGES_PURGE_FUSE_HOURS} h; `
+      + 'no file is written. Any other page whose file is gone is listed with why it is kept (several candidates, a database edit after the move, a shallow history). '
+      + 'Preview-bound: --apply --expect <hash> --yes folds exactly the previewed set. Runs only when named.',
   },
   'receipt-compaction': {
     handler: receiptCompactionRepair, embeds: 'none', checks: ['persistence_capacity'], explicit_only: true, preview_bound: true, consent: 'destructive',
@@ -633,6 +711,15 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'page, then re-scans it. Database only: no file write, no Git commit, and a sync hold stays, so held pages are redacted where they are stored. '
       + 'History (page versions, receipts, Git) is kept. Trusted local CLI only; runs only when named; never on upgrade.',
   },
+  'facts-home': {
+    handler: factsHomeRepair, embeds: 'none', checks: ['strict_facts_outside_git'], explicit_only: true, preview_bound: true,
+    summary: 'Give the facts of a strict source (pages canonical in Git) that live in the database alone a home in Git (GST-2492). Needs --source; '
+      + 'a source that is not strict lists nothing. The preview lists every such fact by group and writes nothing: a fact with no entity, or for an '
+      + 'entity with no page, is written to memory/unattributed (a held row names its entity and moves to the page of its entity once that page exists); a fact whose '
+      + 'entity has a page is left to the extract_facts upkeep step; facts the Facts table cannot render, facts for an entity under a folder access rule, '
+      + 'held rows their page cannot take and held rows older than 30 days (with the nearest existing page) are listed and left alone. --apply --expect '
+      + '<hash> writes exactly the previewed set in one commit; the facts rows move in place. Runs only when named; never on upgrade.',
+  },
   'rows-behind': {
     handler: rowsBehindRepair, embeds: 'effect', checks: ['sync_rows_behind_checkpoint'], explicit_only: true, preview_bound: true,
     summary: 'Re-import the rows a managed sync\'s checkpoint moved past (#8071): the page holds an older version of its file than the commit '
@@ -642,6 +729,32 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'hold:<code> when that import is refused or the file is over the sync read bound (the hold sync would have opened). Rows with no import record '
       + 'join only with --include-ambiguous; rows with an uncommitted working-tree edit are left out. --apply --expect <hash> applies exactly that set. '
       + 'Runs only when named; never on upgrade.',
+  },
+  'private-labels': {
+    handler: privateLabelsRepair, embeds: 'effect', checks: [], explicit_only: true, preview_bound: true,
+    summary: 'Clear privacy labels writer templates over-stamped on ordinary pages: access: private (and the visibility: private stamped from it) is removed, '
+      + 'which widens what remote callers that are not the brain owner can read. Real restrictions are kept and counted: pinned questions, derived pages '
+      + '(atoms, synthesized concepts, chronicle events), access restricted or confidential, a confidentiality value, and visibility: private with no alias. '
+      + 'The preview lists one window (--limit, default 1000) by class (alias, alias-and-visibility) with every category\'s count before and after, and counts '
+      + 'the derived_from pages and chronicle events the window would also expose; --apply --expect <hash> applies exactly that window, one revision-bound page '
+      + 'write each, admitted together and published in groups on a managed brain (a run that fails keeps the preview, so the same command resumes; a page '
+      + 'that declines, its file drifted or gone, fails alone, is counted in declined and is listed after untried pages next time, and a complete run whose '
+      + 'only failures are declines exits 0); a bare --apply is refused. Pages in git-canonical sources '
+      + '(git-publish: clearing commits them into Git) run only with --class git-publish; without managed persistence a page with a file in its checkout is held '
+      + '(file_backed). Each change is recorded ahead of its write in ~/.gbrain/repair/private-labels/<brain>.jsonl (under $GBRAIN_HOME/.gbrain/ if set), '
+      + 'and --class restore re-adds access and visibility: private from it. Runs only when named; never on upgrade.',
+  },
+  'open-facts': {
+    handler: openFactsRepair, embeds: 'none', checks: [], explicit_only: true, preview_bound: true, unlisted: true,
+    summary: 'Open facts stamped private before facts.default_visibility world (#8194), which widens what remote callers that are not the brain owner can read. '
+      + 'Operator-only: runs from the CLI on the brain host, never for a remote caller or under GBRAIN_ENFORCED_MEMBER. Needs --source and --created-before <ISO-8601> '
+      + '(the instant the default became world, with its offset; a date alone is read as midnight UTC). The preview lists one window (--limit, default 1000; --after <id> for the next) of active private facts by class '
+      + '(fenced, unfenced; unpaged:<lane> for facts with no page or from a transcript lane, opened only with --class <that class>; --ids-file narrows to listed ids) '
+      + 'and counts every fact it leaves private by reason: expired, superseded, member page, withdrawn or purged, a trust contest, a private, missing or '
+      + 'quarantined holding, provenance or entity page, an unresolved provenance page. --apply --expect <hash> opens exactly that window, keeping each fact\'s '
+      + 'id, provenance and trust tier, rechecked under the page locks; a fact it could not open is reported fact_left_private. Each change is recorded ahead '
+      + 'of its write in ~/.gbrain/repair/open-facts/<brain>.jsonl (under $GBRAIN_HOME/.gbrain/ if set); --undo <ledger> previews re-privating what it opened '
+      + '(the label only: what was read stays read). Runs only when named; never on upgrade.',
   },
   'generations': {
     handler: generationsRepair, embeds: 'effect', checks: ['generation_retirements', 'generation_held', 'generation_pending'], explicit_only: true, preview_bound: true, consent: 'destructive',
@@ -659,6 +772,22 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'One selector bounds the set: --run <id>, --since <ISO-8601|7d>, --key <owner>, --generation <id>, or --held (release-held). The preview lists each key '
       + 'and saves the set under its hash; --apply --expect <hash> --yes applies exactly that set, refusing a key edited since or with no stored preimage. '
       + 'Runs only when named; never on upgrade.',
+  },
+  'lost-fence-rows': {
+    handler: lostFenceRowsRepair, embeds: 'effect', checks: [], explicit_only: true, preview_bound: true, consent: 'destructive',
+    consentText: {
+      what: 'Put the previewed fact and take rows back into their pages\' Facts and Takes sections',
+      why: 'The preview listed each row an older gbrain expired or deleted after a page rewrite dropped its section and a later remember or takes add re-created the section without it; page history holds each row. A section rebuilt by hand without a row looks the same, so check the list.',
+      risk: 'Each listed page is republished through a revision-bound put_page with the rows added and nothing else changed; a page that changed since the preview is skipped. A restored row never gets more trust than it had: a fact comes back at the tier the expired row had, and a take, or a fact with no recorded tier, at the lowest tier. If the page write is left pending, rerun the same apply to finish lowering the tiers. Page history keeps the earlier revision, and a managed source commits the file, so git revert undoes it.',
+      user_message: 'Put the previewed facts and takes back into their pages? Only those rows are added',
+    },
+    summary: 'Restore fact and take rows an older gbrain retired after a page rewrite dropped their Facts or Takes section: the next remember or takes add '
+      + 're-created the section with only its own row, and the write after that expired the facts and deleted the takes. Lists only rows the records '
+      + 'prove: a fence generation retired the row without an empty-section proof, nothing on the page carries it now, and page history holds it in a '
+      + 'section that then vanished before the retirement (a row an edit removed from a section that stayed is a deliberate removal and is not listed). '
+      + 'A section a person rebuilt by hand without a row leaves the same records, so show the user the preview and let them drop what they meant to remove. '
+      + 'Each cell comes back byte for byte from the newest version that held it, at its row number when free. --source narrows. The preview lists each '
+      + 'page; --apply --expect <hash> --yes republishes exactly that set, one revision-bound put_page per page. Runs only when named; never on upgrade.',
   },
 };
 
@@ -700,7 +829,7 @@ export function repairPreviewCommand(kind: RepairKind, opts: { source?: string }
 export interface ExplicitRepairNotice { kind: RepairKind; code: 'explicit_kind_required'; preview_command: string; docs: string }
 
 export function explicitRepairNotices(opts: { source?: string } = {}): ExplicitRepairNotice[] {
-  return EXPLICIT_REPAIR_REGISTRY.map(spec => ({ kind: spec.kind, code: 'explicit_kind_required' as const,
+  return EXPLICIT_REPAIR_REGISTRY.filter(spec => !spec.unlisted).map(spec => ({ kind: spec.kind, code: 'explicit_kind_required' as const,
     preview_command: repairPreviewCommand(spec.kind, opts), docs: ERROR_CATALOGUE.explicit_kind_required.docs }));
 }
 
@@ -745,18 +874,21 @@ export async function repairRunner(engine: BrainEngine, opts: { apply: boolean; 
       slugs?: string[]; noLlm?: boolean; maxLlmUsd?: number; deadline?: number; stop?: AbortSignal; recordDatabaseStops?: boolean;
       prefer?: 'file' | 'database'; requests?: string[]; allDrifted?: boolean; driftClass?: string; since?: string; held?: boolean; side?: string; state?: string; provenance?: string; cursor?: string; progress?: ProgressReporter;
       keep?: 'prior' | 'disk' | 'withdrawn'; requestId?: string; olderThan?: string; includeFailures?: boolean; force?: boolean; from?: string; close?: boolean; afterPage?: number; generations?: GenerationsSelection; day?: string; rules?: string[];
-      cwdPrefixes?: string[]; sessions?: string[]; principal?: string } = {}): Promise<RepairResult> {
+      cwdPrefixes?: string[]; sessions?: string[]; principal?: string; privateLabelsLedger?: PrivateLabelsLedger; readers?: ReadersRequest; openFacts?: OpenFactsRequest } = {}): Promise<RepairResult> {
       const ctx = { engine, config, logger, dryRun: !opts.apply, remote: false, sourceId: scope.source_ids[0], writeWaitMs } as OperationContext;
       const spec = repairSpec(kind, opts.registry);
       return runRepair(ctx, spec.handler, scope, { apply: opts.apply, limit: run.limit, embeddingModel, sourceFlag: run.sourceFlag, spec,
         embed: !opts.noEmbed && embeddingModel !== undefined, applyArgs: [...(opts.noEmbed && spec.embeds === 'inline' ? ['--no-embed'] : []),
           ...(run.olderThan ? ['--older-than', run.olderThan] : []), ...(run.includeFailures ? ['--include-failures'] : []), ...(run.force ? ['--force'] : []),
           ...(run.afterPage !== undefined ? ['--after', String(run.afterPage)] : []), ...(run.generations ? generationsSelectionArgv(run.generations) : []), ...(run.day ? ['--day', run.day] : []), ...(run.rules?.length ? ['--rules', run.rules.join(',')] : []),
-          ...(kind === 'agent-session-facts' ? agentSessionFlagArgs(run).map(arg => shellQuote(arg)) : [])],
+          ...(kind === 'agent-session-facts' ? agentSessionFlagArgs(run).map(arg => shellQuote(arg)) : []),
+          ...(run.readers ? [...(run.readers.slugsFile ? ['--slugs-file', run.readers.slugsFile.path] : []), '--readers', run.readers.readers,
+            ...(run.readers.allowWithoutOwner ? ['--allow-without-owner'] : [])].map(arg => shellQuote(arg)) : []),
+          ...(run.openFacts ? openFactsApplyArgs(run.openFacts).map(arg => shellQuote(arg)) : [])],
         explicit: run.explicit, expect: run.expect, includeAmbiguous: run.includeAmbiguous, includeCrossEntity: run.includeCrossEntity, only: run.only, skip: run.skip, slugs: run.slugs, noLlm: run.noLlm,
         maxLlmUsd: run.maxLlmUsd, deadline: run.deadline, ...(run.stop ? { stop: run.stop } : {}), ...(run.recordDatabaseStops ? { recordDatabaseStops: true } : {}), prefer: run.prefer, requests: run.requests, allDrifted: run.allDrifted, driftClass: run.driftClass, since: run.since,
         held: run.held, side: run.side, state: run.state, provenance: run.provenance, cursor: run.cursor, progress: run.progress, keep: run.keep, requestId: run.requestId, olderThan: run.olderThan, includeFailures: run.includeFailures, force: run.force, from: run.from, close: run.close, afterPage: run.afterPage, generations: run.generations, day: run.day, rules: run.rules,
-        cwdPrefixes: run.cwdPrefixes, sessions: run.sessions, principal: run.principal });
+        cwdPrefixes: run.cwdPrefixes, sessions: run.sessions, principal: run.principal, privateLabelsLedger: run.privateLabelsLedger, readers: run.readers, openFacts: run.openFacts });
     },
   };
 }
